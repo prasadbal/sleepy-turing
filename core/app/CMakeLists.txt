@@ -11,12 +11,16 @@ target_include_directories(core_app PUBLIC
 target_include_directories(core_app PRIVATE
     ${backward_SOURCE_DIR}
 )
-# app uses exceptions (backward-cpp, CLI11 via cmdline) — compiler_options only
+# app uses exceptions (backward-cpp, CLI11 via cmdline) — compiler_options
+# only. core_logging transitively leaks core_options' -fno-exceptions in
+# here (see reenable_exceptions in cmake/compiler_options.cmake) — must be
+# linked last so its override lands after the leaked flag.
 target_link_libraries(core_app PUBLIC
     compiler_options
     core_config
     core_cmdline
     core_logging
+    reenable_exceptions
 )
 add_backward(core_app)
 # add_backward() sets core_app's private LINK_LIBRARIES property directly,

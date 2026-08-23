@@ -77,7 +77,7 @@ public:
 
 protected:
     Application(std::string_view name, std::string_view version)
-        : name_{name}, version_{version} {}
+        : name_{name}, version_{version}, cli_{name, version} {}
 
     // Called after all modules are init'd, before they are started.
     // Override to perform app-level init that depends on modules being ready.
@@ -91,16 +91,20 @@ protected:
     // Called after modules are stopped, before they are shutdown.
     virtual void on_shutdown() noexcept {}
 
+    // Register app-specific CLI options — call from the derived class's
+    // constructor, before run() parses argv. See cmdline::Options.
+    [[nodiscard]] cmdline::Options& cmdline() noexcept { return cli_; }
+
     [[nodiscard]] const config::Config& config()  const noexcept { return config_; }
-    [[nodiscard]] const cmdline::Args&  args()    const noexcept { return args_; }
+    [[nodiscard]] const cmdline::Args&  args()    const noexcept { return cli_.args(); }
     [[nodiscard]] std::string_view      name()    const noexcept { return name_; }
     [[nodiscard]] std::string_view      version() const noexcept { return version_; }
 
 private:
-    std::string    name_;
-    std::string    version_;
-    config::Config config_;
-    cmdline::Args  args_;
+    std::string      name_;
+    std::string      version_;
+    config::Config    config_;
+    cmdline::Options  cli_;
 
     std::vector<std::unique_ptr<Module>>        modules_;
     std::unordered_map<const void*, Module*>    module_index_;

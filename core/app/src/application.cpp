@@ -9,19 +9,19 @@ namespace marketlib::app {
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 int Application::run(int argc, char** argv) noexcept {
-    // 1. Parse command line
-    auto pr = cmdline::parse(argc, argv, name_, version_);
-    if (pr.exit_code >= 0)
-        return pr.exit_code;
-    args_ = std::move(pr.args);
+    // 1. Parse command line (base options + anything added via cmdline())
+    const int parse_exit = cli_.parse(argc, argv);
+    if (parse_exit >= 0)
+        return parse_exit;
+    const auto& parsed_args = cli_.args();
 
     // 2. Load and process config
-    if (!args_.config_file.empty()) {
-        auto cfg = config::Config::load(args_.config_file, args_.overrides);
+    if (!parsed_args.config_file.empty()) {
+        auto cfg = config::Config::load(parsed_args.config_file, parsed_args.overrides);
         if (!cfg) {
             const bool missing = (cfg.error() == config::ConfigError::file_not_found);
             std::cerr << "Config " << (missing ? "not found" : "parse error")
-                      << ": " << args_.config_file << '\n';
+                      << ": " << parsed_args.config_file << '\n';
             return 1;
         }
         config_ = std::move(*cfg);

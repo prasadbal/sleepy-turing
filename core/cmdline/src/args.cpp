@@ -1,35 +1,42 @@
 #include <cmdline/args.h>
-#include <CLI/CLI.hpp>
+#include <iostream>
 
 namespace marketlib::cmdline {
 
-ParseResult parse(int argc, char** argv,
-                  std::string_view app_name,
-                  std::string_view app_version) noexcept {
-    CLI::App app{std::string(app_name)};
-    app.set_version_flag("--version,-V", std::string(app_version));
+Options::Options(std::string_view app_name, std::string_view app_version) noexcept
+    : app_{std::string(app_name)} {
+    app_.set_version_flag("--version,-V", std::string(app_version));
 
-    Args args;
-    app.add_option("--config,-c", args.config_file,
-                   "Path to TOML config file");
-    app.add_option("--set,-s", args.overrides,
-                   "Override config key: --set logging.level=debug feed.port=9001")
-       ->expected(-1)
-       ->allow_extra_args(true);
+    args_.config_file = "config/" + std::string(app_name) + ".toml";
+    config_opt_ = app_.add_option("--config,-c", args_.config_file,
+                                   "Path to TOML config file")
+                      ->capture_default_str();
 
+    app_.add_option("--set,-s", args_.overrides,
+                     "Override config key: --set logging.level=debug feed.port=9001")
+        ->expected(-1)
+        ->allow_extra_args(true);
+}
+
+int Options::parse(int argc, char** argv) noexcept {
     try {
-        app.parse(argc, argv);
+        app_.parse(argc, argv);
     } catch (const CLI::CallForHelp&) {
-        std::cout << app.help() << std::flush;
-        return {args, 0};
+        std::cout << app_.help() << std::flush;
+        return 0;
     } catch (const CLI::CallForVersion&) {
-        return {args, 0};
+        return 0;
     } catch (const CLI::ParseError& e) {
-        std::cerr << "Error: " << e.what() << "\n\n" << app.help() << std::flush;
-        return {args, e.get_exit_code()};
+        std::cerr << "Error: " << e.what() << "\n\n" << app_.help() << std::flush;
+        return e.get_exit_code();
     }
 
-    return {args, -1};
+    // Left at the "config/<app_name>.toml" default (not passed explicitly)
+    // and that file doesn't exist — treat as "no config" rather than an error.
+    if (config_opt_->count() == 0 && !std::filesystem::exists(args_.config_file))
+        args_.config_file.clear();
+
+    return -1;
 }
 
 } // namespace marketlib::cmdline
