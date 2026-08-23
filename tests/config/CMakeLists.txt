@@ -1,0 +1,3 @@
+add_executable(test_config test_config.cpp)
+target_link_libraries(test_config PRIVATE core_config core_testing)
+catch_discover_tests(test_config)

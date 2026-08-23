@@ -1,0 +1,3 @@
+add_executable(test_perfmeasure test_tsc.cpp)
+target_link_libraries(test_perfmeasure PRIVATE core_perfmeasure core_testing)
+catch_discover_tests(test_perfmeasure)

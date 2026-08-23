@@ -1,0 +1,3 @@
+add_executable(test_serialization test_endian.cpp)
+target_link_libraries(test_serialization PRIVATE core_serialization core_testing)
+catch_discover_tests(test_serialization)

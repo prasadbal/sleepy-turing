@@ -1,0 +1,40 @@
+# Sleepy Turing — example configuration
+# Priority order for any value: cmdline --set > environment variable > this file > built-in default
+
+# ── Environment variable bindings ─────────────────────────────────────────────
+# Declare which env vars map to which config keys.
+# Values are set only when the env var is present at startup.
+[env_bindings]
+"SLEEPY_LOG_DIR"    = "logging.dir"
+"SLEEPY_LOG_FILE"   = "logging.file"
+"SLEEPY_LOG_LEVEL"  = "logging.level"
+"SLEEPY_LOG_FMT"    = "logging.fmt"
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+[logging]
+dir       = "${SLEEPY_RUN_DIR}/logs"   # ${VAR} expanded at load time
+file      = "sleepy.log"               # final path: dir/file
+level     = "info"                     # trace|debug|info|warn|error|critical
+fmt       = "%Y-%m-%dT%T.%e [%^%-5l%$] [%t] %v"
+max_size  = 67108864                   # 64 MiB per rotating file
+max_files = 5
+console   = true
+
+# ── Feed / market data ────────────────────────────────────────────────────────
+[feed]
+venue     = "NASDAQ"
+interface = "eth0"
+port      = 26477
+symbols   = ["AAPL", "MSFT", "NVDA"]
+
+# ── Order entry ───────────────────────────────────────────────────────────────
+[order_entry]
+host      = "ouch.example.com"
+port      = 9000
+session   = "SLEEPY01"
+
+# ── Risk limits ───────────────────────────────────────────────────────────────
+[risk]
+max_order_qty   = 500
+max_position    = 10000
+max_daily_loss  = 50000.00

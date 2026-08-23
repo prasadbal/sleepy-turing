@@ -1,0 +1,3 @@
+add_executable(test_cmdline test_args.cpp)
+target_link_libraries(test_cmdline PRIVATE core_cmdline core_testing)
+catch_discover_tests(test_cmdline)

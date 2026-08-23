@@ -1,0 +1,17 @@
+[demo]
+symbol           = "ESZ4"
+tick_interval_ms = 500
+
+[logging]
+level   = "debug"
+console = true
+file    = "demo.log"
+
+# Per-module level overrides
+[logging.levels]
+"marketlib.app" = "info"
+
+[env_bindings]
+"DEMO_SYMBOL"       = "demo.symbol"
+"DEMO_TICK_MS"      = "demo.tick_interval_ms"
+"MARKETLIB_LOG_LVL" = "logging.level"

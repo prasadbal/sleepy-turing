@@ -1,0 +1,3 @@
+add_executable(test_memory test_pool.cpp)
+target_link_libraries(test_memory PRIVATE core_memory core_testing)
+catch_discover_tests(test_memory)
