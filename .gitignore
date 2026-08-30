@@ -4,3 +4,4 @@ build/
 *.kate-swp
 clangd
 CMakeUserPresets.json
+ideas/binding/build/
