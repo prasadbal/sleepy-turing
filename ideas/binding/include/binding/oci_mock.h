@@ -20,6 +20,7 @@
 // ---- Base types -------------------------------------------------------
 using text   = unsigned char;
 using dvoid  = void;
+using sb2    = short;
 using sb4    = int;
 using ub4    = unsigned int;
 using ub2    = unsigned short;
@@ -63,8 +64,13 @@ constexpr sword OCI_SUCCESS = 0;
 constexpr sword OCI_ERROR   = -1;
 constexpr sword OCI_NO_DATA = 100;
 
+// ---- Indicator variable values ---------------------------------------------
+constexpr sb2 OCI_IND_NOTNULL = 0;
+constexpr sb2 OCI_IND_NULL    = -1;
+
 // ---- External type constants ----------------------------------------------
 constexpr ub2 SQLT_INT     = 3;
+constexpr ub2 SQLT_STR     = 5;
 constexpr ub2 SQLT_BFLOAT  = 21;
 constexpr ub2 SQLT_BDOUBLE = 22;
 constexpr ub2 SQLT_CLOB    = 112;
@@ -84,10 +90,23 @@ inline void set_mode(FailureMode mode, int disconnect_count = 1) {
     g_disconnects_remaining = disconnect_count;
 }
 
-struct MockDefine { void* ptr = nullptr; sb4 size = 0; ub2 dty = 0; };
+struct MockDefine { void* ptr = nullptr; sb4 size = 0; ub2 dty = 0; sb2* indp = nullptr; };
 inline std::vector<MockDefine> g_defines;
 inline int g_fetch_row = 0;
 inline constexpr int MOCK_ROW_COUNT = 3;
+
+// Lets a demo inspect what indicator value the last execute()'s bind calls
+// set for each bind position -- 0 = OCI_IND_NOTNULL, -1 = OCI_IND_NULL.
+inline std::vector<sb2> g_last_bind_indicators;
+
+// Opt-in: when enabled, OCIStmtFetch2 (below) simulates a NULL on the *last*
+// defined column of every other fetched row, so query()'s NULL handling has
+// something real to exercise. Off by default -- a query() row struct with no
+// nullable field has nowhere to put a simulated NULL (the column would just
+// silently keep the previous row's stale value), so only turn this on for a
+// query whose row type actually has an std::optional field in that position.
+inline std::atomic<bool> g_simulate_null_last_column{false};
+inline void set_simulate_null_last_column(bool enabled) { g_simulate_null_last_column = enabled; }
 
 } // namespace binding::mock
 
@@ -117,6 +136,7 @@ inline sword OCISessionEnd(OCISvcCtx*, OCIError*, OCISession*, ub4) { return OCI
 inline sword OCIStmtPrepare(OCIStmt*, OCIError*, const text*, ub4, ub4, ub4) {
     binding::mock::g_defines.clear();
     binding::mock::g_fetch_row = 0;
+    binding::mock::g_last_bind_indicators.clear();
     return OCI_SUCCESS;
 }
 
@@ -125,17 +145,20 @@ inline sword OCIBindByName(OCIStmt*, OCIBind**, OCIError*, const text*, sb4,
     return OCI_SUCCESS;
 }
 
-inline sword OCIBindByPos(OCIStmt*, OCIBind**, OCIError*, ub4,
-                           dvoid*, sb4, ub2, dvoid*, ub2*, ub2*, ub4, ub4*, ub4) {
+inline sword OCIBindByPos(OCIStmt*, OCIBind**, OCIError*, ub4 position,
+                           dvoid*, sb4, ub2, dvoid* indp, ub2*, ub2*, ub4, ub4*, ub4) {
+    auto& inds = binding::mock::g_last_bind_indicators;
+    if (inds.size() < position) inds.resize(position, OCI_IND_NOTNULL);
+    inds[position - 1] = indp ? *static_cast<sb2*>(indp) : OCI_IND_NOTNULL;
     return OCI_SUCCESS;
 }
 
 inline sword OCIDefineByPos(OCIStmt*, OCIDefine**, OCIError*, ub4 position,
                              dvoid* valuep, sb4 value_sz, ub2 dty,
-                             dvoid*, ub2*, ub2*, ub4) {
+                             dvoid* indp, ub2*, ub2*, ub4) {
     auto& defines = binding::mock::g_defines;
     if (defines.size() < position) defines.resize(position);
-    defines[position - 1] = { valuep, value_sz, dty };
+    defines[position - 1] = { valuep, value_sz, dty, static_cast<sb2*>(indp) };
     return OCI_SUCCESS;
 }
 
@@ -156,9 +179,22 @@ inline sword OCIStmtFetch2(OCIStmt*, OCIError*, ub4, ub2, sb4, ub4) {
     using namespace binding::mock;
     if (g_fetch_row >= MOCK_ROW_COUNT) return OCI_NO_DATA;
 
+    // Demo behavior (opt-in, see g_simulate_null_last_column): the last
+    // defined column comes back NULL on every other row, so code driving
+    // query() has a real NULL to exercise.
+    const std::size_t null_column = g_defines.empty() ? 0 : g_defines.size() - 1;
+    const bool simulate_null_this_row = g_simulate_null_last_column.load() && (g_fetch_row % 2 == 1);
+
     for (std::size_t i = 0; i < g_defines.size(); ++i) {
         const auto& d = g_defines[i];
         if (!d.ptr) continue;
+
+        if (simulate_null_this_row && i == null_column) {
+            if (d.indp) *d.indp = OCI_IND_NULL;
+            continue; // OCI leaves the output buffer alone for a NULL column
+        }
+        if (d.indp) *d.indp = OCI_IND_NOTNULL;
+
         if (d.dty == SQLT_INT && d.size == sizeof(int)) {
             int v = 100 + g_fetch_row * 10 + static_cast<int>(i);
             std::memcpy(d.ptr, &v, sizeof(v));

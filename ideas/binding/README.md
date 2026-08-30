@@ -14,8 +14,9 @@ that's worth doing, not a committed dependency.
 - `include/binding/reflect.h` -- the shared engine: `struct_field_auditor<T, Predicate>`
   walks `T`'s fields via `boost::pfr::tuple_size` / `tuple_element_t` and checks
   each one against a `Predicate`. `flat_schema<T>` is this engine with a
-  leaf-only predicate (arithmetic or string-convertible, no pointers/const) --
-  use it for config-section structs.
+  leaf-only predicate (arithmetic or string-convertible, no pointers/const,
+  optionally wrapped in `std::optional<U>` to mark it nullable) -- use it for
+  config-section structs.
 - `include/binding/oci_compat.h` -- picks the real `<oci.h>` if it's on the
   include path, otherwise falls back to `oci_mock.h`. Never both at once.
 - `include/binding/oci_mock.h` -- a compile-only OCI stand-in (not a real
@@ -31,9 +32,39 @@ that's worth doing, not a committed dependency.
   and `OciClient::query<T>` (SELECT into `vector<T>`), both built on
   `oci_row_schema<T>` -- `flat_schema`'s leaf predicate, plus LOB types,
   reusing the same `struct_field_auditor` engine.
-- `examples/main.cpp` -- three scenarios: a mid-execute disconnect that
-  recovers, a plain exec error that must not retry, and a `SELECT` into
-  `vector<T>`.
+- `examples/main.cpp` -- five scenarios: a mid-execute disconnect that
+  recovers, a plain exec error that must not retry, a `SELECT` into
+  `vector<T>`, binding an empty `std::optional` as SQL NULL, and a `SELECT`
+  where a NULL column comes back as `std::nullopt`.
+
+## NULL handling (std::optional<U>)
+
+A field declared `std::optional<U>` (U arithmetic or string-convertible)
+maps to a nullable column:
+
+- **`execute()`**: an empty optional binds SQL NULL (indicator `OCI_IND_NULL`);
+  a set one binds `*field` with indicator `OCI_IND_NOTNULL`.
+- **`query()`**: a NULL column comes back as `std::nullopt`; otherwise the
+  fetched value is wrapped in the optional.
+
+Neither direction can bind/define straight into the optional's own storage:
+dereferencing an empty `std::optional` to get `&*opt` is undefined behavior,
+and there's no standard-sanctioned way to get the address of its unset
+storage either. So each optional field gets a real, addressable staging `U`
+(`detail::staging_tuple_t<T>` in `oci_client.h`) that OCI actually
+binds/defines against, plus a `sb2` indicator slot per field
+(`OCI_IND_NULL` / `OCI_IND_NOTNULL`) -- `execute()` copies the optional into
+the staging value (or leaves it default or empty), `query()` copies the
+staging value back into the optional (or resets it to `nullopt`) once the
+indicator says which after each fetched row.
+
+`std::string`/`optional<std::string>` **binds** fine on the `execute()` side
+(size = content length, not `sizeof(std::string)` -- an earlier version of
+this file had that bug too, since no demo exercised a raw string bind).
+`query()`'s output side still rejects string columns via `static_assert`
+(same reason as LOB columns): OCI needs a fixed max buffer size to write
+into before it knows how long the value is, and this client doesn't manage
+that yet.
 
 ## Why positional binds, not named
 
@@ -69,13 +100,22 @@ by both `execute()` and `query()`:
 
 - Transaction/commit handling (`OCITransCommit` / `OCI_COMMIT_ON_SUCCESS`) --
   left to the caller.
-- LOB columns in `query()`'s result rows (`static_assert`s against it for now).
+- String and LOB columns in `query()`'s result rows (`static_assert`s
+  against both, for the same fixed-buffer-size reason).
+- Nullable LOBs (`std::optional<OciClob>`) -- LOB fields always bind/define
+  as not-null for now.
 - Config-file binding itself (XML/TOML -> `flat_schema` struct) -- the
   concept exists in `reflect.h`, but no parser is wired to it yet. That's
   the natural next step if this idea goes anywhere.
 
 ## Compiling
 
-Not verified against a real compiler in the session that wrote this pass --
-see `CMakeLists.txt` for the intended build (`FetchContent`s `boost::pfr`
-2.2.0, C++20). Sanity-check it before relying on it.
+Verified end to end on this host: `g++ 15.2` / C++20, both via
+`cmake -S -B` / `--build` (using `CMakeLists.txt`, pointed at
+`/mnt/c/local/boost_1_91_0` through `BOOST_ROOT`) and via a direct `g++`
+invocation with `-Wall -Wextra -Wpedantic -Wshadow` (clean except for one
+warning inside Boost's own `core_name20_static.hpp`, unrelated to this
+code). Not yet verified against MSVC -- the `flat_schema`/`struct_field_auditor`
+engine in `reflect.h` has already needed two MSVC-specific workarounds (see
+the comments on `struct_field_auditor` and `check_field`), so treat MSVC as
+untested until it's actually been built there.

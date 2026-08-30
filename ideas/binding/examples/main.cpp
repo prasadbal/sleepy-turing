@@ -46,6 +46,13 @@ struct TradeRow {
 };
 static_assert(binding::oci_row_schema<TradeRow>);
 
+// ---- nullable column demo: commission is a nullable NUMBER -------------
+struct EmployeeRow {
+    int emp_id;
+    std::optional<double> commission;
+};
+static_assert(binding::oci_row_schema<EmployeeRow>);
+
 int main() {
     binding::OciConnection conn("orcl", "app_user", "secret",
                                 /*max_retries=*/3, std::chrono::milliseconds(200));
@@ -78,6 +85,27 @@ int main() {
     client.query(conn, "SELECT trade_id, notional FROM trades", rows);
     for (const auto& r : rows) {
         std::cout << "trade_id=" << r.trade_id << " notional=" << r.notional << "\n";
+    }
+    std::cout << "\n";
+
+    std::cout << "--- Demo 4: bind std::optional -- empty maps to SQL NULL ---\n";
+    EmployeeRow with_commission{101, 250.5};
+    client.execute(conn, "INSERT INTO employees (id, commission) VALUES (:1, :2)", with_commission);
+    std::cout << "emp 101 (has commission): bind indicator="
+              << binding::mock::g_last_bind_indicators[1] << " (expect 0 = NOT NULL)\n";
+
+    EmployeeRow without_commission{102, std::nullopt};
+    client.execute(conn, "INSERT INTO employees (id, commission) VALUES (:1, :2)", without_commission);
+    std::cout << "emp 102 (no commission):  bind indicator="
+              << binding::mock::g_last_bind_indicators[1] << " (expect -1 = NULL)\n\n";
+
+    std::cout << "--- Demo 5: query std::optional -- NULL indicator maps back to nullopt ---\n";
+    binding::mock::set_simulate_null_last_column(true); // commission is the last column here
+    std::vector<EmployeeRow> employees;
+    client.query(conn, "SELECT id, commission FROM employees", employees);
+    for (const auto& e : employees) {
+        std::cout << "emp_id=" << e.emp_id << " commission="
+                  << (e.commission ? std::to_string(*e.commission) : std::string("NULL")) << "\n";
     }
 
     conn.disconnect();

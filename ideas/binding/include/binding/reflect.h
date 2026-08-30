@@ -2,6 +2,7 @@
 #include <type_traits>
 #include <string_view>
 #include <cstddef>
+#include <optional>
 #include <boost/pfr.hpp>
 
 // ============================================================================
@@ -20,7 +21,30 @@
 namespace binding {
 
 // ----------------------------------------------------------------------------
-// Core leaf value validation (arithmetic primitives + string-like layouts).
+// std::optional<U> recognition. A nullable column/config value is modeled as
+// std::optional<U> where U is itself a bindable leaf -- an empty optional
+// means SQL NULL (or "absent" for config), a set one means U's value.
+// ----------------------------------------------------------------------------
+template <typename T>
+struct is_optional_impl : std::false_type {};
+template <typename U>
+struct is_optional_impl<std::optional<U>> : std::true_type {};
+
+template <typename T>
+inline constexpr bool is_optional_v = is_optional_impl<std::remove_cv_t<T>>::value;
+
+template <typename T>
+struct optional_value_impl { using type = void; };
+template <typename U>
+struct optional_value_impl<std::optional<U>> { using type = U; };
+
+// The U in std::optional<U>; only meaningful when is_optional_v<T> is true.
+template <typename T>
+using optional_value_t = typename optional_value_impl<std::remove_cv_t<T>>::type;
+
+// ----------------------------------------------------------------------------
+// Core leaf value validation (arithmetic primitives + string-like layouts,
+// optionally wrapped in std::optional to mark the column/value nullable).
 // ----------------------------------------------------------------------------
 template <typename T>
 concept is_bindable_leaf =
@@ -28,7 +52,9 @@ concept is_bindable_leaf =
     !std::is_const_v<T> &&
     !std::is_pointer_v<T> && (
         std::is_arithmetic_v<T> ||
-        std::is_convertible_v<T, std::string_view>
+        std::is_convertible_v<T, std::string_view> ||
+        (is_optional_v<T> && std::is_arithmetic_v<optional_value_t<T>>) ||
+        (is_optional_v<T> && std::is_convertible_v<optional_value_t<T>, std::string_view>)
     );
 
 // Hides the concept behind a plain bool so callers (and fold expressions)
