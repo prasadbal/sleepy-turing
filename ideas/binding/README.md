@@ -192,6 +192,12 @@ OCI side's error handling, so this doesn't try to be exception-free.
   everything else here is built on. `oci_row_schema` correctly rejects a
   nested/`vector<U>` field today; it just doesn't yet offer a way to
   actually bind one of these two column kinds when you do need it.
+- Binding a collection for a SQL `IN (...)` clause -- variable-length
+  `WHERE col IN (:1, :2, ...)` needs either a generated placeholder list
+  sized to the collection at prepare time, or an Oracle collection-type
+  bind (`OCITypeByName` + `OCICollAppend`, or a temp table/array join), and
+  neither fits the fixed-one-value-per-position model `bind_fields`/
+  `OCIBindByPos` use today. Deferred -- not designed yet.
 
 ## Compiling
 
