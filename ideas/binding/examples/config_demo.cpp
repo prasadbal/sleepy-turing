@@ -72,6 +72,29 @@ int main() {
         std::cout << "  replica name=" << r.name << " priority=" << r.priority << "\n";
     }
 
+    std::cout << "\n--- bind_flat_fields: same binder, restricted to flat_schema ---\n";
+    // A plain record shape -- a database row being the common case -- where
+    // nesting/vector<U> would be a mistake, not a feature. bind_flat_fields
+    // requires flat_schema<T> instead of config_schema<T>, so accidentally
+    // adding a nested or vector<U> field to DbRow later is a compile error
+    // right here, rather than silently compiling under the more permissive
+    // config_schema.
+    struct DbRow {
+        int id;
+        std::string name;
+        double amount;
+    };
+    static_assert(binding::flat_schema<DbRow>);
+
+    binding::FieldList row_fields{
+        binding::Field{"id", std::string("42")},
+        binding::Field{"name", std::string("widget")},
+        binding::Field{"amount", std::string("19.99")},
+    };
+    DbRow row{};
+    binding::bind_flat_fields(row_fields, row);
+    std::cout << "id=" << row.id << " name=" << row.name << " amount=" << row.amount << "\n";
+
     std::cout << "\n--- missing required field: error path ---\n";
     try {
         struct Strict { int required_thing; };

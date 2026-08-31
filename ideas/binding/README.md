@@ -182,6 +182,16 @@ OCI side's error handling, so this doesn't try to be exception-free.
 - Wiring `Config` (the project's existing TOML-based config class in
   `core/config`) up to any of this -- this is XML-shaped scaffolding sitting
   next to it, not a replacement.
+- Oracle's genuinely nested column types -- object types and `TABLE OF`
+  nested tables. A normal result-set row is flat except for LOBs, which is
+  exactly what `oci_row_schema` enforces; those two column kinds are a real
+  exception (a single row's column can itself be struct- or collection-
+  shaped), but supporting them for real needs `OCIType`/`OCIDescribe`
+  metadata and `OCIObjectNew`/`OCIObjectGetInd`-style APIs -- a different
+  mechanism from the `OCIBindByPos`/`OCIDefineByPos` scalar+LOB path
+  everything else here is built on. `oci_row_schema` correctly rejects a
+  nested/`vector<U>` field today; it just doesn't yet offer a way to
+  actually bind one of these two column kinds when you do need it.
 
 ## Compiling
 

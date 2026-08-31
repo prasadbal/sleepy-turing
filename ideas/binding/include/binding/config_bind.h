@@ -140,4 +140,16 @@ void bind_from_fields(const FieldList& fields, T& out) {
     detail::bind_all_fields(fields, out, std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
 }
 
+// Same as bind_from_fields, but requires flat_schema<T> instead of the more
+// permissive config_schema<T>. Use this at call sites where a struct is
+// meant to stay strictly flat -- a plain DB row/record shape being the
+// common case -- so a nested or vector<U> field added to it later is a
+// compile error right here, instead of silently being accepted by the more
+// general config_schema (flat_schema is a strict subset of it: every
+// flat_schema struct already satisfies config_schema, so this just forwards).
+template <flat_schema T>
+void bind_flat_fields(const FieldList& fields, T& out) {
+    bind_from_fields(fields, out);
+}
+
 } // namespace binding
