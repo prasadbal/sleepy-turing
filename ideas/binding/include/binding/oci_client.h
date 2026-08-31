@@ -309,6 +309,24 @@ void sync_optionals_after_fetch(T& row, const std::vector<sb2>& indicators, stag
 // at the call site for an empty ID list.
 inline std::string make_in_placeholders(std::size_t count, ub4 start_position = 1) {
     if (count == 0) return "NULL";
+
+    // ORA-01795: "maximum number of expressions in a list is 1000". This is
+    // a parser-level cap on a syntactic IN (...) list -- it applies whether
+    // the elements are literals or bind placeholders, and has nothing to do
+    // with the 64KB max SQL statement text length (which a placeholder list
+    // this size comes nowhere near). Caught here with a clear message
+    // instead of surfacing as an opaque ORA-01795 from OCIStmtExecute. See
+    // "Dynamic IN (...) lists" in the README for the collection-bind
+    // alternative, which isn't subject to this cap.
+    constexpr std::size_t oracle_max_in_list_size = 1000;
+    if (count > oracle_max_in_list_size) {
+        throw std::runtime_error(
+            "binding: IN list has " + std::to_string(count) +
+            " elements, but Oracle limits a plain IN (...) list to " +
+            std::to_string(oracle_max_in_list_size) +
+            " (ORA-01795) -- use a collection bind for larger lists");
+    }
+
     std::string result;
     for (std::size_t i = 0; i < count; ++i) {
         if (i) result += ',';
