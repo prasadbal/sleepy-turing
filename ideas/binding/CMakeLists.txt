@@ -45,3 +45,13 @@ endif()
 
 add_executable(binding_demo examples/main.cpp)
 target_link_libraries(binding_demo PRIVATE binding)
+
+# config_demo additionally needs boost::property_tree, which (unlike pfr)
+# isn't available through the standalone-pfr FetchContent fallback above --
+# it needs an actual local Boost install. Only build it when one was found.
+if(BINDING_BOOST_INCLUDE_DIR)
+    add_executable(config_demo examples/config_demo.cpp)
+    target_link_libraries(config_demo PRIVATE binding)
+else()
+    message(STATUS "binding: no local Boost install found, skipping config_demo (needs boost::property_tree)")
+endif()

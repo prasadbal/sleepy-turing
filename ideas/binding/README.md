@@ -36,6 +36,19 @@ that's worth doing, not a committed dependency.
   recovers, a plain exec error that must not retry, a `SELECT` into
   `vector<T>`, binding an empty `std::optional` as SQL NULL, and a `SELECT`
   where a NULL column comes back as `std::nullopt`.
+- `include/binding/field_tree.h` -- `Field`/`FieldList`: a parser-independent
+  (name, value) tree that config parsing converts into, before it ever meets
+  a user struct.
+- `include/binding/ptree_bridge.h` -- `from_ptree()`, the one place
+  `boost::property_tree` is named: converts a parsed `ptree` (e.g. from
+  `read_xml`) into a `FieldList`.
+- `include/binding/config_bind.h` -- `bind_from_fields<T>()`: binds a
+  `FieldList` onto a `config_schema<T>` struct by field *name* (see below),
+  matched case-insensitively.
+- `examples/config_demo.cpp` -- parses a small XML config with attributes,
+  a nested attribute-only element, three repeated elements, mixed-case keys,
+  and a field absent from the XML; then shows the missing-required-field
+  error path.
 
 ## NULL handling (std::optional<U>)
 
@@ -66,20 +79,38 @@ this file had that bug too, since no demo exercised a raw string bind).
 into before it knows how long the value is, and this client doesn't manage
 that yet.
 
-## Why positional binds, not named
+## Why OCI binds by position but config binds by name
 
 The first draft of the OCI code bound by name (`OCIBindByName`, deriving
 `:PLACEHOLDER` from the struct's field name via `boost::pfr::names_of`).
 Field-*name* reflection in `boost::pfr` depends on parsing compiler-specific
 `__FUNCSIG__`/`__PRETTY_FUNCTION__` output and isn't reliably available on
-MSVC, which is the actual compiler target this idea started from (see the
-`flat_schema` concept in `reflect.h` and the note in `oci_client.h`).
-`tuple_size`/`tuple_element_t`/`for_each_field` -- the only primitives this
-directory depends on -- always iterate in declaration order on every
-compiler, so binding/defining *by position* sidesteps the problem entirely.
-The cost: bind placeholders in your SQL text must occur left-to-right in the
-same order as the struct's fields (see the comment on `FinancialUpdate` in
+MSVC, which is the actual compiler target this idea started from. So
+`oci_client.h` binds/defines *by position* instead --
+`tuple_size`/`tuple_element_t`/`for_each_field`/`get`, the only primitives it
+depends on, always iterate in declaration order on every compiler. The cost:
+bind placeholders in your SQL text must occur left-to-right in the same
+order as the struct's fields (see the comment on `FinancialUpdate` in
 `main.cpp`), not by matching names.
+
+`config_bind.h` makes the opposite call, deliberately: it uses
+`boost::pfr::names_as_array<T>()` and matches a struct field to a `Field` of
+the same name, case-insensitively (`iequals`). Two reasons position doesn't
+work here the way it does for OCI:
+
+- A repeated XML element (see `field_tree.h`) isn't a distinct "array" thing
+  in the `FieldList` -- it's just several `Field` entries that happen to
+  share a name, wherever they land among their differently-named siblings.
+  A `vector<Replica>` field has to gather *all* of them by name; there's no
+  single struct-field-index <-> `FieldList`-index correspondence to walk
+  positionally once repetition is in play.
+- Config files are edited by humans who reasonably expect reordering keys
+  not to break parsing, unlike SQL bind parameter order, which has no such
+  expectation.
+
+This is a confirmed, deliberate choice for config binding specifically, not
+a reversal of the position-based decision for OCI -- see the note at the top
+of `reflect.h`.
 
 ## Reconnect policy
 
@@ -96,6 +127,46 @@ by both `execute()` and `query()`:
   return failure immediately. It is not retried, because retrying an exec
   error just reproduces it.
 
+## Config binding (FieldList -> struct)
+
+`field_tree.h` defines the shape parsed config data takes before it meets a
+struct:
+
+```cpp
+struct Field {
+    std::string name;
+    std::variant<std::string, FieldList> value;   // leaf, or a nested struct
+};
+using FieldList = std::vector<Field>;
+```
+
+`ptree_bridge.h`'s `from_ptree()` converts a `boost::property_tree::ptree`
+(e.g. from `read_xml`) into this shape -- it's the only file that names
+`boost::property_tree` at all, so a TOML/INI/JSON source could produce the
+same `FieldList` without anything downstream caring. Two things it does on
+XML's behalf: attributes come back from `xml_parser` nested one level down
+under a synthetic `<xmlattr>` child, which `from_ptree()` flattens into the
+parent level; and an attribute-only self-closing element like
+`<pool size="10"/>` becomes a one-field nested struct
+(`{pool: {size: "10"}}`), not a bare leaf, since collapsing it further would
+lose the attribute's own name.
+
+`reflect.h`'s `config_schema<T>` extends `flat_schema` to also allow a field
+that's a nested `config_schema` struct, or a `std::vector<U>` of one (the
+repeated-element case) -- both recurse through the same
+`struct_field_auditor` engine used everywhere else in this directory.
+
+`config_bind.h`'s `bind_from_fields<T>(fields, out)` walks `T`'s fields by
+name (see above for why) and, per field: an absent `std::optional` leaf
+becomes `nullopt`; a present leaf is parsed via `std::from_chars` (rejecting
+partial matches like `"10abc"`) or taken as-is for `std::string`; a nested
+struct field recurses into the one matching same-named `Field`; a
+`std::vector<U>` field recurses into *every* same-named `Field`, in order.
+A missing required field, or a value of the wrong shape (a leaf where a
+struct was expected, or vice versa), throws `std::runtime_error` naming the
+offending field -- config errors are a fail-fast-at-startup case, unlike the
+OCI side's error handling, so this doesn't try to be exception-free.
+
 ## What's deliberately not here
 
 - Transaction/commit handling (`OCITransCommit` / `OCI_COMMIT_ON_SUCCESS`) --
@@ -104,18 +175,34 @@ by both `execute()` and `query()`:
   against both, for the same fixed-buffer-size reason).
 - Nullable LOBs (`std::optional<OciClob>`) -- LOB fields always bind/define
   as not-null for now.
-- Config-file binding itself (XML/TOML -> `flat_schema` struct) -- the
-  concept exists in `reflect.h`, but no parser is wired to it yet. That's
-  the natural next step if this idea goes anywhere.
+- Non-`std::string` string-like leaf types in `config_bind.h`'s
+  `parse_leaf_value` (only `std::string` and arithmetic types are handled;
+  a custom string-view-convertible type would satisfy `is_bindable_leaf`
+  but hit a `static_assert` here).
+- Wiring `Config` (the project's existing TOML-based config class in
+  `core/config`) up to any of this -- this is XML-shaped scaffolding sitting
+  next to it, not a replacement.
 
 ## Compiling
 
-Verified end to end on this host: `g++ 15.2` / C++20, both via
-`cmake -S -B` / `--build` (using `CMakeLists.txt`, pointed at
-`/mnt/c/local/boost_1_91_0` through `BOOST_ROOT`) and via a direct `g++`
-invocation with `-Wall -Wextra -Wpedantic -Wshadow` (clean except for one
-warning inside Boost's own `core_name20_static.hpp`, unrelated to this
-code). Not yet verified against MSVC -- the `flat_schema`/`struct_field_auditor`
-engine in `reflect.h` has already needed two MSVC-specific workarounds (see
+Verified end to end on this host: `g++ 15.2` / C++20 / Boost 1.91, both
+`binding_demo` (OCI) and `config_demo` (XML config), via `cmake -S -B` /
+`--build` (using `CMakeLists.txt`, pointed at `/mnt/c/local/boost_1_91_0`
+through `BOOST_ROOT`) and via a direct `g++` invocation with
+`-Wall -Wextra -Wpedantic -Wshadow` (clean except for one warning inside
+Boost's own `core_name20_static.hpp`, unrelated to this code).
+`config_demo` additionally needs `boost::property_tree`, which the
+FetchContent fallback (standalone `pfr` only) doesn't provide -- it only
+builds when `BINDING_BOOST_INCLUDE_DIR` resolves to a real local Boost
+install.
+
+Not yet verified against MSVC. That matters more for `config_bind.h` than
+anywhere else in this directory: it's the one place that uses
+`boost::pfr::names_as_array()`, the field-name-reflection feature the rest
+of this directory deliberately avoids as MSVC-unreliable (see "Why OCI binds
+by position but config binds by name" above) -- confirmed as a deliberate,
+working choice in conversation, but still only compiler-tested on g++ here.
+The `flat_schema`/`oci_row_schema`/`config_schema` position-based engine in
+`reflect.h` has separately already needed two MSVC-specific workarounds (see
 the comments on `struct_field_auditor` and `check_field`), so treat MSVC as
-untested until it's actually been built there.
+untested for this directory generally until it's actually been built there.

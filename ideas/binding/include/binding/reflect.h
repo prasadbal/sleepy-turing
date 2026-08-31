@@ -3,19 +3,28 @@
 #include <string_view>
 #include <cstddef>
 #include <optional>
+#include <vector>
 #include <boost/pfr.hpp>
 
 // ============================================================================
 // Shared compile-time reflection core, built on boost::pfr.
 //
-// This is deliberately built only from boost::pfr::tuple_size /
-// boost::pfr::tuple_element_t / boost::pfr::for_each_field -- the stable
-// primitives that work identically on MSVC, GCC and clang (they rely on
-// aggregate init + structured bindings, not on compiler-specific name
-// capture). boost::pfr's *field name* reflection (names_of / names_as_array)
-// depends on parsing __FUNCSIG__/__PRETTY_FUNCTION__-style compiler output
-// and is not consistently available on MSVC, so nothing in this directory
-// depends on it -- see oci_client.h, which binds by position instead.
+// The position-based half of this (struct_field_auditor, is_bindable_leaf,
+// flat_schema/oci_row_schema) is deliberately built only from
+// boost::pfr::tuple_size / tuple_element_t / for_each_field/get -- the
+// stable primitives that work identically on MSVC, GCC and clang (they rely
+// on aggregate init + structured bindings, not on compiler-specific name
+// capture). oci_client.h binds/defines by field position for exactly this
+// reason.
+//
+// config_schema (below) is the one place that breaks that rule on purpose:
+// nested/repeated config structs (see field_tree.h) need to match a struct
+// field to a same-named XML element or attribute wherever it appears, which
+// position alone can't express once repeated elements are involved. That
+// needs boost::pfr::names_as_array()'s field-name reflection, which is the
+// __FUNCSIG__/__PRETTY_FUNCTION__-parsing feature the paragraph above avoids
+// -- config_bind.h's use of it is a deliberate, confirmed-working choice for
+// config binding specifically, not a change of position on the OCI side.
 // ============================================================================
 
 namespace binding {
@@ -129,5 +138,61 @@ struct leaf_only_predicate {
 // repeated sections) -- no pointers, no const members, no nested structs.
 template <typename T>
 concept flat_schema = struct_field_auditor<T, leaf_only_predicate>::value;
+
+// ----------------------------------------------------------------------------
+// std::vector<U> recognition -- the "repeated element" case for config_schema
+// below (see field_tree.h: a repeated XML element isn't a distinct Field
+// variant, just several same-named entries, so the struct side needs to know
+// which of its fields are meant to collect all of them).
+// ----------------------------------------------------------------------------
+template <typename T>
+struct is_vector_impl : std::false_type {};
+template <typename U>
+struct is_vector_impl<std::vector<U>> : std::true_type {};
+
+template <typename T>
+inline constexpr bool is_vector_v = is_vector_impl<std::remove_cv_t<T>>::value;
+
+template <typename T>
+struct vector_value_impl { using type = void; };
+template <typename U>
+struct vector_value_impl<std::vector<U>> { using type = U; };
+
+// The U in std::vector<U>; only meaningful when is_vector_v<T> is true.
+template <typename T>
+using vector_value_t = typename vector_value_impl<std::remove_cv_t<T>>::type;
+
+// ----------------------------------------------------------------------------
+// Predicate: every field is a bindable leaf, OR a nested config_schema
+// struct, OR a std::vector<U> of a nested config_schema struct (a repeated
+// element). Recurses through struct_field_auditor itself rather than through
+// the config_schema concept directly, for the same reason check_field()
+// folds over a function call instead of a raw expression -- keeping the
+// recursive step a plain function body, not something folded/expanded
+// inline, avoids giving MSVC's template parser another nested-angle-bracket
+// shape to trip on.
+// ----------------------------------------------------------------------------
+struct config_field_predicate {
+    template <typename U>
+    static constexpr bool check() {
+        if constexpr (is_bindable_leaf_v<U>) {
+            return true;
+        } else if constexpr (is_vector_v<U>) {
+            return struct_field_auditor<vector_value_t<U>, config_field_predicate>::value;
+        } else if constexpr (is_bindable_struct_v<U>) {
+            return struct_field_auditor<U, config_field_predicate>::value;
+        } else {
+            return false;
+        }
+    }
+};
+
+// Public concept: T is a config-shaped struct -- fields are leaves,
+// std::optional<leaf> (absent when the field is missing), nested
+// config_schema structs (a child element's attributes/children), or
+// std::vector<U> of a nested config_schema struct (repeated child
+// elements). See config_bind.h for the FieldList -> T binder that uses this.
+template <typename T>
+concept config_schema = struct_field_auditor<T, config_field_predicate>::value;
 
 } // namespace binding
