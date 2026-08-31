@@ -1,5 +1,7 @@
 #pragma once
 #include <optional>
+#include <set>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -201,6 +203,36 @@ inline void free_locators(std::vector<OCILobLocator**>& active_locators) {
     active_locators.clear();
 }
 
+// ---- dynamic IN (...) lists -------------------------------------------------
+
+// Binds every element of `values` as a positional IN parameter, starting at
+// start_position. Takes a std::set, not a vector: an IN list rarely benefits
+// from a repeated value (it only adds a redundant bind), and iterating a set
+// gives a deterministic order, so the same logical set of values always
+// produces the same generated SQL text regardless of what order the caller
+// happened to collect them in -- Oracle's shared-pool cursor cache is keyed
+// on SQL text, so that determinism is what keeps a given IN-list size from
+// fragmenting into many distinct cached cursors for no reason.
+template <typename ElemType>
+void bind_in_list(OCIStmt* stmt, OciConnection& conn, const std::set<ElemType>& values,
+                   ub4 start_position, std::vector<sb2>& indicators) {
+    ub4 position = start_position;
+    for (const ElemType& value : values) {
+        const std::size_t idx = position - start_position;
+        indicators[idx] = OCI_IND_NOTNULL;
+        OCIBind* bind_handle = nullptr;
+        // OCIBindByPos's valuep is non-const even for an IN-only bind (OCI
+        // never writes through it here); const_cast matches the same
+        // read-only-through-a-mutable-pointer pattern raw_bind_args already
+        // uses for std::string_view content.
+        auto [value_ptr, bind_size] = raw_bind_args(const_cast<ElemType&>(value));
+        OCIBindByPos(stmt, &bind_handle, conn.err(), position,
+                    value_ptr, bind_size, oci_type_code_v<ElemType>,
+                    &indicators[idx], nullptr, nullptr, 0, nullptr, OCI_DEFAULT);
+        ++position;
+    }
+}
+
 // ---- define (query(): SELECT columns -> struct) ----------------------------
 
 template <std::size_t I, oci_row_schema T>
@@ -267,6 +299,36 @@ void sync_optionals_after_fetch(T& row, const std::vector<sb2>& indicators, stag
 
 } // namespace detail
 
+// Builds "start,start+1,...,start+count-1" as ":N,:N+1,..." for splicing an
+// IN (...) clause into a query template -- Oracle needs the exact number of
+// bind placeholders fixed in the prepared SQL text itself, so the caller's
+// template gets re-instantiated to match the collection's size before every
+// prepare. An empty collection produces "NULL": "IN ()" is a SQL syntax
+// error, but "IN (NULL)" is valid and, since x = NULL is never true in SQL's
+// three-valued logic, correctly matches nothing -- no special-casing needed
+// at the call site for an empty ID list.
+inline std::string make_in_placeholders(std::size_t count, ub4 start_position = 1) {
+    if (count == 0) return "NULL";
+    std::string result;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (i) result += ',';
+        result += ':' + std::to_string(start_position + i);
+    }
+    return result;
+}
+
+// Replaces the one "{IN}" marker in `query_template` with `placeholders`.
+inline std::string substitute_in_marker(const std::string& query_template, const std::string& placeholders) {
+    constexpr std::string_view marker = "{IN}";
+    const auto pos = query_template.find(marker);
+    if (pos == std::string::npos) {
+        throw std::runtime_error("binding: query template is missing the {IN} placeholder marker");
+    }
+    std::string result = query_template;
+    result.replace(pos, marker.size(), placeholders);
+    return result;
+}
+
 // ----------------------------------------------------------------------------
 // Core database execution client.
 // ----------------------------------------------------------------------------
@@ -305,6 +367,56 @@ public:
         return conn.run_with_reconnect([&]() -> OciOutcome {
             return run_query_once(conn, query_text, results);
         });
+    }
+
+    // SELECT with a dynamic IN (...) list as the query's only bind
+    // parameters. `query_template` must contain exactly one "{IN}" marker,
+    // e.g. "SELECT trade_id, notional FROM trades WHERE trade_id IN ({IN})",
+    // which gets replaced with a placeholder list sized to ids.size() (see
+    // make_in_placeholders) before preparing. See bind_in_list for why the
+    // list is a std::set, not a std::vector.
+    //
+    // A different ids.size() re-prepares with different SQL text each call
+    // -- fine for occasional or boundedly-sized lists, but each distinct
+    // size becomes its own entry in Oracle's shared-pool cursor cache. For
+    // very large or highly variable-sized lists, an Oracle collection-type
+    // bind (WHERE id IN (SELECT column_value FROM TABLE(:1))) keeps the SQL
+    // text fixed regardless of size -- not implemented here yet (see the
+    // README: same OCIType/OCIObject* machinery as the nested-column-type
+    // gap on the query() side).
+    template <typename ElemType, oci_row_schema T>
+    bool query_with_in_list(OciConnection& conn, const std::string& query_template,
+                             const std::set<ElemType>& ids, std::vector<T>& results) {
+        return conn.run_with_reconnect([&]() -> OciOutcome {
+            return run_query_with_in_list_once(conn, query_template, ids, results);
+        });
+    }
+
+    // Convenience overload: dedupes and orders `ids` into a std::set first
+    // (see bind_in_list for why that matters), then delegates.
+    template <typename ElemType, oci_row_schema T>
+    bool query_with_in_list(OciConnection& conn, const std::string& query_template,
+                             const std::vector<ElemType>& ids, std::vector<T>& results) {
+        return query_with_in_list(conn, query_template,
+                                   std::set<ElemType>(ids.begin(), ids.end()), results);
+    }
+
+    // DML (e.g. "DELETE FROM trades WHERE trade_id IN ({IN})") with a
+    // dynamic IN (...) list as the statement's only bind parameters. Same
+    // reconnect-on-disconnect-only policy and the same {IN}-marker/std::set
+    // rules as query_with_in_list.
+    template <typename ElemType>
+    bool execute_with_in_list(OciConnection& conn, const std::string& query_template,
+                               const std::set<ElemType>& ids) {
+        return conn.run_with_reconnect([&]() -> OciOutcome {
+            return run_execute_with_in_list_once(conn, query_template, ids);
+        });
+    }
+
+    template <typename ElemType>
+    bool execute_with_in_list(OciConnection& conn, const std::string& query_template,
+                               const std::vector<ElemType>& ids) {
+        return execute_with_in_list(conn, query_template, std::set<ElemType>(ids.begin(), ids.end()));
     }
 
 private:
@@ -372,6 +484,69 @@ private:
 
         OCIHandleFree(stmt, OCI_HTYPE_STMT);
         return {true, OCI_SUCCESS};
+    }
+
+    template <typename ElemType, oci_row_schema T>
+    OciOutcome run_query_with_in_list_once(OciConnection& conn, const std::string& query_template,
+                                            const std::set<ElemType>& ids, std::vector<T>& results) {
+        results.clear();
+        const std::string sql = substitute_in_marker(query_template, make_in_placeholders(ids.size(), 1));
+
+        OCIStmt* stmt = nullptr;
+        OCIHandleAlloc(conn.env(), reinterpret_cast<void**>(&stmt), OCI_HTYPE_STMT, 0, nullptr);
+        OCIStmtPrepare(stmt, conn.err(),
+                       reinterpret_cast<const text*>(sql.c_str()),
+                       static_cast<ub4>(sql.size()),
+                       OCI_NTV_SYNTAX, OCI_DEFAULT);
+
+        std::vector<sb2> in_indicators(ids.size(), OCI_IND_NOTNULL);
+        detail::bind_in_list(stmt, conn, ids, 1, in_indicators);
+
+        T row_buffer{};
+        std::vector<sb2> row_indicators(boost::pfr::tuple_size_v<T>, OCI_IND_NOTNULL);
+        detail::staging_tuple_t<T> staging{};
+        detail::define_fields(stmt, conn, row_buffer, row_indicators, staging);
+
+        sword status = OCIStmtExecute(conn.svc(), stmt, conn.err(), 0, 0, nullptr, nullptr, OCI_DEFAULT);
+        if (status != OCI_SUCCESS) {
+            OCIHandleFree(stmt, OCI_HTYPE_STMT);
+            return {false, status};
+        }
+
+        for (;;) {
+            status = OCIStmtFetch2(stmt, conn.err(), 1, OCI_FETCH_NEXT, 0, OCI_DEFAULT);
+            if (status == OCI_NO_DATA) break;
+            if (status != OCI_SUCCESS) {
+                OCIHandleFree(stmt, OCI_HTYPE_STMT);
+                return {false, status};
+            }
+            detail::sync_optionals_after_fetch(row_buffer, row_indicators, staging,
+                                                std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
+            results.push_back(row_buffer);
+        }
+
+        OCIHandleFree(stmt, OCI_HTYPE_STMT);
+        return {true, OCI_SUCCESS};
+    }
+
+    template <typename ElemType>
+    OciOutcome run_execute_with_in_list_once(OciConnection& conn, const std::string& query_template,
+                                              const std::set<ElemType>& ids) {
+        const std::string sql = substitute_in_marker(query_template, make_in_placeholders(ids.size(), 1));
+
+        OCIStmt* stmt = nullptr;
+        OCIHandleAlloc(conn.env(), reinterpret_cast<void**>(&stmt), OCI_HTYPE_STMT, 0, nullptr);
+        OCIStmtPrepare(stmt, conn.err(),
+                       reinterpret_cast<const text*>(sql.c_str()),
+                       static_cast<ub4>(sql.size()),
+                       OCI_NTV_SYNTAX, OCI_DEFAULT);
+
+        std::vector<sb2> indicators(ids.size(), OCI_IND_NOTNULL);
+        detail::bind_in_list(stmt, conn, ids, 1, indicators);
+
+        const sword status = OCIStmtExecute(conn.svc(), stmt, conn.err(), 1, 0, nullptr, nullptr, OCI_DEFAULT);
+        OCIHandleFree(stmt, OCI_HTYPE_STMT);
+        return {status == OCI_SUCCESS, status};
     }
 };
 

@@ -167,6 +167,46 @@ struct was expected, or vice versa), throws `std::runtime_error` naming the
 offending field -- config errors are a fail-fast-at-startup case, unlike the
 OCI side's error handling, so this doesn't try to be exception-free.
 
+## Dynamic IN (...) lists
+
+`OciClient::query_with_in_list()` / `execute_with_in_list()` handle a
+variable-length `WHERE col IN (...)`. `query_template` carries one `{IN}`
+marker -- e.g. `"SELECT trade_id, notional FROM trades WHERE trade_id IN
+({IN})"` -- which `make_in_placeholders()` expands to `:1,:2,...,:N` sized
+to the ID collection, before `OCIStmtPrepare` (Oracle needs the exact
+placeholder count fixed in the SQL text itself; there's no variable-arity
+bind). `bind_in_list()` then binds each element positionally, reusing the
+same `raw_bind_args`/`oci_type_code_v` machinery the struct binder uses.
+
+The ID collection is a `std::set<ElemType>`, not a `std::vector` (a
+`std::vector` overload exists too, but only as a convenience that dedupes
+into a set before delegating) -- for two reasons:
+
+- **Dedup.** A repeated value in an `IN` list is never meaningful, only a
+  wasted bind.
+- **Deterministic order.** Oracle's shared-pool cursor cache is keyed on
+  SQL text. Two calls with the same *logical* set of IDs must generate
+  identical placeholder text and bind order regardless of what order the
+  caller happened to collect them in, or they needlessly fragment into
+  separate cached cursors.
+
+An empty collection expands to the literal `NULL` rather than an empty
+placeholder list -- `... IN ()` is a SQL syntax error, but `... IN (NULL)`
+is valid and (per SQL's three-valued logic, `x = NULL` is never true)
+correctly matches zero rows. No special-casing needed at the call site for
+an empty ID list.
+
+**Why placeholder generation, not an Oracle collection bind.** The other
+real option is binding one Oracle collection object (`SYS.ODCINUMBERLIST`
+or a custom type) via `OCIType`/`OCIObjectNew`/`OCICollAppend` with
+`SQLT_NTY`, then querying `WHERE id IN (SELECT column_value FROM
+TABLE(:1))` -- fixed SQL text regardless of list size, so no shared-pool
+fragmentation as sizes vary. It needs the same `OCIType`/`OCIObject*`
+machinery as the nested-column-type gap above, which this client doesn't
+have yet. Placeholder generation is what's implemented for now: simpler,
+and fine for occasional or boundedly-sized lists; revisit if a real use
+case needs very large or wildly variable-sized ones.
+
 ## What's deliberately not here
 
 - Transaction/commit handling (`OCITransCommit` / `OCI_COMMIT_ON_SUCCESS`) --
@@ -192,12 +232,8 @@ OCI side's error handling, so this doesn't try to be exception-free.
   everything else here is built on. `oci_row_schema` correctly rejects a
   nested/`vector<U>` field today; it just doesn't yet offer a way to
   actually bind one of these two column kinds when you do need it.
-- Binding a collection for a SQL `IN (...)` clause -- variable-length
-  `WHERE col IN (:1, :2, ...)` needs either a generated placeholder list
-  sized to the collection at prepare time, or an Oracle collection-type
-  bind (`OCITypeByName` + `OCICollAppend`, or a temp table/array join), and
-  neither fits the fixed-one-value-per-position model `bind_fields`/
-  `OCIBindByPos` use today. Deferred -- not designed yet.
+- An Oracle collection-type bind for `IN (...)` (see "Dynamic IN (...)
+  lists" below for what *is* implemented, and why this alternative isn't).
 
 ## Compiling
 
