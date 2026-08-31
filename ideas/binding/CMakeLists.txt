@@ -46,6 +46,9 @@ endif()
 add_executable(binding_demo examples/main.cpp)
 target_link_libraries(binding_demo PRIVATE binding)
 
+add_executable(collection_demo examples/collection_demo.cpp)
+target_link_libraries(collection_demo PRIVATE binding)
+
 # config_demo additionally needs boost::property_tree, which (unlike pfr)
 # isn't available through the standalone-pfr FetchContent fallback above --
 # it needs an actual local Boost install. Only build it when one was found.

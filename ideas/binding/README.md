@@ -196,16 +196,52 @@ is valid and (per SQL's three-valued logic, `x = NULL` is never true)
 correctly matches zero rows. No special-casing needed at the call site for
 an empty ID list.
 
-**Why placeholder generation, not an Oracle collection bind.** The other
-real option is binding one Oracle collection object (`SYS.ODCINUMBERLIST`
-or a custom type) via `OCIType`/`OCIObjectNew`/`OCICollAppend` with
-`SQLT_NTY`, then querying `WHERE id IN (SELECT column_value FROM
-TABLE(:1))` -- fixed SQL text regardless of list size, so no shared-pool
-fragmentation as sizes vary. It needs the same `OCIType`/`OCIObject*`
-machinery as the nested-column-type gap above, which this client doesn't
-have yet. Placeholder generation is what's implemented for now: simpler,
-and fine for occasional or boundedly-sized lists; revisit if a real use
-case needs very large or wildly variable-sized ones.
+`make_in_placeholders()` also enforces Oracle's other, sharper limit here:
+**ORA-01795** -- a plain `IN (...)` list, whether its elements are literals
+or bind placeholders, is capped at 1000 expressions by the parser itself.
+That's unrelated to (and hit long before) the 64KB max SQL statement text
+length -- a 1000-placeholder list is nowhere near that. Passing more than
+1000 elements throws a clear error naming the actual limit, instead of
+letting it surface as an opaque `ORA-01795` from `OCIStmtExecute`. Beyond
+1000, or to avoid shared-pool fragmentation as list sizes vary, see the
+collection bind below.
+
+## Dynamic IN (...) lists via a collection bind (oci_collection_bind.h)
+
+`query_with_in_collection()` is the alternative to `query_with_in_list()`
+above: instead of generating a placeholder list sized to the collection, it
+binds *one* Oracle collection object and queries
+`WHERE id IN (SELECT column_value FROM TABLE(:1))`. The SQL text is fixed
+regardless of how many elements are in the collection -- no ORA-01795 cap,
+no shared-pool fragmentation as sizes vary between calls.
+
+`OciCollectionTypeBinder<ElemType>` maps the element type to an Oracle SQL
+collection type to bind through, defaulting to Oracle's built-in ODCI
+schema types so the common case needs no schema setup:
+`SYS.ODCINUMBERLIST` for arithmetic types, `SYS.ODCIVARCHAR2LIST` for
+strings. `build_in_collection()` looks up that type (`OCITypeByName`),
+creates a new empty instance of it (`OCIObjectNew`), and appends every
+element (`OCICollAppend`, via `OCINumberFromInt` for a NUMBER element).
+`query_with_in_collection()` then binds the whole collection as one
+parameter (`OCIBindByPos` with `SQLT_NTY`, followed by `OCIBindObject`) and
+frees it (`OCIObjectFree`) after the fetch loop -- otherwise the same
+shape as `query()` in `oci_client.h`.
+
+**This is meaningfully lower-confidence than the rest of this directory.**
+Everything else here binds/defines through `OCIBindByPos`/`OCIDefineByPos`
+-- a handful of well-documented, thoroughly-used scalar OCI calls. Oracle's
+object/collection API (`OCIType`, `OCIObjectNew`, `OCICollAppend`,
+`OCIBindObject`) is a genuinely more obscure corner of OCI, and there's no
+real `oci.h`/`ociap.h` on this machine to check `oci_object_mock.h`'s
+signatures against -- they're written from documentation recall, not
+verified the way the rest of this codebase's OCI signatures have been.
+What *is* verified: `oci_collection_bind.h` compiles and runs correctly
+against its own mock (`examples/collection_demo.cpp`, both a `std::string`
+and an `int` element type), proving the C++ template plumbing hangs
+together. What's *not* verified is that the mock's signatures faithfully
+match a real client's. Diff `oci_object_mock.h` against the actual
+`oci.h`/`ociap.h` before trusting this against a live database -- see the
+warning banner at the top of `oci_collection_bind.h`.
 
 ## What's deliberately not here
 
@@ -232,13 +268,16 @@ case needs very large or wildly variable-sized ones.
   everything else here is built on. `oci_row_schema` correctly rejects a
   nested/`vector<U>` field today; it just doesn't yet offer a way to
   actually bind one of these two column kinds when you do need it.
-- An Oracle collection-type bind for `IN (...)` (see "Dynamic IN (...)
-  lists" below for what *is* implemented, and why this alternative isn't).
+- Using the same `OCIType`/`OCIObjectNew`/`OCICollAppend` machinery for
+  actual Oracle object-type/nested-table *columns* (the point above) --
+  `oci_collection_bind.h` only uses it for one specific purpose (a bound
+  IN-list collection), not as a general nested-column-value binder.
 
 ## Compiling
 
-Verified end to end on this host: `g++ 15.2` / C++20 / Boost 1.91, both
-`binding_demo` (OCI) and `config_demo` (XML config), via `cmake -S -B` /
+Verified end to end on this host: `g++ 15.2` / C++20 / Boost 1.91, all three
+demos (`binding_demo` for OCI, `config_demo` for XML config,
+`collection_demo` for the collection-bind IN-list), via `cmake -S -B` /
 `--build` (using `CMakeLists.txt`, pointed at `/mnt/c/local/boost_1_91_0`
 through `BOOST_ROOT`) and via a direct `g++` invocation with
 `-Wall -Wextra -Wpedantic -Wshadow` (clean except for one warning inside
@@ -246,7 +285,8 @@ Boost's own `core_name20_static.hpp`, unrelated to this code).
 `config_demo` additionally needs `boost::property_tree`, which the
 FetchContent fallback (standalone `pfr` only) doesn't provide -- it only
 builds when `BINDING_BOOST_INCLUDE_DIR` resolves to a real local Boost
-install.
+install. See "Dynamic IN (...) lists via a collection bind" above for why
+`collection_demo` passing here is weaker evidence than the other two.
 
 Not yet verified against MSVC. That matters more for `config_bind.h` than
 anywhere else in this directory: it's the one place that uses
