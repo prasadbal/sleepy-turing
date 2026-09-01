@@ -141,7 +141,12 @@ inline sword OCIStmtPrepare(OCIStmt*, OCIError*, const text*, ub4, ub4, ub4) {
 }
 
 inline sword OCIBindByName(OCIStmt*, OCIBind**, OCIError*, const text*, sb4,
-                            dvoid*, sb4, ub2, dvoid*, ub2*, ub2*, ub4, ub4*, ub4) {
+                            dvoid*, sb4, ub2, dvoid* indp, ub2*, ub2*, ub4, ub4*, ub4) {
+    // Tracked in call order (bind_fields() in oci_client.h always binds a
+    // struct's fields in declaration order), same convention OCIBindByPos
+    // uses positionally -- g_last_bind_indicators[i] is the i-th bound
+    // field's indicator either way.
+    binding::mock::g_last_bind_indicators.push_back(indp ? *static_cast<sb2*>(indp) : OCI_IND_NOTNULL);
     return OCI_SUCCESS;
 }
 

@@ -1,8 +1,8 @@
 // Demo for oci_collection_bind.h -- the Oracle collection-type alternative
-// to oci_client.h's query_with_in_list(): one bound collection object
+// to oci_client.h's select_with_in_list(): one bound collection object
 // instead of a generated ":1,:2,...,:N" placeholder list, so the SQL text
 // stays fixed regardless of how many elements are in the list (and isn't
-// subject to query_with_in_list()'s 1000-element ORA-01795 cap).
+// subject to select_with_in_list()'s 1000-element ORA-01795 cap).
 //
 // See the warning banner at the top of oci_collection_bind.h: this exercises
 // the C++ template plumbing against this repo's own mock, which proves the
@@ -25,7 +25,7 @@ struct TradeRow {
     int trade_id;
     double notional;
 };
-static_assert(binding::oci_row_schema<TradeRow>);
+static_assert(binding::bindable<TradeRow>);
 
 int main() {
     binding::OciConnection conn("orcl", "app_user", "secret", 3, std::chrono::milliseconds(200));
@@ -34,7 +34,7 @@ int main() {
     std::set<std::string> reference_codes = {"REF-C", "REF-A", "REF-A", "REF-B"}; // one duplicate, on purpose
 
     std::vector<TradeRow> rows;
-    bool ok = binding::query_with_in_collection(
+    bool ok = binding::select_with_in_collection(
         conn,
         "SELECT trade_id, notional FROM trades "
         "WHERE ref_code IN (SELECT column_value FROM TABLE(:1))",
@@ -46,7 +46,7 @@ int main() {
               << binding::mock::g_last_type_lookup_schema << "."
               << binding::mock::g_last_type_lookup_name
               << " (expected SYS.ODCIVARCHAR2LIST for a std::string element type)\n";
-    std::cout << "query_with_in_collection result=" << (ok ? "success" : "failed")
+    std::cout << "select_with_in_collection result=" << (ok ? "success" : "failed")
               << ", rows returned=" << rows.size()
               << " (the mock always returns its canned rows -- it doesn't actually filter)\n";
     for (const auto& r : rows) {

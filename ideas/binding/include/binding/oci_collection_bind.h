@@ -1,6 +1,6 @@
 #pragma once
 // Oracle collection-type bind for IN (...): the alternative to
-// oci_client.h's query_with_in_list()/execute_with_in_list(), which
+// oci_client.h's select_with_in_list()/execute_with_in_list(), which
 // generate ":1,:2,...,:N" placeholders sized to the collection at prepare
 // time. That approach is capped at 1000 elements (ORA-01795) and, since
 // each distinct list size is different SQL text, fragments Oracle's
@@ -117,11 +117,11 @@ bool build_in_collection(OciConnection& conn, const std::set<ElemType>& values,
 // column_value FROM TABLE(:1))" -- no {IN} marker/substitution needed,
 // since the whole collection is one bind regardless of how many elements
 // are in it. Not subject to the 1000-element ORA-01795 cap
-// query_with_in_list() has, and reuses the same SQL text (and so the same
+// select_with_in_list() has, and reuses the same SQL text (and so the same
 // cached cursor) no matter how the collection's size varies between calls.
-template <typename ElemType, oci_row_schema RowT>
-bool query_with_in_collection(OciConnection& conn, const std::string& query_text,
-                               const std::set<ElemType>& ids, std::vector<RowT>& results) {
+template <typename ElemType, bindable RowT>
+bool select_with_in_collection(OciConnection& conn, const std::string& query_text,
+                                const std::set<ElemType>& ids, std::vector<RowT>& results) {
     return conn.run_with_reconnect([&]() -> OciOutcome {
         results.clear();
 

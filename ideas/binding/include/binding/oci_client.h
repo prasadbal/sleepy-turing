@@ -42,13 +42,15 @@ template <typename T> inline constexpr ub2 oci_type_code_v = oci_type_code_of<T>
 // struct_field_auditor engine as flat_schema (binding/reflect.h) -- this is
 // the "config schema" and "SQL row schema" ideas sharing one MSVC-safe core.
 // ----------------------------------------------------------------------------
-struct oci_bindable_predicate {
+struct bindable_predicate {
     template <typename U>
     static constexpr bool check() { return is_bindable_leaf_v<U> || is_oci_lob_v<U>; }
 };
 
+// T can be bound as OciClient::execute()/insert()'s parameter struct or
+// select()'s result row.
 template <typename T>
-concept oci_row_schema = struct_field_auditor<T, oci_bindable_predicate>::value;
+concept bindable = struct_field_auditor<T, bindable_predicate>::value;
 
 namespace detail {
 
@@ -82,15 +84,16 @@ constexpr auto staging_tuple_type(std::index_sequence<Is...>)
 template <typename T>
 using staging_tuple_t = decltype(staging_tuple_type<T>(std::make_index_sequence<boost::pfr::tuple_size_v<T>>{}));
 
-// ---- bind (execute(): struct -> IN parameters) -----------------------------
+// ---- bind (execute()/insert(): struct -> IN parameters) --------------------
 
-template <std::size_t I, oci_row_schema T>
+template <std::size_t I, bindable T>
 void bind_one_field(OCIStmt* stmt, OciConnection& conn, T& row,
                      std::vector<OCILobLocator**>& active_locators,
-                     std::vector<sb2>& indicators, staging_tuple_t<T>& staging) {
+                     std::vector<sb2>& indicators, staging_tuple_t<T>& staging,
+                     std::string_view field_name) {
     using FieldType = boost::pfr::tuple_element_t<I, T>;
     auto& field = boost::pfr::get<I>(row);
-    constexpr ub4 position = I + 1;
+    const std::string placeholder = ":" + std::string(field_name);
     OCIBind* bind_handle = nullptr;
     indicators[I] = OCI_IND_NOTNULL;
 
@@ -111,7 +114,8 @@ void bind_one_field(OCIStmt* stmt, OciConnection& conn, T& row,
                          nullptr, nullptr, 0, 0);
         }
 
-        OCIBindByPos(stmt, &bind_handle, conn.err(), position,
+        OCIBindByName(stmt, &bind_handle, conn.err(),
+                    reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
                     reinterpret_cast<dvoid*>(&field.locator), sizeof(OCILobLocator*),
                     oci_type_code_v<FieldType>, &indicators[I], nullptr, nullptr, 0, nullptr, OCI_DEFAULT);
     } else if constexpr (is_optional_v<FieldType>) {
@@ -124,35 +128,39 @@ void bind_one_field(OCIStmt* stmt, OciConnection& conn, T& row,
             indicators[I] = OCI_IND_NULL;
         }
         auto [value_ptr, bind_size] = raw_bind_args(stage);
-        OCIBindByPos(stmt, &bind_handle, conn.err(), position,
+        OCIBindByName(stmt, &bind_handle, conn.err(),
+                    reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
                     value_ptr, bind_size, oci_type_code_v<FieldType>,
                     &indicators[I], nullptr, nullptr, 0, nullptr, OCI_DEFAULT);
     } else {
         auto [value_ptr, bind_size] = raw_bind_args(field);
-        OCIBindByPos(stmt, &bind_handle, conn.err(), position,
+        OCIBindByName(stmt, &bind_handle, conn.err(),
+                    reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
                     value_ptr, bind_size, oci_type_code_v<FieldType>,
                     &indicators[I], nullptr, nullptr, 0, nullptr, OCI_DEFAULT);
     }
 }
 
-template <oci_row_schema T, std::size_t... Is>
+template <bindable T, std::size_t... Is>
 void bind_fields_impl(OCIStmt* stmt, OciConnection& conn, T& row,
                        std::vector<OCILobLocator**>& active_locators,
                        std::vector<sb2>& indicators, staging_tuple_t<T>& staging,
                        std::index_sequence<Is...>) {
-    (bind_one_field<Is>(stmt, conn, row, active_locators, indicators, staging), ...);
+    constexpr auto names = boost::pfr::names_as_array<T>();
+    (bind_one_field<Is>(stmt, conn, row, active_locators, indicators, staging, names[Is]), ...);
 }
 
-// Binds every field of `row` as a parameter on `stmt`, in field-declaration
-// order. Deliberately positional (OCIBindByPos), not by name: name-based
-// binding would need boost::pfr's field-name reflection, which relies on
-// compiler-specific __FUNCSIG__/__PRETTY_FUNCTION__ parsing and is not
-// reliably available on MSVC. tuple_size/tuple_element_t/get (used here) are
-// stable everywhere and always iterate in declaration order, so position N
-// here always means "the Nth field of T" -- your SQL text's bind
-// placeholders (by whatever name) must occur left-to-right in that same
-// order. A field that's std::optional and empty binds SQL NULL.
-template <oci_row_schema T>
+// Binds every field of `row` as a named IN parameter (OCIBindByName) using
+// its own (compiler-derived) field name -- e.g. field `bonus_pct` binds
+// `:bonus_pct` wherever that placeholder occurs in the SQL text. Unlike
+// OCIDefineByPos on the select() side (see define_one_field below), OCI does
+// offer a name-based bind API, and boost::pfr::names_as_array() is
+// confirmed available here, so binding by name is used instead of the
+// occurrence-order-fragile OCIBindByPos this used before: a struct field
+// can now be declared in any order, since matching no longer depends on it
+// lining up with wherever the placeholder happens to occur in the SQL text.
+// A field that's std::optional and empty binds SQL NULL.
+template <bindable T>
 void bind_fields(OCIStmt* stmt, OciConnection& conn, T& row,
                   std::vector<OCILobLocator**>& active_locators,
                   std::vector<sb2>& indicators, staging_tuple_t<T>& staging) {
@@ -162,7 +170,7 @@ void bind_fields(OCIStmt* stmt, OciConnection& conn, T& row,
 
 // After a successful execute, pulls LOB contents back into the struct and
 // frees the descriptors that were allocated for them.
-template <oci_row_schema T>
+template <bindable T>
 void drain_lobs(OciConnection& conn, T& row) {
     boost::pfr::for_each_field(row, [&](auto& field) {
         using FieldType = std::decay_t<decltype(field)>;
@@ -233,19 +241,19 @@ void bind_in_list(OCIStmt* stmt, OciConnection& conn, const std::set<ElemType>& 
     }
 }
 
-// ---- define (query(): SELECT columns -> struct) ----------------------------
+// ---- define (select(): SELECT columns -> struct) ---------------------------
 
-template <std::size_t I, oci_row_schema T>
+template <std::size_t I, bindable T>
 void define_one_field(OCIStmt* stmt, OciConnection& conn, T& row,
                        std::vector<sb2>& indicators, staging_tuple_t<T>& staging) {
     using FieldType = boost::pfr::tuple_element_t<I, T>;
     static_assert(!is_oci_lob_v<FieldType>,
-                  "LOB columns are not supported in query() result rows yet");
+                  "LOB columns are not supported in select() result rows yet");
     static_assert(!std::is_convertible_v<FieldType, std::string_view> &&
                   !(is_optional_v<FieldType> && std::is_convertible_v<optional_value_t<FieldType>, std::string_view>),
-                  "string columns are not supported in query() result rows yet -- OCI needs a "
+                  "string columns are not supported in select() result rows yet -- OCI needs a "
                   "fixed max output buffer size to define into, which this minimal client "
-                  "doesn't manage. Bind side (execute()) supports std::string fine.");
+                  "doesn't manage. Bind side (execute()/insert()) supports std::string fine.");
 
     auto& field = boost::pfr::get<I>(row);
     constexpr ub4 position = I + 1;
@@ -264,14 +272,14 @@ void define_one_field(OCIStmt* stmt, OciConnection& conn, T& row,
     }
 }
 
-template <oci_row_schema T, std::size_t... Is>
+template <bindable T, std::size_t... Is>
 void define_fields_impl(OCIStmt* stmt, OciConnection& conn, T& row,
                          std::vector<sb2>& indicators, staging_tuple_t<T>& staging,
                          std::index_sequence<Is...>) {
     (define_one_field<Is>(stmt, conn, row, indicators, staging), ...);
 }
 
-template <oci_row_schema T>
+template <bindable T>
 void define_fields(OCIStmt* stmt, OciConnection& conn, T& row,
                     std::vector<sb2>& indicators, staging_tuple_t<T>& staging) {
     define_fields_impl(stmt, conn, row, indicators, staging,
@@ -281,7 +289,7 @@ void define_fields(OCIStmt* stmt, OciConnection& conn, T& row,
 // After each fetched row, an std::optional field was defined into a staging
 // U, not into the struct directly (see staging_slot_t) -- copy it in, or
 // reset to nullopt, depending on what the indicator said this row.
-template <std::size_t I, oci_row_schema T>
+template <std::size_t I, bindable T>
 void sync_one_optional(T& row, const std::vector<sb2>& indicators, staging_tuple_t<T>& staging) {
     using FieldType = boost::pfr::tuple_element_t<I, T>;
     if constexpr (is_optional_v<FieldType>) {
@@ -291,7 +299,7 @@ void sync_one_optional(T& row, const std::vector<sb2>& indicators, staging_tuple
     }
 }
 
-template <oci_row_schema T, std::size_t... Is>
+template <bindable T, std::size_t... Is>
 void sync_optionals_after_fetch(T& row, const std::vector<sb2>& indicators, staging_tuple_t<T>& staging,
                                  std::index_sequence<Is...>) {
     (sync_one_optional<Is>(row, indicators, staging), ...);
@@ -349,13 +357,33 @@ inline std::string substitute_in_marker(const std::string& query_template, const
 
 // ----------------------------------------------------------------------------
 // Core database execution client.
+//
+// Names read as SQL verbs: execute() runs any statement that doesn't return
+// rows (DDL, or DML with or without a bound struct); insert() is a
+// same-mechanism, intent-naming alias for execute() that also adds a
+// std::vector<T> overload for inserting several rows; select() runs a query
+// and returns its rows.
 // ----------------------------------------------------------------------------
 class OciClient {
 public:
-    // Single-row DML (INSERT/UPDATE/DELETE, including RETURNING ... INTO).
-    // Bind placeholders in `query_text` must occur left-to-right in the same
-    // order as T's fields are declared (see bind_fields above). A field
-    // declared as std::optional<U> binds SQL NULL when it's empty.
+    // Runs any SQL statement that returns no rows and needs no bind
+    // parameters -- DDL (CREATE/ALTER/TRUNCATE), or DML with everything
+    // already literal in the text. For a statement with bind parameters,
+    // use the execute(conn, query_text, bind_struct) overload below.
+    bool execute(OciConnection& conn, const std::string& query_text) {
+        return conn.run_with_reconnect([&]() -> OciOutcome {
+            return run_execute_once(conn, query_text);
+        });
+    }
+
+    // Runs any SQL statement that returns no rows (INSERT/UPDATE/DELETE/
+    // MERGE/a stored-procedure call/..., including RETURNING ... INTO),
+    // binding bind_struct's fields as named IN parameters. Each field binds
+    // to a `:field_name` placeholder in `query_text` by its own
+    // (compiler-derived) name -- e.g. field `bonus_pct` binds `:bonus_pct`
+    // wherever that placeholder appears, in any order, any number of times
+    // (see bind_fields above). A field declared as std::optional<U> binds
+    // SQL NULL when it's empty.
     //
     // conn.run_with_reconnect() reconnects and retries the whole statement
     // only on a disconnect-class error; an ordinary execution error (bad
@@ -364,26 +392,54 @@ public:
     // Note: passes OCI_DEFAULT (no autocommit) to OCIStmtExecute -- deciding
     // transaction/commit boundaries is left to the caller (OCITransCommit or
     // OCI_COMMIT_ON_SUCCESS), it's out of scope for this reconnect scaffold.
-    template <oci_row_schema T>
+    template <bindable T>
     bool execute(OciConnection& conn, const std::string& query_text, T& bind_struct) {
         return conn.run_with_reconnect([&]() -> OciOutcome {
             return run_execute_once(conn, query_text, bind_struct);
         });
     }
 
-    // SELECT into a vector of rows -- the "vector<S> as a result set" case.
-    // Column order in `query_text`'s SELECT list must match T's declared
-    // field order (OCIDefineByPos is positional for the same MSVC-safety
-    // reason bind_fields is). A field declared as std::optional<U> comes
+    // Same mechanism as execute(conn, query_text, bind_struct) -- an alias
+    // that reads as intent for the common case where the statement actually
+    // is an INSERT.
+    template <bindable T>
+    bool insert(OciConnection& conn, const std::string& query_text, T& row) {
+        return execute(conn, query_text, row);
+    }
+
+    // Inserts several rows by running `query_text` once per element of
+    // `rows`, in order. A naive per-row loop for now -- one OCIStmtExecute
+    // (with its own reconnect-retry) per row, not a real Oracle array bind
+    // (OCIBindByName + OCI_ATTR_BIND_COUNT/an array of values bound as one
+    // exec, iters = rows.size()). Stops at the first failed row without
+    // rolling back the rows already inserted -- like execute()/insert()
+    // above, transaction/commit boundaries are the caller's responsibility.
+    // TODO: real bulk-bind support once this matters for throughput; the
+    // per-row loop is correct, just not fast for large `rows`.
+    template <bindable T>
+    bool insert(OciConnection& conn, const std::string& query_text, std::vector<T>& rows) {
+        for (T& row : rows) {
+            if (!insert(conn, query_text, row)) return false;
+        }
+        return true;
+    }
+
+    // Runs a SELECT and returns its rows -- the "vector<S> as a result set"
+    // case. Column order in `query_text`'s SELECT list must match T's
+    // declared field order: unlike execute()/insert(), which bind by name,
+    // OCIDefineByPos is the *only* way to bind output columns in raw OCI --
+    // there is no OCIDefineByName. That's an OCI limitation, not a choice
+    // made here, so this side stays positional regardless of boost::pfr's
+    // name-reflection support. A field declared as std::optional<U> comes
     // back as std::nullopt when that column is NULL for the row; string and
     // LOB output columns aren't supported here yet (see define_one_field).
     //
     // On a disconnect mid-fetch, results are cleared and the whole SELECT is
     // re-run from scratch on reconnect (there's no cursor to resume from).
-    template <oci_row_schema T>
-    bool query(OciConnection& conn, const std::string& query_text, std::vector<T>& results) {
+    template <bindable T>
+    bool select(OciConnection& conn, const std::string& query_text, std::vector<T>& results) {
         return conn.run_with_reconnect([&]() -> OciOutcome {
-            return run_query_once(conn, query_text, results);
+            return run_select_once(conn, query_text, results);
         });
     }
 
@@ -396,33 +452,32 @@ public:
     //
     // A different ids.size() re-prepares with different SQL text each call
     // -- fine for occasional or boundedly-sized lists, but each distinct
-    // size becomes its own entry in Oracle's shared-pool cursor cache. For
-    // very large or highly variable-sized lists, an Oracle collection-type
-    // bind (WHERE id IN (SELECT column_value FROM TABLE(:1))) keeps the SQL
-    // text fixed regardless of size -- not implemented here yet (see the
-    // README: same OCIType/OCIObject* machinery as the nested-column-type
-    // gap on the query() side).
-    template <typename ElemType, oci_row_schema T>
-    bool query_with_in_list(OciConnection& conn, const std::string& query_template,
-                             const std::set<ElemType>& ids, std::vector<T>& results) {
+    // size becomes its own entry in Oracle's shared-pool cursor cache, and
+    // it's capped at 1000 elements (ORA-01795, see make_in_placeholders).
+    // For very large or highly variable-sized lists, oci_collection_bind.h's
+    // select_with_in_collection() keeps the SQL text fixed regardless of
+    // size instead.
+    template <typename ElemType, bindable T>
+    bool select_with_in_list(OciConnection& conn, const std::string& query_template,
+                              const std::set<ElemType>& ids, std::vector<T>& results) {
         return conn.run_with_reconnect([&]() -> OciOutcome {
-            return run_query_with_in_list_once(conn, query_template, ids, results);
+            return run_select_with_in_list_once(conn, query_template, ids, results);
         });
     }
 
     // Convenience overload: dedupes and orders `ids` into a std::set first
     // (see bind_in_list for why that matters), then delegates.
-    template <typename ElemType, oci_row_schema T>
-    bool query_with_in_list(OciConnection& conn, const std::string& query_template,
-                             const std::vector<ElemType>& ids, std::vector<T>& results) {
-        return query_with_in_list(conn, query_template,
-                                   std::set<ElemType>(ids.begin(), ids.end()), results);
+    template <typename ElemType, bindable T>
+    bool select_with_in_list(OciConnection& conn, const std::string& query_template,
+                              const std::vector<ElemType>& ids, std::vector<T>& results) {
+        return select_with_in_list(conn, query_template,
+                                    std::set<ElemType>(ids.begin(), ids.end()), results);
     }
 
     // DML (e.g. "DELETE FROM trades WHERE trade_id IN ({IN})") with a
     // dynamic IN (...) list as the statement's only bind parameters. Same
     // reconnect-on-disconnect-only policy and the same {IN}-marker/std::set
-    // rules as query_with_in_list.
+    // rules as select_with_in_list.
     template <typename ElemType>
     bool execute_with_in_list(OciConnection& conn, const std::string& query_template,
                                const std::set<ElemType>& ids) {
@@ -438,7 +493,20 @@ public:
     }
 
 private:
-    template <oci_row_schema T>
+    OciOutcome run_execute_once(OciConnection& conn, const std::string& query_text) {
+        OCIStmt* stmt = nullptr;
+        OCIHandleAlloc(conn.env(), reinterpret_cast<void**>(&stmt), OCI_HTYPE_STMT, 0, nullptr);
+        OCIStmtPrepare(stmt, conn.err(),
+                       reinterpret_cast<const text*>(query_text.c_str()),
+                       static_cast<ub4>(query_text.size()),
+                       OCI_NTV_SYNTAX, OCI_DEFAULT);
+
+        const sword status = OCIStmtExecute(conn.svc(), stmt, conn.err(), 1, 0, nullptr, nullptr, OCI_DEFAULT);
+        OCIHandleFree(stmt, OCI_HTYPE_STMT);
+        return {status == OCI_SUCCESS, status};
+    }
+
+    template <bindable T>
     OciOutcome run_execute_once(OciConnection& conn, const std::string& query_text, T& bind_struct) {
         OCIStmt* stmt = nullptr;
         OCIHandleAlloc(conn.env(), reinterpret_cast<void**>(&stmt), OCI_HTYPE_STMT, 0, nullptr);
@@ -466,8 +534,8 @@ private:
         return {false, status};
     }
 
-    template <oci_row_schema T>
-    OciOutcome run_query_once(OciConnection& conn, const std::string& query_text, std::vector<T>& results) {
+    template <bindable T>
+    OciOutcome run_select_once(OciConnection& conn, const std::string& query_text, std::vector<T>& results) {
         results.clear();
 
         OCIStmt* stmt = nullptr;
@@ -504,9 +572,9 @@ private:
         return {true, OCI_SUCCESS};
     }
 
-    template <typename ElemType, oci_row_schema T>
-    OciOutcome run_query_with_in_list_once(OciConnection& conn, const std::string& query_template,
-                                            const std::set<ElemType>& ids, std::vector<T>& results) {
+    template <typename ElemType, bindable T>
+    OciOutcome run_select_with_in_list_once(OciConnection& conn, const std::string& query_template,
+                                             const std::set<ElemType>& ids, std::vector<T>& results) {
         results.clear();
         const std::string sql = substitute_in_marker(query_template, make_in_placeholders(ids.size(), 1));
 

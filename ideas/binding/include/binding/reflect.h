@@ -9,22 +9,37 @@
 // ============================================================================
 // Shared compile-time reflection core, built on boost::pfr.
 //
-// The position-based half of this (struct_field_auditor, is_bindable_leaf,
-// flat_schema/oci_row_schema) is deliberately built only from
-// boost::pfr::tuple_size / tuple_element_t / for_each_field/get -- the
-// stable primitives that work identically on MSVC, GCC and clang (they rely
-// on aggregate init + structured bindings, not on compiler-specific name
-// capture). oci_client.h binds/defines by field position for exactly this
-// reason.
+// struct_field_auditor/is_bindable_leaf/flat_schema/bindable/config_schema
+// -- the "does this struct have the right shape" checks -- are
+// built only from boost::pfr::tuple_size / tuple_element_t / for_each_field/
+// get, walking fields by position. That's independent of whether field
+// *names* are used anywhere -- it's just how boost::pfr enumerates a
+// struct's fields at all, on every compiler.
 //
-// config_schema (below) is the one place that breaks that rule on purpose:
-// nested/repeated config structs (see field_tree.h) need to match a struct
-// field to a same-named XML element or attribute wherever it appears, which
-// position alone can't express once repeated elements are involved. That
-// needs boost::pfr::names_as_array()'s field-name reflection, which is the
-// __FUNCSIG__/__PRETTY_FUNCTION__-parsing feature the paragraph above avoids
-// -- config_bind.h's use of it is a deliberate, confirmed-working choice for
-// config binding specifically, not a change of position on the OCI side.
+// Field *names* (boost::pfr::names_as_array()) were initially avoided
+// project-wide, on the assumption that the feature depends on
+// __FUNCSIG__/__PRETTY_FUNCTION__-style compiler-specific parsing and so
+// wasn't reliably available on MSVC, the actual compiler target this idea
+// started from. That assumption turned out to be wrong for the MSVC version
+// in question -- boost::pfr has a separate consteval/std::source_location-
+// based implementation (see BOOST_PFR_CORE_NAME_ENABLED and
+// core_name20_static.hpp) that isn't the __FUNCSIG__-parsing one, and it's
+// confirmed working there. So:
+//
+// - config_bind.h uses names_as_array() to match a config field to a
+//   same-named XML element/attribute -- necessary, not just convenient,
+//   since a repeated element's several same-named entries can't be matched
+//   to a single vector<T> field by position at all.
+// - oci_client.h's bind_fields() (execute()'s IN parameters, via
+//   OCIBindByName) also now uses names_as_array() -- a real improvement
+//   there too: OCIBindByPos's "position" meant occurrence order in the SQL
+//   text, which forced a struct's field *declaration* order to match
+//   wherever its placeholders happened to land across a statement's
+//   clauses. Binding by name removes that coupling entirely.
+// - oci_client.h's define_fields() (query()'s output columns) stays
+//   positional regardless: OCIDefineByPos is the only column-output bind
+//   API in raw OCI -- there is no OCIDefineByName -- so this one is an OCI
+//   limitation, not a choice.
 // ============================================================================
 
 namespace binding {
@@ -85,8 +100,8 @@ inline constexpr bool is_bindable_struct_v =
 // Walks every field of T (via boost::pfr) and checks it against `Predicate`,
 // a type exposing `template <typename U> static constexpr bool check()`.
 // Parameterizing on Predicate is what lets flat_schema (leaf-only, for config
-// structs) and oci_row_schema (leaf-or-LOB, for OCI bind/row structs) share
-// this same MSVC-safe engine instead of duplicating it.
+// structs) and bindable (leaf-or-LOB, for OCI bind/row structs) share this
+// same MSVC-safe engine instead of duplicating it.
 //
 // The `bool IsStruct` non-type parameter (rather than an `if constexpr`
 // inside a single template) is what keeps this parseable on MSVC: folding a

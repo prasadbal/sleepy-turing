@@ -28,14 +28,15 @@ that's worth doing, not a committed dependency.
 - `include/binding/oci_lob.h` -- `OciClob`/`OciXml` wrapper types.
 - `include/binding/oci_connection.h` -- `OciConnection`: owns the OCI
   handles and the reconnect policy (see below).
-- `include/binding/oci_client.h` -- `OciClient::execute<T>` (single-row DML)
-  and `OciClient::query<T>` (SELECT into `vector<T>`), both built on
-  `oci_row_schema<T>` -- `flat_schema`'s leaf predicate, plus LOB types,
-  reusing the same `struct_field_auditor` engine.
-- `examples/main.cpp` -- five scenarios: a mid-execute disconnect that
-  recovers, a plain exec error that must not retry, a `SELECT` into
-  `vector<T>`, binding an empty `std::optional` as SQL NULL, and a `SELECT`
-  where a NULL column comes back as `std::nullopt`.
+- `include/binding/oci_client.h` -- `OciClient`: `execute()`, `insert()`,
+  `select()` (see "The client's methods" below), all built on `bindable<T>`
+  -- `flat_schema`'s leaf predicate, plus LOB types, reusing the same
+  `struct_field_auditor` engine.
+- `examples/main.cpp` -- execute() with no bind struct at all, a mid-execute
+  disconnect that recovers, a plain exec error that must not retry, select()
+  into `vector<T>`, binding an empty `std::optional` as SQL NULL, insert()
+  with a `vector<T>` of several rows, select() with std::optional (a NULL
+  column comes back as `nullopt`), and a dynamic `IN (...)` list.
 - `include/binding/field_tree.h` -- `Field`/`FieldList`: a parser-independent
   (name, value) tree that config parsing converts into, before it ever meets
   a user struct.
@@ -49,73 +50,91 @@ that's worth doing, not a committed dependency.
   a nested attribute-only element, three repeated elements, mixed-case keys,
   and a field absent from the XML; then shows the missing-required-field
   error path.
+- `include/binding/oci_collection_bind.h` -- `select_with_in_collection()`:
+  an Oracle collection-object bind for `IN (...)`, the alternative to
+  `select_with_in_list()`'s generated placeholder list (see below).
 
-## NULL handling (std::optional<U>)
+## The client's methods (execute / insert / select)
 
-A field declared `std::optional<U>` (U arithmetic or string-convertible)
-maps to a nullable column:
+`OciClient`'s public methods are named as SQL verbs, not as
+bind-mechanism jargon:
 
-- **`execute()`**: an empty optional binds SQL NULL (indicator `OCI_IND_NULL`);
-  a set one binds `*field` with indicator `OCI_IND_NOTNULL`.
-- **`query()`**: a NULL column comes back as `std::nullopt`; otherwise the
-  fetched value is wrapped in the optional.
+- **`execute(conn, query_text)`** -- runs any statement that returns no
+  rows and needs no bind parameters: DDL (`CREATE`/`ALTER`/`TRUNCATE`), or
+  DML that's fully literal in the text.
+- **`execute(conn, query_text, bind_struct)`** -- runs any statement that
+  returns no rows (`INSERT`/`UPDATE`/`DELETE`/`MERGE`/a stored-procedure
+  call/..., including `RETURNING ... INTO`), binding `bind_struct`'s fields
+  by name (see below).
+- **`insert(conn, query_text, row)`** -- the exact same mechanism as the
+  `execute(..., bind_struct)` overload above; it's an alias, purely for
+  reading as intent at the call site when the statement actually is an
+  `INSERT`.
+- **`insert(conn, query_text, std::vector<T>& rows)`** -- inserts several
+  rows. For now this is a naive per-row loop: one `OCIStmtExecute` (with
+  its own independent reconnect-retry) per row, not a real Oracle array
+  bind. It stops at the first failed row without rolling back rows already
+  inserted -- transaction/commit boundaries are the caller's responsibility
+  here exactly as with every other method (see "What's deliberately not
+  here"). **A real bulk-bind implementation (`OCIBindByName` against an
+  array of values, one `OCIStmtExecute` with `iters = rows.size()`) is a
+  deliberately deferred TODO** -- the per-row loop is correct, just not
+  fast for a large `rows`; revisit when bulk-insert throughput actually
+  matters for a real use case.
+- **`select(conn, query_text, results)`** -- runs a `SELECT` and returns
+  its rows into `std::vector<T>&`.
+- **`select_with_in_list()` / `execute_with_in_list()` / (from
+  `oci_collection_bind.h`) `select_with_in_collection()`** -- the dynamic
+  `IN (...)` list variants (see below).
 
-Neither direction can bind/define straight into the optional's own storage:
-dereferencing an empty `std::optional` to get `&*opt` is undefined behavior,
-and there's no standard-sanctioned way to get the address of its unset
-storage either. So each optional field gets a real, addressable staging `U`
-(`detail::staging_tuple_t<T>` in `oci_client.h`) that OCI actually
-binds/defines against, plus a `sb2` indicator slot per field
-(`OCI_IND_NULL` / `OCI_IND_NOTNULL`) -- `execute()` copies the optional into
-the staging value (or leaves it default or empty), `query()` copies the
-staging value back into the optional (or resets it to `nullopt`) once the
-indicator says which after each fetched row.
+## Binding: by name for parameters, by position for result columns
 
-`std::string`/`optional<std::string>` **binds** fine on the `execute()` side
-(size = content length, not `sizeof(std::string)` -- an earlier version of
-this file had that bug too, since no demo exercised a raw string bind).
-`query()`'s output side still rejects string columns via `static_assert`
-(same reason as LOB columns): OCI needs a fixed max buffer size to write
-into before it knows how long the value is, and this client doesn't manage
-that yet.
+`execute()`/`insert()`'s parameters bind **by name** (`OCIBindByName`):
+each field binds to a `:field_name` placeholder using its own
+(compiler-derived) name, e.g. field `bonus_pct` binds `:bonus_pct` wherever
+that placeholder occurs in the SQL text -- in any order, and even if it
+occurs more than once (see "on placeholder reuse" below).
 
-## Why OCI binds by position but config binds by name
+`select()`'s result columns bind **by position** (`OCIDefineByPos`):
+column order in the `SELECT` list must match `T`'s declared field order.
+This isn't a design choice made here -- raw OCI simply has no
+`OCIDefineByName`; binding an output column is only ever positional in
+classic OCI, regardless of what `boost::pfr` can do.
 
-The first draft of the OCI code bound by name (`OCIBindByName`, deriving
-`:PLACEHOLDER` from the struct's field name via `boost::pfr::names_of`).
-Field-*name* reflection in `boost::pfr` depends on parsing compiler-specific
-`__FUNCSIG__`/`__PRETTY_FUNCTION__` output and isn't reliably available on
-MSVC, which is the actual compiler target this idea started from. So
-`oci_client.h` binds/defines *by position* instead --
-`tuple_size`/`tuple_element_t`/`for_each_field`/`get`, the only primitives it
-depends on, always iterate in declaration order on every compiler. The cost:
-bind placeholders in your SQL text must occur left-to-right in the same
-order as the struct's fields (see the comment on `FinancialUpdate` in
-`main.cpp`), not by matching names.
+**History, since this reversed an earlier decision in this file:** the
+first cut of the OCI binder bound *everything* by position, on the
+assumption that `boost::pfr::names_as_array()` depends on
+`__FUNCSIG__`/`__PRETTY_FUNCTION__`-style compiler-specific parsing and so
+wasn't reliably available on MSVC, the actual compiler target this idea
+started from. That assumption turned out to be wrong for the MSVC version
+in question: `boost::pfr` also has a separate consteval/
+`std::source_location`-based name implementation (see
+`BOOST_PFR_CORE_NAME_ENABLED` and `core_name20_static.hpp`), confirmed
+working there, so parameter binding switched to `OCIBindByName`. This also
+fixed a real usability wart the position-based version had: `OCIBindByPos`'s
+"position" meant *occurrence order in the SQL text*, which forced a
+struct's field *declaration* order to match wherever its placeholders
+happened to land across a statement's clauses -- reordering the struct
+silently rebinds the wrong parameter to the wrong field, and it compiles
+fine. Binding by name removes that coupling entirely. `config_bind.h`'s
+name-based matching (`config_schema`/`bind_from_fields`, further down) was
+never affected by this -- it needs name matching regardless, since a
+repeated element's several same-named `Field` entries can't be matched to
+a single `vector<T>` field by position at all.
 
-`config_bind.h` makes the opposite call, deliberately: it uses
-`boost::pfr::names_as_array<T>()` and matches a struct field to a `Field` of
-the same name, case-insensitively (`iequals`). Two reasons position doesn't
-work here the way it does for OCI:
-
-- A repeated XML element (see `field_tree.h`) isn't a distinct "array" thing
-  in the `FieldList` -- it's just several `Field` entries that happen to
-  share a name, wherever they land among their differently-named siblings.
-  A `vector<Replica>` field has to gather *all* of them by name; there's no
-  single struct-field-index <-> `FieldList`-index correspondence to walk
-  positionally once repetition is in play.
-- Config files are edited by humans who reasonably expect reordering keys
-  not to break parsing, unlike SQL bind parameter order, which has no such
-  expectation.
-
-This is a confirmed, deliberate choice for config binding specifically, not
-a reversal of the position-based decision for OCI -- see the note at the top
-of `reflect.h`.
+**On placeholder reuse:** a bind placeholder's "position" (whether
+numbered, like `:1`, or named, like `:emp_id`) refers to the Nth *distinct*
+placeholder in order of first appearance in the SQL text, not the Nth
+*occurrence*. `WHERE a = :1 OR b = :1` has exactly one bind (`:1`, reused
+in two places), not two -- the same rule applies to named binds. This
+matters for `bind_in_list()` (below): each element of the IN-list consumes
+one new placeholder, since each is a distinct value, but a struct field
+whose name is written twice in a statement's text still only binds once.
 
 ## Reconnect policy
 
 `OciConnection::run_with_reconnect()` is the one piece of retry logic, used
-by both `execute()` and `query()`:
+by every method above:
 
 - Runs the given operation once.
 - On failure, calls `is_disconnect_error()`, which reads the ORA-code off
@@ -126,6 +145,35 @@ by both `execute()` and `query()`:
 - If it's anything else (bad SQL, a constraint violation, no data found):
   return failure immediately. It is not retried, because retrying an exec
   error just reproduces it.
+
+## NULL handling (std::optional<U>)
+
+A field declared `std::optional<U>` (U arithmetic or string-convertible)
+maps to a nullable column:
+
+- **`execute()`/`insert()`**: an empty optional binds SQL NULL (indicator
+  `OCI_IND_NULL`); a set one binds `*field` with indicator `OCI_IND_NOTNULL`.
+- **`select()`**: a NULL column comes back as `std::nullopt`; otherwise the
+  fetched value is wrapped in the optional.
+
+Neither direction can bind/define straight into the optional's own storage:
+dereferencing an empty `std::optional` to get `&*opt` is undefined behavior,
+and there's no standard-sanctioned way to get the address of its unset
+storage either. So each optional field gets a real, addressable staging `U`
+(`detail::staging_tuple_t<T>` in `oci_client.h`) that OCI actually
+binds/defines against, plus a `sb2` indicator slot per field
+(`OCI_IND_NULL` / `OCI_IND_NOTNULL`) -- the bind side copies the optional
+into the staging value (or leaves it default/empty), the select side copies
+the staging value back into the optional (or resets it to `nullopt`) once
+the indicator says which after each fetched row.
+
+`std::string`/`optional<std::string>` **binds** fine on the
+`execute()`/`insert()` side (size = content length, not `sizeof(std::string)`
+-- an earlier version of this file had that bug too, since no demo
+exercised a raw string bind). `select()`'s output side still rejects string
+columns via `static_assert` (same reason as LOB columns): OCI needs a
+fixed max buffer size to write into before it knows how long the value is,
+and this client doesn't manage that yet.
 
 ## Config binding (FieldList -> struct)
 
@@ -157,19 +205,27 @@ repeated-element case) -- both recurse through the same
 `struct_field_auditor` engine used everywhere else in this directory.
 
 `config_bind.h`'s `bind_from_fields<T>(fields, out)` walks `T`'s fields by
-name (see above for why) and, per field: an absent `std::optional` leaf
-becomes `nullopt`; a present leaf is parsed via `std::from_chars` (rejecting
-partial matches like `"10abc"`) or taken as-is for `std::string`; a nested
-struct field recurses into the one matching same-named `Field`; a
-`std::vector<U>` field recurses into *every* same-named `Field`, in order.
-A missing required field, or a value of the wrong shape (a leaf where a
-struct was expected, or vice versa), throws `std::runtime_error` naming the
-offending field -- config errors are a fail-fast-at-startup case, unlike the
-OCI side's error handling, so this doesn't try to be exception-free.
+name (see "Binding: by name for parameters, by position for result
+columns" above -- name matching is necessary here, not just convenient) and,
+per field: an absent `std::optional` leaf becomes `nullopt`; a present leaf
+is parsed via `std::from_chars` (rejecting partial matches like `"10abc"`)
+or taken as-is for `std::string`; a nested struct field recurses into the
+one matching same-named `Field`; a `std::vector<U>` field recurses into
+*every* same-named `Field`, in order. A missing required field, or a value
+of the wrong shape (a leaf where a struct was expected, or vice versa),
+throws `std::runtime_error` naming the offending field -- config errors are
+a fail-fast-at-startup case, unlike the OCI side's error handling, so this
+doesn't try to be exception-free.
+
+`bind_flat_fields<T>()` is the same binder restricted to `flat_schema<T>`
+instead of the more permissive `config_schema<T>` -- use it where a struct
+is meant to stay strictly flat (a plain DB row/record shape being the
+common case), so a nested or `vector<U>` field added to it later is a
+compile error right there, instead of silently being accepted.
 
 ## Dynamic IN (...) lists
 
-`OciClient::query_with_in_list()` / `execute_with_in_list()` handle a
+`OciClient::select_with_in_list()` / `execute_with_in_list()` handle a
 variable-length `WHERE col IN (...)`. `query_template` carries one `{IN}`
 marker -- e.g. `"SELECT trade_id, notional FROM trades WHERE trade_id IN
 ({IN})"` -- which `make_in_placeholders()` expands to `:1,:2,...,:N` sized
@@ -208,7 +264,7 @@ collection bind below.
 
 ## Dynamic IN (...) lists via a collection bind (oci_collection_bind.h)
 
-`query_with_in_collection()` is the alternative to `query_with_in_list()`
+`select_with_in_collection()` is the alternative to `select_with_in_list()`
 above: instead of generating a placeholder list sized to the collection, it
 binds *one* Oracle collection object and queries
 `WHERE id IN (SELECT column_value FROM TABLE(:1))`. The SQL text is fixed
@@ -222,32 +278,34 @@ schema types so the common case needs no schema setup:
 strings. `build_in_collection()` looks up that type (`OCITypeByName`),
 creates a new empty instance of it (`OCIObjectNew`), and appends every
 element (`OCICollAppend`, via `OCINumberFromInt` for a NUMBER element).
-`query_with_in_collection()` then binds the whole collection as one
+`select_with_in_collection()` then binds the whole collection as one
 parameter (`OCIBindByPos` with `SQLT_NTY`, followed by `OCIBindObject`) and
 frees it (`OCIObjectFree`) after the fetch loop -- otherwise the same
-shape as `query()` in `oci_client.h`.
+shape as `select()` in `oci_client.h`.
 
 **This is meaningfully lower-confidence than the rest of this directory.**
-Everything else here binds/defines through `OCIBindByPos`/`OCIDefineByPos`
--- a handful of well-documented, thoroughly-used scalar OCI calls. Oracle's
-object/collection API (`OCIType`, `OCIObjectNew`, `OCICollAppend`,
-`OCIBindObject`) is a genuinely more obscure corner of OCI, and there's no
-real `oci.h`/`ociap.h` on this machine to check `oci_object_mock.h`'s
-signatures against -- they're written from documentation recall, not
-verified the way the rest of this codebase's OCI signatures have been.
-What *is* verified: `oci_collection_bind.h` compiles and runs correctly
-against its own mock (`examples/collection_demo.cpp`, both a `std::string`
-and an `int` element type), proving the C++ template plumbing hangs
-together. What's *not* verified is that the mock's signatures faithfully
-match a real client's. Diff `oci_object_mock.h` against the actual
-`oci.h`/`ociap.h` before trusting this against a live database -- see the
-warning banner at the top of `oci_collection_bind.h`.
+Everything else here binds/defines through `OCIBindByName`/`OCIBindByPos`/
+`OCIDefineByPos` -- a handful of well-documented, thoroughly-used scalar
+OCI calls. Oracle's object/collection API (`OCIType`, `OCIObjectNew`,
+`OCICollAppend`, `OCIBindObject`) is a genuinely more obscure corner of
+OCI, and there's no real `oci.h`/`ociap.h` on this machine to check
+`oci_object_mock.h`'s signatures against -- they're written from
+documentation recall, not verified the way the rest of this codebase's OCI
+signatures have been. What *is* verified: `oci_collection_bind.h` compiles
+and runs correctly against its own mock (`examples/collection_demo.cpp`,
+both a `std::string` and an `int` element type), proving the C++ template
+plumbing hangs together. What's *not* verified is that the mock's
+signatures faithfully match a real client's. Diff `oci_object_mock.h`
+against the actual `oci.h`/`ociap.h` before trusting this against a live
+database -- see the warning banner at the top of `oci_collection_bind.h`.
 
 ## What's deliberately not here
 
+- Real bulk/array-bind for `insert(conn, query_text, std::vector<T>&)` --
+  see "The client's methods" above. It's a correct but naive per-row loop.
 - Transaction/commit handling (`OCITransCommit` / `OCI_COMMIT_ON_SUCCESS`) --
   left to the caller.
-- String and LOB columns in `query()`'s result rows (`static_assert`s
+- String and LOB columns in `select()`'s result rows (`static_assert`s
   against both, for the same fixed-buffer-size reason).
 - Nullable LOBs (`std::optional<OciClob>`) -- LOB fields always bind/define
   as not-null for now.
@@ -260,18 +318,22 @@ warning banner at the top of `oci_collection_bind.h`.
   next to it, not a replacement.
 - Oracle's genuinely nested column types -- object types and `TABLE OF`
   nested tables. A normal result-set row is flat except for LOBs, which is
-  exactly what `oci_row_schema` enforces; those two column kinds are a real
+  exactly what `bindable` enforces; those two column kinds are a real
   exception (a single row's column can itself be struct- or collection-
   shaped), but supporting them for real needs `OCIType`/`OCIDescribe`
   metadata and `OCIObjectNew`/`OCIObjectGetInd`-style APIs -- a different
-  mechanism from the `OCIBindByPos`/`OCIDefineByPos` scalar+LOB path
-  everything else here is built on. `oci_row_schema` correctly rejects a
+  mechanism from the `OCIBindByName`/`OCIDefineByPos` scalar+LOB path
+  everything else here is built on. `bindable` correctly rejects a
   nested/`vector<U>` field today; it just doesn't yet offer a way to
   actually bind one of these two column kinds when you do need it.
 - Using the same `OCIType`/`OCIObjectNew`/`OCICollAppend` machinery for
   actual Oracle object-type/nested-table *columns* (the point above) --
   `oci_collection_bind.h` only uses it for one specific purpose (a bound
   IN-list collection), not as a general nested-column-value binder.
+- An ad hoc, struct-free positional bind interface (something like
+  `select(conn, query_text, results, args...)`, each `args...` element
+  binding at `:1, :2, ...` in pack order) for one-off queries where
+  defining a whole named struct is overkill. Discussed, not built yet.
 
 ## Compiling
 
@@ -288,13 +350,11 @@ builds when `BINDING_BOOST_INCLUDE_DIR` resolves to a real local Boost
 install. See "Dynamic IN (...) lists via a collection bind" above for why
 `collection_demo` passing here is weaker evidence than the other two.
 
-Not yet verified against MSVC. That matters more for `config_bind.h` than
-anywhere else in this directory: it's the one place that uses
-`boost::pfr::names_as_array()`, the field-name-reflection feature the rest
-of this directory deliberately avoids as MSVC-unreliable (see "Why OCI binds
-by position but config binds by name" above) -- confirmed as a deliberate,
-working choice in conversation, but still only compiler-tested on g++ here.
-The `flat_schema`/`oci_row_schema`/`config_schema` position-based engine in
-`reflect.h` has separately already needed two MSVC-specific workarounds (see
-the comments on `struct_field_auditor` and `check_field`), so treat MSVC as
-untested for this directory generally until it's actually been built there.
+Not yet verified against MSVC in this session -- but `boost::pfr::names_as_array()`
+being available there at all (see "Binding: by name for parameters..."
+above) has been confirmed directly by whoever's building this against the
+real MSVC toolchain in question. The `flat_schema`/`bindable`/
+`config_schema` position-based field-walking engine in `reflect.h` has
+separately already needed two MSVC-specific workarounds (see the comments
+on `struct_field_auditor` and `check_field`), so treat MSVC as untested
+for anything not explicitly called out as confirmed.
