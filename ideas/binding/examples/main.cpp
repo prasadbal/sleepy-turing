@@ -16,7 +16,10 @@
 //   4.5. insert() with a vector<T> -- several rows, one execute per row.
 //   5. select() with std::optional -- a NULL column maps back to nullopt.
 //   5.5. A dynamic IN (...) list: dedup + deterministic bind order via
-//      std::set, for both select_with_in_list() and execute_with_in_list().
+//      std::set, for both select_with_in_list() and execute_with_in_list()
+//      (std::vector and std::valarray ID collections both accepted).
+//   6. A NULL landing on a field that isn't std::optional -- throws,
+//      instead of silently leaving the field's stale/default value.
 //
 // Builds against the mock OCI backend (binding/oci_mock.h) since there's no
 // real Oracle client in this environment -- see oci_compat.h.
@@ -24,6 +27,7 @@
 #include <chrono>
 #include <iostream>
 #include <set>
+#include <valarray>
 #include <vector>
 
 #include "binding/oci_client.h"
@@ -148,6 +152,13 @@ int main() {
         conn, "DELETE FROM trades WHERE trade_id IN ({IN})", unique_ids);
     std::cout << "execute_with_in_list result=" << (del_ok ? "success" : "failed") << "\n";
 
+    std::valarray<int> valarray_ids = {305, 101, 210}; // same ids, as a std::valarray this time
+    std::vector<TradeRow> valarray_rows;
+    bool valarray_ok = client.select_with_in_list(
+        conn, "SELECT trade_id, notional FROM trades WHERE trade_id IN ({IN})", valarray_ids, valarray_rows);
+    std::cout << "select_with_in_list (std::valarray overload) result=" << (valarray_ok ? "success" : "failed")
+              << ", rows returned=" << valarray_rows.size() << "\n";
+
     std::cout << "empty ID list generates: \"" << binding::make_in_placeholders(0, 1)
               << "\" (matches nothing, without a SQL syntax error)\n\n";
 
@@ -159,6 +170,18 @@ int main() {
         std::cout << "emp_id=" << e.emp_id << " commission="
                   << (e.commission ? std::to_string(*e.commission) : std::string("NULL")) << "\n";
     }
+    std::cout << "\n";
+
+    std::cout << "--- Demo 6: NULL on a non-optional field throws -- no schema to check this ahead of time ---\n";
+    binding::mock::set_simulate_null_last_column(true); // notional is the last column here too
+    std::vector<TradeRow> maybe_null_rows;
+    try {
+        client.select(conn, "SELECT trade_id, notional FROM trades", maybe_null_rows);
+        std::cout << "ERROR: expected a throw -- notional is not std::optional\n";
+    } catch (const std::exception& e) {
+        std::cout << "threw as expected: " << e.what() << "\n";
+    }
+    binding::mock::set_simulate_null_last_column(false);
 
     conn.disconnect();
     return 0;

@@ -6,6 +6,7 @@
 #include <string_view>
 #include <tuple>
 #include <type_traits>
+#include <valarray>
 #include <variant>
 #include <vector>
 
@@ -286,23 +287,39 @@ void define_fields(OCIStmt* stmt, OciConnection& conn, T& row,
                         std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
 }
 
-// After each fetched row, an std::optional field was defined into a staging
-// U, not into the struct directly (see staging_slot_t) -- copy it in, or
-// reset to nullopt, depending on what the indicator said this row.
+// After each fetched row, applies what the indicator said for one field:
+//   - std::optional<U>: the field was defined into a staging U, not into
+//     the struct directly (see staging_slot_t) -- copy it in, or reset to
+//     nullopt, depending on the indicator.
+//   - anything else (a "required" field): a NULL indicator is an error.
+//     There's no schema/DESCRIBE metadata available to check ahead of time
+//     whether a column can be NULL (see the README) -- this is the only
+//     point a NULL landing on a non-optional field can be caught at all.
+//     Throwing here, rather than returning a retriable failure, is
+//     deliberate: no reconnect/retry can ever fix a real data/schema
+//     mismatch like this, so retrying it would just waste a retry budget
+//     reproducing the same throw.
 template <std::size_t I, bindable T>
-void sync_one_optional(T& row, const std::vector<sb2>& indicators, staging_tuple_t<T>& staging) {
+void apply_field_null_semantics(T& row, const std::vector<sb2>& indicators,
+                                 staging_tuple_t<T>& staging, std::string_view field_name) {
     using FieldType = boost::pfr::tuple_element_t<I, T>;
     if constexpr (is_optional_v<FieldType>) {
         auto& field = boost::pfr::get<I>(row);
         field = (indicators[I] == OCI_IND_NULL) ? std::nullopt
                                                  : std::make_optional(std::get<I>(staging));
+    } else if (indicators[I] == OCI_IND_NULL) {
+        throw std::runtime_error(
+            "binding: column bound to field '" + std::string(field_name) +
+            "' returned SQL NULL, but that field is not declared std::optional<T> -- "
+            "wrap it in std::optional<T> if this column can be NULL");
     }
 }
 
 template <bindable T, std::size_t... Is>
-void sync_optionals_after_fetch(T& row, const std::vector<sb2>& indicators, staging_tuple_t<T>& staging,
-                                 std::index_sequence<Is...>) {
-    (sync_one_optional<Is>(row, indicators, staging), ...);
+void apply_null_semantics_after_fetch(T& row, const std::vector<sb2>& indicators,
+                                       staging_tuple_t<T>& staging, std::index_sequence<Is...>) {
+    constexpr auto names = boost::pfr::names_as_array<T>();
+    (apply_field_null_semantics<Is>(row, indicators, staging, names[Is]), ...);
 }
 
 } // namespace detail
@@ -474,6 +491,14 @@ public:
                                     std::set<ElemType>(ids.begin(), ids.end()), results);
     }
 
+    // Same convenience, for a std::valarray<ElemType> collection of ids.
+    template <typename ElemType, bindable T>
+    bool select_with_in_list(OciConnection& conn, const std::string& query_template,
+                              const std::valarray<ElemType>& ids, std::vector<T>& results) {
+        return select_with_in_list(conn, query_template,
+                                    std::set<ElemType>(std::begin(ids), std::end(ids)), results);
+    }
+
     // DML (e.g. "DELETE FROM trades WHERE trade_id IN ({IN})") with a
     // dynamic IN (...) list as the statement's only bind parameters. Same
     // reconnect-on-disconnect-only policy and the same {IN}-marker/std::set
@@ -490,6 +515,13 @@ public:
     bool execute_with_in_list(OciConnection& conn, const std::string& query_template,
                                const std::vector<ElemType>& ids) {
         return execute_with_in_list(conn, query_template, std::set<ElemType>(ids.begin(), ids.end()));
+    }
+
+    // Same convenience, for a std::valarray<ElemType> collection of ids.
+    template <typename ElemType>
+    bool execute_with_in_list(OciConnection& conn, const std::string& query_template,
+                               const std::valarray<ElemType>& ids) {
+        return execute_with_in_list(conn, query_template, std::set<ElemType>(std::begin(ids), std::end(ids)));
     }
 
 private:
@@ -563,8 +595,8 @@ private:
                 OCIHandleFree(stmt, OCI_HTYPE_STMT);
                 return {false, status};
             }
-            detail::sync_optionals_after_fetch(row_buffer, indicators, staging,
-                                                std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
+            detail::apply_null_semantics_after_fetch(row_buffer, indicators, staging,
+                                                      std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
             results.push_back(row_buffer);
         }
 
@@ -606,8 +638,8 @@ private:
                 OCIHandleFree(stmt, OCI_HTYPE_STMT);
                 return {false, status};
             }
-            detail::sync_optionals_after_fetch(row_buffer, row_indicators, staging,
-                                                std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
+            detail::apply_null_semantics_after_fetch(row_buffer, row_indicators, staging,
+                                                      std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
             results.push_back(row_buffer);
         }
 

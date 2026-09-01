@@ -163,7 +163,7 @@ bool select_with_in_collection(OciConnection& conn, const std::string& query_tex
                 OCIHandleFree(stmt, OCI_HTYPE_STMT);
                 return {false, status};
             }
-            detail::sync_optionals_after_fetch(row_buffer, row_indicators, staging,
+            detail::apply_null_semantics_after_fetch(row_buffer, row_indicators, staging,
                                                 std::make_index_sequence<boost::pfr::tuple_size_v<RowT>>{});
             results.push_back(row_buffer);
         }

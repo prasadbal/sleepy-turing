@@ -175,6 +175,30 @@ columns via `static_assert` (same reason as LOB columns): OCI needs a
 fixed max buffer size to write into before it knows how long the value is,
 and this client doesn't manage that yet.
 
+### NULL on a field that isn't std::optional
+
+Every column defined by `select()` gets an indicator captured during fetch
+(see above), but until now only `std::optional` fields were ever checked
+against it -- a plain `int`/`double`/`std::string` field that unexpectedly
+came back NULL silently kept whatever stale/default value was already in
+its staging slot. `detail::apply_field_null_semantics` (in `oci_client.h`)
+now checks every field's indicator, not just optional ones: a NULL landing
+on a field that isn't `std::optional<T>` throws `std::runtime_error` naming
+the field, instead of continuing with a garbage value.
+
+There's no schema/`DESCRIBE` metadata available here to know ahead of time
+whether a column can be NULL, so this can only be caught *after* a fetch
+actually returns one -- not at compile time, and not before running the
+query. Enforcing it at compile time (checking a struct's declared
+nullability against real column metadata via `OCIDescribeAny`/`OCIAttrGet`
+at connection-setup time, say) is a natural next step if this idea goes
+further, but isn't attempted here.
+
+Throwing rather than returning a retriable `false` is deliberate, for the
+same reason `config_bind.h`'s errors throw: no reconnect/retry can ever fix
+a real data/schema mismatch like this, so retrying it would just waste a
+retry budget reproducing the same throw.
+
 ## Config binding (FieldList -> struct)
 
 `field_tree.h` defines the shape parsed config data takes before it meets a
@@ -234,9 +258,9 @@ placeholder count fixed in the SQL text itself; there's no variable-arity
 bind). `bind_in_list()` then binds each element positionally, reusing the
 same `raw_bind_args`/`oci_type_code_v` machinery the struct binder uses.
 
-The ID collection is a `std::set<ElemType>`, not a `std::vector` (a
-`std::vector` overload exists too, but only as a convenience that dedupes
-into a set before delegating) -- for two reasons:
+The ID collection is a `std::set<ElemType>` (`std::vector<ElemType>` and
+`std::valarray<ElemType>` overloads exist too, both purely as a convenience
+that dedupes into a set before delegating) -- for two reasons:
 
 - **Dedup.** A repeated value in an `IN` list is never meaningful, only a
   wasted bind.
