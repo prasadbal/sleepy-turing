@@ -48,8 +48,9 @@ that's worth doing, not a committed dependency.
   matched case-insensitively.
 - `examples/config_demo.cpp` -- parses a small XML config with attributes,
   a nested attribute-only element, three repeated elements, mixed-case keys,
-  and a field absent from the XML; then shows the missing-required-field
-  error path.
+  and a field absent from the XML; a self-referential tree (a `Node` whose
+  children are more `Node`s, 4 levels deep); then shows the
+  missing-required-field error path.
 - `include/binding/oci_collection_bind.h` -- `select_with_in_collection()`:
   an Oracle collection-object bind for `IN (...)`, the alternative to
   `select_with_in_list()`'s generated placeholder list (see below).
@@ -224,9 +225,50 @@ parent level; and an attribute-only self-closing element like
 lose the attribute's own name.
 
 `reflect.h`'s `config_schema<T>` extends `flat_schema` to also allow a field
-that's a nested `config_schema` struct, or a `std::vector<U>` of one (the
-repeated-element case) -- both recurse through the same
-`struct_field_auditor` engine used everywhere else in this directory.
+that's a nested struct, or a `std::vector<U>` of one (the repeated-element
+case) -- including a genuinely self-referential tree, where `U` is `T`
+itself:
+
+```cpp
+struct Node {
+    std::string name;
+    int id;
+    std::vector<Node> node; // same type -- a tree node whose children are more nodes
+};
+static_assert(binding::config_schema<Node>); // holds
+```
+
+This only works because the per-field check is deliberately *shallow*: it
+verifies a nested-struct/`vector<U>` field's element type is *some* plain
+aggregate (`is_bindable_struct_v<U>`), without recursively re-verifying
+*that* type's own fields as part of computing `T`'s value. An eager,
+fully-recursive version of this check was tried first and is a real
+compiler error for a self-referential `T`, not a slow-but-working one --
+confirmed directly: `struct_field_auditor<Node, config_field_predicate>::value`
+needs its own already-computed value to compute itself
+(`error: 'value' used in its own initializer`), because checking whether
+`Node` is valid requires already knowing whether `Node` is valid. There's
+no way to eagerly compute one compile-time boolean that validates every
+level of a self-referential tree up front.
+
+So the actual per-level verification is deferred to where it happens
+naturally: `bind_from_fields<T>()` is templated on `config_schema<T>`, and
+its nested-struct/`vector<U>` handling recursively calls `bind_from_fields<U>`.
+For `U == T` (the self-referential case), that's the *same* function
+template instantiation calling itself -- ordinary runtime recursion bounded
+by however deep the actual `FieldList` tree is, not a second compile-time
+instantiation of anything. The cost: a malformed *nested* struct is now
+only caught when `bind_from_fields` actually recurses into it, not
+immediately at a `static_assert(config_schema<Outer>)` on the containing
+type -- still a compile error, just one level of indirection further from
+where you'd see it with a fully eager check.
+
+Note the field is named `node`, not `children`: a repeated child element
+isn't a distinct concept in the `FieldList` model (see above), it's just
+several `Field` entries sharing a name -- so the struct field that collects
+them has to be named to match whatever tag is actually repeated in the XML
+(here, `<node>` nested directly under `<node>`), the same as any other
+repeated-element field.
 
 `config_bind.h`'s `bind_from_fields<T>(fields, out)` walks `T`'s fields by
 name (see "Binding: by name for parameters, by position for result

@@ -178,14 +178,35 @@ template <typename T>
 using vector_value_t = typename vector_value_impl<std::remove_cv_t<T>>::type;
 
 // ----------------------------------------------------------------------------
-// Predicate: every field is a bindable leaf, OR a nested config_schema
-// struct, OR a std::vector<U> of a nested config_schema struct (a repeated
-// element). Recurses through struct_field_auditor itself rather than through
-// the config_schema concept directly, for the same reason check_field()
-// folds over a function call instead of a raw expression -- keeping the
-// recursive step a plain function body, not something folded/expanded
-// inline, avoids giving MSVC's template parser another nested-angle-bracket
-// shape to trip on.
+// Predicate: every field is a bindable leaf, OR a nested struct (a plain
+// aggregate -- is_bindable_struct_v), OR a std::vector<U> of one (a
+// repeated element).
+//
+// Deliberately shallow: unlike leaf_only_predicate/oci_bindable_predicate,
+// this does NOT recursively re-verify a nested struct/vector<U> element's
+// *own* fields here. It can't -- a genuinely self-referential shape like
+// `struct Node { std::string name; std::vector<Node> children; };` (a tree
+// node whose children are the same type) needs config_schema<Node> while
+// still computing config_schema<Node>: struct_field_auditor<Node,
+// config_field_predicate>::value's "used in its own initializer" is a real,
+// immediate compiler error, not a timeout -- confirmed directly against
+// this header. There is no way to eagerly compute one compile-time boolean
+// that recursively validates a self-referential tree's every level up
+// front.
+//
+// So the deep, per-level check is deferred to where it can actually happen
+// lazily: config_bind.h's bind_from_fields<T>() is itself templated on
+// config_schema<T>, and its nested-struct/vector<U> handling calls
+// bind_from_fields<U> recursively. For a self-referential T (U == T), that
+// recursive call reuses the *same* function template instantiation calling
+// itself -- ordinary runtime recursion over however deep the actual
+// FieldList tree happens to be, not a second compile-time instantiation of
+// anything. The cost of this shallowness: a malformed *nested* struct
+// (e.g. a field type that isn't itself bindable) is only caught when
+// bind_from_fields actually recurses into it, not immediately at a
+// `static_assert(config_schema<Outer>)` on the outer type -- still a
+// compile error, just a level of indirection further from where you'd see
+// it with an eager check.
 // ----------------------------------------------------------------------------
 struct config_field_predicate {
     template <typename U>
@@ -193,20 +214,20 @@ struct config_field_predicate {
         if constexpr (is_bindable_leaf_v<U>) {
             return true;
         } else if constexpr (is_vector_v<U>) {
-            return struct_field_auditor<vector_value_t<U>, config_field_predicate>::value;
-        } else if constexpr (is_bindable_struct_v<U>) {
-            return struct_field_auditor<U, config_field_predicate>::value;
+            return is_bindable_struct_v<vector_value_t<U>>;
         } else {
-            return false;
+            return is_bindable_struct_v<U>;
         }
     }
 };
 
 // Public concept: T is a config-shaped struct -- fields are leaves,
-// std::optional<leaf> (absent when the field is missing), nested
-// config_schema structs (a child element's attributes/children), or
-// std::vector<U> of a nested config_schema struct (repeated child
-// elements). See config_bind.h for the FieldList -> T binder that uses this.
+// std::optional<leaf> (absent when the field is missing), a nested struct
+// (a child element's attributes/children), or std::vector<U> of one
+// (repeated child elements) -- including U == T itself, for a tree node
+// whose children are the same shape. See config_bind.h for the FieldList ->
+// T binder that uses this, and does the actual (lazy, recursive-by-function-
+// call) per-level verification.
 template <typename T>
 concept config_schema = struct_field_auditor<T, config_field_predicate>::value;
 
