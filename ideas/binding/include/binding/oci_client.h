@@ -37,21 +37,130 @@ template <typename U> struct oci_type_code_of<std::optional<U>> { static constex
 template <typename T> inline constexpr ub2 oci_type_code_v = oci_type_code_of<T>::value;
 
 // ----------------------------------------------------------------------------
-// Predicate + concept: a struct usable as an OCI bind/row type is either a
-// flat leaf (arithmetic/string, optionally wrapped in std::optional to mark
-// it nullable) or a recognized LOB wrapper. Reuses the same
-// struct_field_auditor engine as flat_schema (binding/reflect.h) -- this is
-// the "config schema" and "SQL row schema" ideas sharing one MSVC-safe core.
+// std::vector<U>/std::set<U>/std::valarray<U> recognition, for a struct
+// field meant to bind as a dynamic multi-value IN-list parameter (see
+// "input variables" further down) rather than a single scalar. Distinct
+// from reflect.h's is_vector_v/vector_value_t, which is about config's
+// "repeated nested struct" concept -- an entirely different thing sharing
+// only the word "vector".
+// ----------------------------------------------------------------------------
+template <typename T> struct is_multi_bind_container_impl : std::false_type { using value_type = void; };
+template <typename U> struct is_multi_bind_container_impl<std::vector<U>>   : std::true_type  { using value_type = U; };
+template <typename U> struct is_multi_bind_container_impl<std::set<U>>     : std::true_type  { using value_type = U; };
+template <typename U> struct is_multi_bind_container_impl<std::valarray<U>> : std::true_type  { using value_type = U; };
+
+template <typename T>
+inline constexpr bool is_multi_bind_container_v = is_multi_bind_container_impl<std::remove_cv_t<T>>::value;
+template <typename T>
+using multi_bind_value_t = typename is_multi_bind_container_impl<std::remove_cv_t<T>>::value_type;
+
+// ----------------------------------------------------------------------------
+// Predicate + concept: a struct usable as an OCI bind/row type has fields
+// that are each a flat leaf (arithmetic/string, optionally wrapped in
+// std::optional to mark it nullable), a recognized LOB wrapper, or (bind
+// side only -- see define_one_field's static_assert) a
+// vector/set/valarray<U> of a leaf U, for a dynamic multi-value IN-list
+// parameter. Reuses the same struct_field_auditor engine as flat_schema
+// (binding/reflect.h) -- this is the "config schema" and "SQL row schema"
+// ideas sharing one MSVC-safe core.
 // ----------------------------------------------------------------------------
 struct bindable_predicate {
     template <typename U>
-    static constexpr bool check() { return is_bindable_leaf_v<U> || is_oci_lob_v<U>; }
+    static constexpr bool check() {
+        if constexpr (is_multi_bind_container_v<U>) {
+            return is_bindable_leaf_v<multi_bind_value_t<U>>;
+        } else {
+            return is_bindable_leaf_v<U> || is_oci_lob_v<U>;
+        }
+    }
 };
 
 // T can be bound as OciClient::execute()/insert()'s parameter struct or
 // select()'s result row.
 template <typename T>
 concept bindable = struct_field_auditor<T, bindable_predicate>::value;
+
+// Builds "start,start+1,...,start+count-1" as ":N,:N+1,..." for splicing an
+// IN (...) clause into a query template -- Oracle needs the exact number of
+// bind placeholders fixed in the prepared SQL text itself, so the caller's
+// template gets re-instantiated to match the collection's size before every
+// prepare. An empty collection produces "NULL": "IN ()" is a SQL syntax
+// error, but "IN (NULL)" is valid and, since x = NULL is never true in SQL's
+// three-valued logic, correctly matches nothing -- no special-casing needed
+// at the call site for an empty ID list.
+inline std::string make_in_placeholders(std::size_t count, ub4 start_position = 1) {
+    if (count == 0) return "NULL";
+
+    // ORA-01795: "maximum number of expressions in a list is 1000". This is
+    // a parser-level cap on a syntactic IN (...) list -- it applies whether
+    // the elements are literals or bind placeholders, and has nothing to do
+    // with the 64KB max SQL statement text length (which a placeholder list
+    // this size comes nowhere near). Caught here with a clear message
+    // instead of surfacing as an opaque ORA-01795 from OCIStmtExecute. See
+    // "Dynamic IN (...) lists" in the README for the collection-bind
+    // alternative, which isn't subject to this cap.
+    constexpr std::size_t oracle_max_in_list_size = 1000;
+    if (count > oracle_max_in_list_size) {
+        throw std::runtime_error(
+            "binding: IN list has " + std::to_string(count) +
+            " elements, but Oracle limits a plain IN (...) list to " +
+            std::to_string(oracle_max_in_list_size) +
+            " (ORA-01795) -- use a collection bind for larger lists");
+    }
+
+    std::string result;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (i) result += ',';
+        result += ':' + std::to_string(start_position + i);
+    }
+    return result;
+}
+
+// Like make_in_placeholders, but generates NAMED placeholders derived from
+// `field_name` (":field_name_0,:field_name_1,...") instead of numbered
+// ones -- for a struct field bound as a dynamic multi-value IN-list (see
+// detail::bind_named_container), where OCIBindByName needs each element to
+// have its own distinct placeholder name. Subject to the same ORA-01795
+// 1000-element cap, for the same reason.
+inline std::string make_named_placeholders(std::string_view field_name, std::size_t count) {
+    if (count == 0) return "NULL";
+
+    constexpr std::size_t oracle_max_in_list_size = 1000;
+    if (count > oracle_max_in_list_size) {
+        throw std::runtime_error(
+            "binding: field '" + std::string(field_name) + "' has " + std::to_string(count) +
+            " elements, but Oracle limits a plain IN (...) list to " +
+            std::to_string(oracle_max_in_list_size) + " (ORA-01795)");
+    }
+
+    std::string result;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (i) result += ',';
+        result += ':' + std::string(field_name) + '_' + std::to_string(i);
+    }
+    return result;
+}
+
+// Replaces the first occurrence of "{marker_name}" in `query_template` with
+// `placeholders`. Shared by the standalone IN-list marker ("IN", see
+// substitute_in_marker) and the per-field container marker (that field's
+// own name, see detail::substitute_container_markers).
+inline std::string substitute_marker(const std::string& query_template, std::string_view marker_name,
+                                      const std::string& placeholders) {
+    const std::string marker = "{" + std::string(marker_name) + "}";
+    const auto pos = query_template.find(marker);
+    if (pos == std::string::npos) {
+        throw std::runtime_error("binding: query template is missing the " + marker + " placeholder marker");
+    }
+    std::string result = query_template;
+    result.replace(pos, marker.size(), placeholders);
+    return result;
+}
+
+// Replaces the one "{IN}" marker in `query_template` with `placeholders`.
+inline std::string substitute_in_marker(const std::string& query_template, const std::string& placeholders) {
+    return substitute_marker(query_template, "IN", placeholders);
+}
 
 namespace detail {
 
@@ -87,18 +196,54 @@ using staging_tuple_t = decltype(staging_tuple_type<T>(std::make_index_sequence<
 
 // ---- bind (execute()/insert(): struct -> IN parameters) --------------------
 
+// Binds every element of `container` as its own named IN parameter,
+// `:field_name_0`, `:field_name_1`, ... in iteration order -- the
+// name-based, per-struct-field counterpart to bind_in_list() (which binds
+// a standalone collection positionally for select_with_in_list()/
+// execute_with_in_list()). Unlike bind_in_list(), this does NOT dedupe/sort
+// into a set first: a struct field's std::vector/std::valarray is bound
+// exactly as the caller populated it, in order, duplicates included --
+// deduping was a deliberate, documented optimization specific to the
+// standalone IN-list convenience functions (for shared-pool cursor cache
+// determinism), not a general property every collection-bind should have.
+// A std::set<U> field is naturally already ordered/deduped by virtue of
+// being a set, so behaves the same either way.
+template <typename Container>
+void bind_named_container(OCIStmt* stmt, OciConnection& conn, Container& container,
+                           std::string_view field_name, std::vector<sb2>& elem_indicators) {
+    using ElemType = multi_bind_value_t<Container>;
+    elem_indicators.assign(container.size(), OCI_IND_NOTNULL);
+    std::size_t idx = 0;
+    for (auto& elem : container) {
+        const std::string placeholder = ":" + std::string(field_name) + "_" + std::to_string(idx);
+        OCIBind* bind_handle = nullptr;
+        // set<T>'s elements are always const when iterated (mutating one
+        // could violate the set's ordering invariant); const_cast matches
+        // the same read-only-through-a-mutable-pointer pattern bind_in_list
+        // already uses for exactly this reason.
+        auto [value_ptr, bind_size] = raw_bind_args(const_cast<ElemType&>(elem));
+        OCIBindByName(stmt, &bind_handle, conn.err(),
+                    reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
+                    value_ptr, bind_size, oci_type_code_v<ElemType>,
+                    &elem_indicators[idx], nullptr, nullptr, 0, nullptr, OCI_DEFAULT);
+        ++idx;
+    }
+}
+
 template <std::size_t I, bindable T>
 void bind_one_field(OCIStmt* stmt, OciConnection& conn, T& row,
                      std::vector<OCILobLocator**>& active_locators,
-                     std::vector<sb2>& indicators, staging_tuple_t<T>& staging,
-                     std::string_view field_name) {
+                     std::vector<sb2>& indicators, std::vector<std::vector<sb2>>& container_indicators,
+                     staging_tuple_t<T>& staging, std::string_view field_name) {
     using FieldType = boost::pfr::tuple_element_t<I, T>;
     auto& field = boost::pfr::get<I>(row);
     const std::string placeholder = ":" + std::string(field_name);
     OCIBind* bind_handle = nullptr;
     indicators[I] = OCI_IND_NOTNULL;
 
-    if constexpr (is_oci_lob_v<FieldType>) {
+    if constexpr (is_multi_bind_container_v<FieldType>) {
+        bind_named_container(stmt, conn, field, field_name, container_indicators[I]);
+    } else if constexpr (is_oci_lob_v<FieldType>) {
         OCIDescriptorAlloc(conn.env(), reinterpret_cast<void**>(&field.locator), OCI_DTYPE_LOB, 0, nullptr);
         active_locators.push_back(&field.locator);
 
@@ -145,10 +290,10 @@ void bind_one_field(OCIStmt* stmt, OciConnection& conn, T& row,
 template <bindable T, std::size_t... Is>
 void bind_fields_impl(OCIStmt* stmt, OciConnection& conn, T& row,
                        std::vector<OCILobLocator**>& active_locators,
-                       std::vector<sb2>& indicators, staging_tuple_t<T>& staging,
-                       std::index_sequence<Is...>) {
+                       std::vector<sb2>& indicators, std::vector<std::vector<sb2>>& container_indicators,
+                       staging_tuple_t<T>& staging, std::index_sequence<Is...>) {
     constexpr auto names = boost::pfr::names_as_array<T>();
-    (bind_one_field<Is>(stmt, conn, row, active_locators, indicators, staging, names[Is]), ...);
+    (bind_one_field<Is>(stmt, conn, row, active_locators, indicators, container_indicators, staging, names[Is]), ...);
 }
 
 // Binds every field of `row` as a named IN parameter (OCIBindByName) using
@@ -160,12 +305,16 @@ void bind_fields_impl(OCIStmt* stmt, OciConnection& conn, T& row,
 // occurrence-order-fragile OCIBindByPos this used before: a struct field
 // can now be declared in any order, since matching no longer depends on it
 // lining up with wherever the placeholder happens to occur in the SQL text.
-// A field that's std::optional and empty binds SQL NULL.
+// A field that's std::optional and empty binds SQL NULL. A field that's a
+// std::vector/std::set/std::valarray<U> binds as a dynamic multi-value
+// IN-list instead of a single value -- see bind_named_container and
+// substitute_container_markers.
 template <bindable T>
 void bind_fields(OCIStmt* stmt, OciConnection& conn, T& row,
                   std::vector<OCILobLocator**>& active_locators,
-                  std::vector<sb2>& indicators, staging_tuple_t<T>& staging) {
-    bind_fields_impl(stmt, conn, row, active_locators, indicators, staging,
+                  std::vector<sb2>& indicators, std::vector<std::vector<sb2>>& container_indicators,
+                  staging_tuple_t<T>& staging) {
+    bind_fields_impl(stmt, conn, row, active_locators, indicators, container_indicators, staging,
                       std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
 }
 
@@ -255,6 +404,10 @@ void define_one_field(OCIStmt* stmt, OciConnection& conn, T& row,
                   "string columns are not supported in select() result rows yet -- OCI needs a "
                   "fixed max output buffer size to define into, which this minimal client "
                   "doesn't manage. Bind side (execute()/insert()) supports std::string fine.");
+    static_assert(!is_multi_bind_container_v<FieldType>,
+                  "vector/set/valarray fields are an execute()/insert() input-side concept only "
+                  "(a dynamic multi-value IN-list parameter) -- a single result column can't "
+                  "fetch into a variable-length container; that's multiple rows, not one field.");
 
     auto& field = boost::pfr::get<I>(row);
     constexpr ub4 position = I + 1;
@@ -322,55 +475,43 @@ void apply_null_semantics_after_fetch(T& row, const std::vector<sb2>& indicators
     (apply_field_null_semantics<Is>(row, indicators, staging, names[Is]), ...);
 }
 
+// If field I is a vector/set/valarray<U>, replaces that field's own
+// "{field_name}" marker in `sql` with a named placeholder list sized to
+// the field's current element count (see make_named_placeholders) --
+// e.g. field `trade_ids` with 3 elements turns
+// "... IN ({trade_ids})" into "... IN (:trade_ids_0,:trade_ids_1,:trade_ids_2)"
+// before OCIStmtPrepare, since Oracle needs the exact placeholder count
+// fixed in the SQL text itself. A missing marker for a container field is
+// a caller mistake (forgot to write "{field_name}" where the values
+// should go) and throws, rather than silently preparing a statement whose
+// binds have nowhere to land. No-op for every other field type.
+template <std::size_t I, bindable T>
+void substitute_one_container_marker(std::string& sql, const T& row, std::string_view field_name) {
+    using FieldType = boost::pfr::tuple_element_t<I, T>;
+    if constexpr (is_multi_bind_container_v<FieldType>) {
+        const auto& container = boost::pfr::get<I>(row);
+        sql = substitute_marker(sql, field_name, make_named_placeholders(field_name, container.size()));
+    }
+}
+
+template <bindable T, std::size_t... Is>
+std::string substitute_container_markers_impl(const std::string& query_text, const T& row, std::index_sequence<Is...>) {
+    std::string sql = query_text;
+    constexpr auto names = boost::pfr::names_as_array<T>();
+    (substitute_one_container_marker<Is>(sql, row, names[Is]), ...);
+    return sql;
+}
+
+// Returns `query_text` with every vector/set/valarray field's own
+// "{field_name}" marker replaced by a placeholder list sized to that
+// field's current contents -- a no-op (returns query_text unchanged) for a
+// T with no such fields.
+template <bindable T>
+std::string substitute_container_markers(const std::string& query_text, const T& row) {
+    return substitute_container_markers_impl(query_text, row, std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
+}
+
 } // namespace detail
-
-// Builds "start,start+1,...,start+count-1" as ":N,:N+1,..." for splicing an
-// IN (...) clause into a query template -- Oracle needs the exact number of
-// bind placeholders fixed in the prepared SQL text itself, so the caller's
-// template gets re-instantiated to match the collection's size before every
-// prepare. An empty collection produces "NULL": "IN ()" is a SQL syntax
-// error, but "IN (NULL)" is valid and, since x = NULL is never true in SQL's
-// three-valued logic, correctly matches nothing -- no special-casing needed
-// at the call site for an empty ID list.
-inline std::string make_in_placeholders(std::size_t count, ub4 start_position = 1) {
-    if (count == 0) return "NULL";
-
-    // ORA-01795: "maximum number of expressions in a list is 1000". This is
-    // a parser-level cap on a syntactic IN (...) list -- it applies whether
-    // the elements are literals or bind placeholders, and has nothing to do
-    // with the 64KB max SQL statement text length (which a placeholder list
-    // this size comes nowhere near). Caught here with a clear message
-    // instead of surfacing as an opaque ORA-01795 from OCIStmtExecute. See
-    // "Dynamic IN (...) lists" in the README for the collection-bind
-    // alternative, which isn't subject to this cap.
-    constexpr std::size_t oracle_max_in_list_size = 1000;
-    if (count > oracle_max_in_list_size) {
-        throw std::runtime_error(
-            "binding: IN list has " + std::to_string(count) +
-            " elements, but Oracle limits a plain IN (...) list to " +
-            std::to_string(oracle_max_in_list_size) +
-            " (ORA-01795) -- use a collection bind for larger lists");
-    }
-
-    std::string result;
-    for (std::size_t i = 0; i < count; ++i) {
-        if (i) result += ',';
-        result += ':' + std::to_string(start_position + i);
-    }
-    return result;
-}
-
-// Replaces the one "{IN}" marker in `query_template` with `placeholders`.
-inline std::string substitute_in_marker(const std::string& query_template, const std::string& placeholders) {
-    constexpr std::string_view marker = "{IN}";
-    const auto pos = query_template.find(marker);
-    if (pos == std::string::npos) {
-        throw std::runtime_error("binding: query template is missing the {IN} placeholder marker");
-    }
-    std::string result = query_template;
-    result.replace(pos, marker.size(), placeholders);
-    return result;
-}
 
 // ----------------------------------------------------------------------------
 // Core database execution client.
@@ -540,18 +681,25 @@ private:
 
     template <bindable T>
     OciOutcome run_execute_once(OciConnection& conn, const std::string& query_text, T& bind_struct) {
+        // A vector/set/valarray field's own "{field_name}" marker gets
+        // replaced with a placeholder list sized to that field's current
+        // element count -- a no-op if T has no such field, so this is safe
+        // (and cheap) to call unconditionally.
+        const std::string sql = detail::substitute_container_markers(query_text, bind_struct);
+
         OCIStmt* stmt = nullptr;
         OCIHandleAlloc(conn.env(), reinterpret_cast<void**>(&stmt), OCI_HTYPE_STMT, 0, nullptr);
 
         OCIStmtPrepare(stmt, conn.err(),
-                       reinterpret_cast<const text*>(query_text.c_str()),
-                       static_cast<ub4>(query_text.size()),
+                       reinterpret_cast<const text*>(sql.c_str()),
+                       static_cast<ub4>(sql.size()),
                        OCI_NTV_SYNTAX, OCI_DEFAULT);
 
         std::vector<OCILobLocator**> active_locators;
         std::vector<sb2> indicators(boost::pfr::tuple_size_v<T>, OCI_IND_NOTNULL);
+        std::vector<std::vector<sb2>> container_indicators(boost::pfr::tuple_size_v<T>);
         detail::staging_tuple_t<T> staging{};
-        detail::bind_fields(stmt, conn, bind_struct, active_locators, indicators, staging);
+        detail::bind_fields(stmt, conn, bind_struct, active_locators, indicators, container_indicators, staging);
 
         const sword status = OCIStmtExecute(conn.svc(), stmt, conn.err(), 1, 0, nullptr, nullptr, OCI_DEFAULT);
 

@@ -14,6 +14,9 @@
 //      mirroring how a config file binds repeated sections into vector<S>.
 //   4. Binding std::optional -- an empty one maps to SQL NULL.
 //   4.5. insert() with a vector<T> -- several rows, one execute per row.
+//   4.75. A struct field that's itself a std::set<int> -- binds as its own
+//      dynamic IN-list, alongside an ordinary named scalar field in the
+//      same statement.
 //   5. select() with std::optional -- a NULL column maps back to nullopt.
 //   5.5. A dynamic IN (...) list: dedup + deterministic bind order via
 //      std::set, for both select_with_in_list() and execute_with_in_list()
@@ -67,6 +70,17 @@ struct EmployeeRow {
     std::optional<double> commission;
 };
 static_assert(binding::bindable<EmployeeRow>);
+
+// ---- mixed scalar + dynamic multi-value IN-list, in ONE struct: a plain
+// named field (status) alongside a std::set<int> field (trade_ids), which
+// binds as its own dynamic IN-list -- the query text's "{trade_ids}" marker
+// (named after the field, same convention as "{IN}") gets replaced with a
+// placeholder list sized to trade_ids.size() before preparing. -----------
+struct TradeStatusUpdate {
+    std::string status;
+    std::set<int> trade_ids;
+};
+static_assert(binding::bindable<TradeStatusUpdate>);
 
 int main() {
     binding::OciConnection conn("orcl", "app_user", "secret",
@@ -131,6 +145,15 @@ int main() {
     std::cout << "result=" << (bulk_ok ? "success" : "failed")
               << ", OCIStmtExecute calls=" << binding::mock::g_execute_calls.load()
               << " (expect 3: a naive per-row loop for now -- see the TODO on insert(vector<T>&))\n\n";
+
+    std::cout << "--- Demo 4.75: struct field is itself a dynamic multi-value IN-list ---\n";
+    TradeStatusUpdate filter{"CLOSED", {305, 101, 305, 210, 101}}; // duplicates, out of order, on purpose
+    bool mixed_ok = client.execute(
+        conn, "UPDATE trades SET status = :status WHERE trade_id IN ({trade_ids})", filter);
+    std::cout << "result=" << (mixed_ok ? "success" : "failed")
+              << " -- status bound by name (:status), trade_ids bound as its own "
+              << filter.trade_ids.size() << "-element IN-list ({trade_ids} -> "
+              << binding::make_named_placeholders("trade_ids", filter.trade_ids.size()) << ")\n\n";
 
     std::cout << "--- Demo 5.5: dynamic IN (...) list -- dedup + deterministic order via std::set ---\n";
     binding::mock::set_mode(binding::mock::FailureMode::None);

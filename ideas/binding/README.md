@@ -368,6 +368,56 @@ starts to matter for a `FieldList` with hundreds-to-thousands of entries
 nesting level), where the old linear-scan version would visibly slow down
 config loading and the indexed one won't.
 
+## A struct field can itself be a dynamic multi-value IN-list
+
+Before this, `execute()`/`insert()`'s struct-based binding only accepted
+scalar leaf fields (plus `std::optional<leaf>` and the LOB types) -- there
+was no way to bind a query that mixes ordinary named parameters with a
+collection-typed one, e.g. `UPDATE trades SET status = :status WHERE
+trade_id IN (...)`. The only place a collection could be bound at all was
+`select_with_in_list()`/`execute_with_in_list()` below, which assume the
+collection is the query's *only* parameter.
+
+`bindable`'s field predicate now also accepts a `std::vector<U>`/
+`std::set<U>`/`std::valarray<U>` field, for U a bindable leaf:
+
+```cpp
+struct TradeStatusUpdate {
+    std::string status;      // an ordinary named parameter: :status
+    std::set<int> trade_ids; // a dynamic multi-value IN-list: {trade_ids}
+};
+
+client.execute(conn, "UPDATE trades SET status = :status WHERE trade_id IN ({trade_ids})", filter);
+```
+
+The mechanism is the field-scoped version of the standalone `{IN}` marker
+below: `detail::substitute_container_markers` (called once, unconditionally,
+at the top of `run_execute_once` -- a no-op if `T` has no container field)
+replaces each container field's own `{field_name}` marker with a named
+placeholder list sized to that field's current element count
+(`make_named_placeholders`, e.g. `:trade_ids_0,:trade_ids_1,:trade_ids_2`),
+*before* `OCIStmtPrepare` -- Oracle needs the exact placeholder count fixed
+in the SQL text itself, the same reason `{IN}` substitution exists.
+`detail::bind_named_container` then binds each element by that generated
+name (`OCIBindByName`, matching how every other field on this side binds).
+A missing marker for a container field -- forgetting to write
+`{field_name}` where the values should go -- throws immediately rather than
+silently preparing a statement whose binds have nowhere to land.
+
+Unlike `select_with_in_list()`'s ID collection, a struct's container field
+is **not** deduped/sorted into a set first (a `std::set<U>` field is
+naturally already ordered/deduped by being a set, but a `std::vector<U>`/
+`std::valarray<U>` field binds exactly what the caller put there, in
+order, duplicates included) -- that deduping was a deliberate,
+documented optimization specific to the standalone IN-list convenience
+functions, not a property every collection bind should silently apply to
+a caller's own data.
+
+`select()`'s output side explicitly rejects a container-typed field via
+`static_assert` -- a single result column can't fetch into a
+variable-length container (that's what multiple *rows* are for), so this
+is bind-side-only by design, not an oversight.
+
 ## Dynamic IN (...) lists
 
 `OciClient::select_with_in_list()` / `execute_with_in_list()` handle a
