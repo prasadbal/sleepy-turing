@@ -56,7 +56,13 @@ public:
     // disconnect(), rather than continuing on with a handle from a call
     // that never happened.
     bool connect() {
-        if (OCIEnvCreate(&env_, OCI_DEFAULT, nullptr, nullptr, nullptr, nullptr, 0, nullptr) != OCI_SUCCESS) {
+        // OCI_OBJECT (not OCI_DEFAULT) -- oci_collection_bind.h's OCIType/
+        // OCIObjectNew/OCICollAppend/OCIBindObject calls need the object
+        // cache this mode initializes; without it they fail with
+        // ORA-21301 "not initialized in object mode". OCI_OBJECT is
+        // additive over the plain scalar bind/define path, so it doesn't
+        // change behavior for callers that never touch collections.
+        if (OCIEnvCreate(&env_, OCI_OBJECT, nullptr, nullptr, nullptr, nullptr, 0, nullptr) != OCI_SUCCESS) {
             env_ = nullptr; // no err_ handle exists yet to get a message out of
             return false;
         }
