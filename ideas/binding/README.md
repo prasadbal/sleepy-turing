@@ -263,12 +263,17 @@ immediately at a `static_assert(config_schema<Outer>)` on the containing
 type -- still a compile error, just one level of indirection further from
 where you'd see it with a fully eager check.
 
-Note the field is named `node`, not `children`: a repeated child element
-isn't a distinct concept in the `FieldList` model (see above), it's just
-several `Field` entries sharing a name -- so the struct field that collects
-them has to be named to match whatever tag is actually repeated in the XML
-(here, `<node>` nested directly under `<node>`), the same as any other
-repeated-element field.
+The field is named `node`, not `children` -- but there's nothing special
+about that spelling, and no reserved name anywhere in this binder. A
+repeated child element isn't a distinct concept in the `FieldList` model
+(see above), it's just several `Field` entries sharing a name, and
+`bind_from_fields` matches a field to entries by that field's own
+(compiler-reflected) name. So the field just has to be named the same as
+whatever tag is actually repeated -- here that tag happens to be `<node>`
+nested under `<node>`, so the field is `node`; a tree using `<item>` tags
+instead would need a field named `item`, and so on. Confirmed directly:
+renaming both the tag and the field to `item` in an otherwise-identical
+tree reproduces the exact same binding result.
 
 `config_bind.h`'s `bind_from_fields<T>(fields, out)` walks `T`'s fields by
 name (see "Binding: by name for parameters, by position for result
