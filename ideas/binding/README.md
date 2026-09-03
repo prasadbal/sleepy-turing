@@ -51,6 +51,10 @@ that's worth doing, not a committed dependency.
   and a field absent from the XML; a self-referential tree (a `Node` whose
   children are more `Node`s, 4 levels deep); then shows the
   missing-required-field error path.
+- `examples/lookup_benchmark.cpp` -- timing comparison of the old
+  linear-scan field lookup against the current indexed one (see "Field
+  lookup" below); always built with optimizations on regardless of overall
+  build type.
 - `include/binding/oci_collection_bind.h` -- `select_with_in_collection()`:
   an Oracle collection-object bind for `IN (...)`, the alternative to
   `select_with_in_list()`'s generated placeholder list (see below).
@@ -293,6 +297,54 @@ instead of the more permissive `config_schema<T>` -- use it where a struct
 is meant to stay strictly flat (a plain DB row/record shape being the
 common case), so a nested or `vector<U>` field added to it later is a
 compile error right there, instead of silently being accepted.
+
+### Field lookup: an index built once, not a linear scan per field
+
+Each of `T`'s M fields needs to find its matching `Field` in an N-entry
+`FieldList`. The obvious implementation -- linearly scan `fields` for every
+one of `T`'s fields -- is O(M·N), and an earlier version of this file did
+exactly that. `bind_from_fields()` now builds one `detail::FieldIndex` (a
+case-insensitive `name -> vector<const Field*>` hash map, the vector since
+a repeated element means several entries can share a name) over `fields`
+once per call -- O(N) -- and looks up each of `T`'s fields in it -- O(1)
+average each -- for O(N+M) overall instead of O(M·N).
+
+`examples/lookup_benchmark.cpp` measures the two lookup mechanisms directly
+(not the whole binder, since `T`'s field count is fixed at compile time and
+can't be varied in a loop -- but the lookup is exactly what changed):
+
+```
+       N     linear(us)    indexed(us)    speedup
+      10            1.8            2.1       0.9x
+      50           25.2            5.6       4.5x
+     100          118.1           11.4      10.3x
+     500         2728.4           63.4      43.1x
+    1000        11845.1          132.2      89.6x
+    5000       263011.0          745.5     352.8x
+   20000      3447508.8         3179.9    1084.2x
+   50000     27163654.8        12151.8    2235.4x
+```
+
+Two honest things this shows, not just "faster":
+
+- **Below roughly N=10-20, the linear scan wins.** Building a hash map has
+  real fixed overhead (allocating buckets, hashing every string) that a
+  handful of string comparisons doesn't need to pay. For a small,
+  flat config section this is the realistic case, and the difference
+  either way is a couple of microseconds -- noise next to actually reading
+  the file off disk.
+- **The crossover is sharp and then dominant.** By N=1000 the indexed
+  version is ~90x faster; by N=50000 it's ~2200x, because linear scan is
+  genuinely quadratic (11.8ms -> 27.2s as N goes from 1000 to 50000, a
+  2300x increase for a 50x increase in N -- squares to 2500x, matching)
+  while the indexed version stays close to linear.
+
+For a typical config file (tens of fields), this change doesn't matter --
+config loading isn't a hot path, and both numbers round to "fast." It
+starts to matter for a `FieldList` with hundreds-to-thousands of entries
+(a large repeated-element section, or many sibling config sections at one
+nesting level), where the old linear-scan version would visibly slow down
+config loading and the indexed one won't.
 
 ## Dynamic IN (...) lists
 

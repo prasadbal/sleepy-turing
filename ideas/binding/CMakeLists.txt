@@ -49,6 +49,17 @@ target_link_libraries(binding_demo PRIVATE binding)
 add_executable(collection_demo examples/collection_demo.cpp)
 target_link_libraries(collection_demo PRIVATE binding)
 
+# A timing comparison, not a correctness demo -- always optimized regardless
+# of the overall build type, since an unoptimized comparison of an O(1)
+# hash lookup against an O(N) linear scan mostly measures debug-build
+# overhead, not the algorithmic difference this is supposed to show.
+add_executable(lookup_benchmark examples/lookup_benchmark.cpp)
+target_link_libraries(lookup_benchmark PRIVATE binding)
+target_compile_options(lookup_benchmark PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/O2>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O2>
+)
+
 # config_demo additionally needs boost::property_tree, which (unlike pfr)
 # isn't available through the standalone-pfr FetchContent fallback above --
 # it needs an actual local Boost install. Only build it when one was found.
