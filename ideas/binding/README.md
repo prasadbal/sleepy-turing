@@ -494,6 +494,19 @@ signatures faithfully match a real client's. Diff `oci_object_mock.h`
 against the actual `oci.h`/`ociap.h` before trusting this against a live
 database -- see the warning banner at the top of `oci_collection_bind.h`.
 
+`execute_with_in_collection()` is the DML counterpart (e.g. `"DELETE FROM
+trades WHERE trade_id IN (SELECT column_value FROM TABLE(:1))"`) -- same
+mechanism, no result rows. Both it and `select_with_in_collection()` take
+`std::vector<ElemType>`/`std::valarray<ElemType>` convenience overloads
+too, matching `select_with_in_list()`/`execute_with_in_list()`'s shape --
+**but don't confuse the two**: a `vector`/`valarray` passed to the
+`_with_in_list()` functions still goes through `make_in_placeholders()`
+and is still subject to the 1000-element ORA-01795 cap above. Only the
+`_with_in_collection()` functions -- regardless of which of the three
+container types you hand them -- bind a single Oracle collection object
+and are exempt from that cap. The container type you pass in doesn't
+determine which limit applies; which *function* you call does.
+
 ## What's deliberately not here
 
 - Real bulk/array-bind for `insert(conn, query_text, std::vector<T>&)` --

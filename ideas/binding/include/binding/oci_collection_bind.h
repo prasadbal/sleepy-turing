@@ -28,6 +28,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <valarray>
 #include <vector>
 
 #include <boost/pfr.hpp>
@@ -172,6 +173,71 @@ bool select_with_in_collection(OciConnection& conn, const std::string& query_tex
         OCIHandleFree(stmt, OCI_HTYPE_STMT);
         return {true, OCI_SUCCESS};
     });
+}
+
+// Convenience overloads: dedupe/order `ids` into a std::set first (same
+// reason as oci_client.h's select_with_in_list overloads), then delegate.
+// These do NOT change which cap applies -- the set is still bound as one
+// Oracle collection object either way, so the ORA-01795 1000-element cap
+// (see oci_client.h's make_in_placeholders) never applies here regardless
+// of which of the three container types the caller started from.
+template <typename ElemType, bindable RowT>
+bool select_with_in_collection(OciConnection& conn, const std::string& query_text,
+                                const std::vector<ElemType>& ids, std::vector<RowT>& results) {
+    return select_with_in_collection(conn, query_text, std::set<ElemType>(ids.begin(), ids.end()), results);
+}
+
+template <typename ElemType, bindable RowT>
+bool select_with_in_collection(OciConnection& conn, const std::string& query_text,
+                                const std::valarray<ElemType>& ids, std::vector<RowT>& results) {
+    return select_with_in_collection(conn, query_text, std::set<ElemType>(std::begin(ids), std::end(ids)), results);
+}
+
+// DML (e.g. "DELETE FROM trades WHERE trade_id IN (SELECT column_value
+// FROM TABLE(:1))") with a dynamic IN (...) list bound as a single Oracle
+// collection object -- the collection-bind counterpart to
+// oci_client.h's execute_with_in_list(), for the same reason
+// select_with_in_collection() exists opposite select_with_in_list(): fixed
+// SQL text regardless of collection size, no ORA-01795 cap.
+template <typename ElemType>
+bool execute_with_in_collection(OciConnection& conn, const std::string& query_text,
+                                 const std::set<ElemType>& ids) {
+    return conn.run_with_reconnect([&]() -> OciOutcome {
+        OCIType* tdo = nullptr;
+        dvoid* instance = nullptr;
+        if (!detail::build_in_collection(conn, ids, &tdo, &instance)) {
+            return {false, OCI_ERROR};
+        }
+
+        OCIStmt* stmt = nullptr;
+        OCIHandleAlloc(conn.env(), reinterpret_cast<void**>(&stmt), OCI_HTYPE_STMT, 0, nullptr);
+        OCIStmtPrepare(stmt, conn.err(),
+                       reinterpret_cast<const text*>(query_text.c_str()),
+                       static_cast<ub4>(query_text.size()),
+                       OCI_NTV_SYNTAX, OCI_DEFAULT);
+
+        OCIBind* bind_handle = nullptr;
+        OCIBindByPos(stmt, &bind_handle, conn.err(), 1, &instance, 0, SQLT_NTY,
+                    nullptr, nullptr, nullptr, 0, nullptr, OCI_DEFAULT);
+        OCIBindObject(bind_handle, conn.err(), tdo, &instance, nullptr, nullptr, nullptr);
+
+        const sword status = OCIStmtExecute(conn.svc(), stmt, conn.err(), 1, 0, nullptr, nullptr, OCI_DEFAULT);
+        OCIObjectFree(conn.env(), conn.err(), instance, OCI_OBJECTFREE_FORCE);
+        OCIHandleFree(stmt, OCI_HTYPE_STMT);
+        return {status == OCI_SUCCESS, status};
+    });
+}
+
+template <typename ElemType>
+bool execute_with_in_collection(OciConnection& conn, const std::string& query_text,
+                                 const std::vector<ElemType>& ids) {
+    return execute_with_in_collection(conn, query_text, std::set<ElemType>(ids.begin(), ids.end()));
+}
+
+template <typename ElemType>
+bool execute_with_in_collection(OciConnection& conn, const std::string& query_text,
+                                 const std::valarray<ElemType>& ids) {
+    return execute_with_in_collection(conn, query_text, std::set<ElemType>(std::begin(ids), std::end(ids)));
 }
 
 } // namespace binding

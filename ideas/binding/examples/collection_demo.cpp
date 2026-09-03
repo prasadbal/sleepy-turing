@@ -14,6 +14,7 @@
 #include <iostream>
 #include <set>
 #include <string>
+#include <valarray>
 #include <vector>
 
 #include "binding/oci_client.h"
@@ -52,6 +53,28 @@ int main() {
     for (const auto& r : rows) {
         std::cout << "  trade_id=" << r.trade_id << " notional=" << r.notional << "\n";
     }
+
+    std::cout << "\n--- vector<int>/valarray<int> convenience overloads (still collection-bound) ---\n";
+    std::vector<int> vector_ids = {305, 101, 305, 210, 101};
+    std::vector<TradeRow> vector_rows;
+    bool vector_ok = binding::select_with_in_collection(
+        conn, "SELECT trade_id, notional FROM trades WHERE trade_id IN (SELECT column_value FROM TABLE(:1))",
+        vector_ids, vector_rows);
+    std::cout << "select_with_in_collection(vector<int>) result=" << (vector_ok ? "success" : "failed")
+              << ", rows=" << vector_rows.size() << "\n";
+
+    std::valarray<int> valarray_ids = {305, 101, 210};
+    std::vector<TradeRow> valarray_rows;
+    bool valarray_ok = binding::select_with_in_collection(
+        conn, "SELECT trade_id, notional FROM trades WHERE trade_id IN (SELECT column_value FROM TABLE(:1))",
+        valarray_ids, valarray_rows);
+    std::cout << "select_with_in_collection(valarray<int>) result=" << (valarray_ok ? "success" : "failed")
+              << ", rows=" << valarray_rows.size() << "\n";
+
+    std::cout << "\n--- execute_with_in_collection: DML side of the same mechanism ---\n";
+    bool delete_ok = binding::execute_with_in_collection(
+        conn, "DELETE FROM trades WHERE trade_id IN (SELECT column_value FROM TABLE(:1))", vector_ids);
+    std::cout << "execute_with_in_collection(vector<int>) result=" << (delete_ok ? "success" : "failed") << "\n";
 
     conn.disconnect();
 }
