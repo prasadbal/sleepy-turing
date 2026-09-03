@@ -151,6 +151,28 @@ by every method above:
   return failure immediately. It is not retried, because retrying an exec
   error just reproduces it.
 
+### connect() uses OCILogon2, and checks every call
+
+An earlier version of `connect()` did the connection setup the long way --
+`OCIHandleAlloc(SERVER)` + `OCIServerAttach` + `OCIHandleAlloc(SVCCTX)` +
+`OCIAttrSet(SERVER)` + `OCIHandleAlloc(SESSION)` + `OCIAttrSet(USERNAME)` +
+`OCIAttrSet(PASSWORD)` + `OCISessionBegin` + `OCIAttrSet(SESSION)` -- and
+only ever checked the status of `OCISessionBegin`, the second-to-last call.
+A failure anywhere earlier (a bad hostname at `OCIServerAttach`, say) was
+silently ignored, and every later call in the sequence ran anyway against
+whatever half-set-up handle resulted, with any real error surfacing (if at
+all) from the wrong call.
+
+For the plain username/password case this class actually needs -- no
+connection pooling, no external authentication -- `OCILogon2` replaces that
+entire sequence with one call that hands back a ready `OCISvcCtx*`.
+`connect()` now checks the status of every call it makes (`OCIEnvCreate`,
+the error handle's `OCIHandleAlloc`, `OCILogon2`), tearing down via
+`disconnect()` on the first failure instead of continuing past it.
+`disconnect()` correspondingly shrank to `OCILogoff` plus freeing the env
+and error handles -- the `OCIServer`/`OCISession` handles `OCILogon2`
+manages internally never need to be held or freed here at all.
+
 ## NULL handling (std::optional<U>)
 
 A field declared `std::optional<U>` (U arithmetic or string-convertible)

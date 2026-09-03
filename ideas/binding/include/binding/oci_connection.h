@@ -44,46 +44,44 @@ public:
     OciConnection(const OciConnection&) = delete;
     OciConnection& operator=(const OciConnection&) = delete;
 
+    // Establishes env + error handles, then logs on via OCILogon2 -- one
+    // call that does what used to be OCIHandleAlloc(SERVER) +
+    // OCIServerAttach + OCIHandleAlloc(SVCCTX) + OCIAttrSet(SERVER) +
+    // OCIHandleAlloc(SESSION) + OCIAttrSet(USERNAME) + OCIAttrSet(PASSWORD)
+    // + OCISessionBegin + OCIAttrSet(SESSION), for the plain username/
+    // password case (no connection pooling, no external authentication)
+    // this class actually needs. Fewer calls means fewer places an error
+    // can go unchecked, which is also the point: every call here is
+    // checked and a failure tears down whatever partially succeeded via
+    // disconnect(), rather than continuing on with a handle from a call
+    // that never happened.
     bool connect() {
-        OCIEnvCreate(&env_, OCI_DEFAULT, nullptr, nullptr, nullptr, nullptr, 0, nullptr);
-        OCIHandleAlloc(env_, reinterpret_cast<void**>(&err_), OCI_HTYPE_ERROR, 0, nullptr);
-        OCIHandleAlloc(env_, reinterpret_cast<void**>(&server_), OCI_HTYPE_SERVER, 0, nullptr);
-        OCIServerAttach(server_, err_,
-                        reinterpret_cast<const text*>(connect_string_.c_str()),
-                        static_cast<sb4>(connect_string_.size()), OCI_DEFAULT);
-
-        OCIHandleAlloc(env_, reinterpret_cast<void**>(&svc_), OCI_HTYPE_SVCCTX, 0, nullptr);
-        OCIAttrSet(svc_, OCI_HTYPE_SVCCTX, server_, 0, OCI_ATTR_SERVER, err_);
-
-        OCIHandleAlloc(env_, reinterpret_cast<void**>(&session_), OCI_HTYPE_SESSION, 0, nullptr);
-        OCIAttrSet(session_, OCI_HTYPE_SESSION,
-                   const_cast<char*>(username_.c_str()), static_cast<ub4>(username_.size()),
-                   OCI_ATTR_USERNAME, err_);
-        OCIAttrSet(session_, OCI_HTYPE_SESSION,
-                   const_cast<char*>(password_.c_str()), static_cast<ub4>(password_.size()),
-                   OCI_ATTR_PASSWORD, err_);
-
-        const sword status = OCISessionBegin(svc_, err_, session_, OCI_CRED_RDBMS, OCI_DEFAULT);
+        if (OCIEnvCreate(&env_, OCI_DEFAULT, nullptr, nullptr, nullptr, nullptr, 0, nullptr) != OCI_SUCCESS) {
+            env_ = nullptr; // no err_ handle exists yet to get a message out of
+            return false;
+        }
+        if (OCIHandleAlloc(env_, reinterpret_cast<void**>(&err_), OCI_HTYPE_ERROR, 0, nullptr) != OCI_SUCCESS) {
+            disconnect();
+            return false;
+        }
+        const sword status = OCILogon2(env_, err_, &svc_,
+            reinterpret_cast<const text*>(username_.c_str()), static_cast<ub4>(username_.size()),
+            reinterpret_cast<const text*>(password_.c_str()), static_cast<ub4>(password_.size()),
+            reinterpret_cast<const text*>(connect_string_.c_str()), static_cast<ub4>(connect_string_.size()),
+            OCI_DEFAULT);
         if (status != OCI_SUCCESS) {
             disconnect();
             return false;
         }
-        OCIAttrSet(svc_, OCI_HTYPE_SVCCTX, session_, 0, OCI_ATTR_SESSION, err_);
         connected_ = true;
         return true;
     }
 
     void disconnect() {
-        if (session_ && svc_) OCISessionEnd(svc_, err_, session_, OCI_DEFAULT);
-        if (server_) OCIServerDetach(server_, err_, OCI_DEFAULT);
-        if (session_) OCIHandleFree(session_, OCI_HTYPE_SESSION);
-        if (svc_) OCIHandleFree(svc_, OCI_HTYPE_SVCCTX);
-        if (server_) OCIHandleFree(server_, OCI_HTYPE_SERVER);
+        if (svc_ && err_) OCILogoff(svc_, err_);
         if (err_) OCIHandleFree(err_, OCI_HTYPE_ERROR);
         if (env_) OCIHandleFree(env_, OCI_HTYPE_ENV);
-        session_ = nullptr;
         svc_ = nullptr;
-        server_ = nullptr;
         err_ = nullptr;
         env_ = nullptr;
         connected_ = false;
@@ -151,11 +149,9 @@ private:
     int max_retries_;
     std::chrono::milliseconds retry_interval_;
 
-    OCIEnv*     env_     = nullptr;
-    OCIError*   err_     = nullptr;
-    OCIServer*  server_  = nullptr;
-    OCISvcCtx*  svc_     = nullptr;
-    OCISession* session_ = nullptr;
+    OCIEnv*    env_ = nullptr;
+    OCIError*  err_ = nullptr;
+    OCISvcCtx* svc_ = nullptr;
     bool connected_ = false;
 };
 

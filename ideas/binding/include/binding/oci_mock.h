@@ -32,8 +32,6 @@ using oraub8 = unsigned long long;
 struct OCIEnv;
 struct OCISvcCtx;
 struct OCIError;
-struct OCIServer;
-struct OCISession;
 struct OCIStmt;
 struct OCIBind;
 struct OCIDefine;
@@ -47,14 +45,7 @@ struct OCILobLocator;
 #define OCI_HTYPE_ERROR   2
 #define OCI_HTYPE_SVCCTX  3
 #define OCI_HTYPE_STMT    4
-#define OCI_HTYPE_SESSION 5
-#define OCI_HTYPE_SERVER  6
 #define OCI_DTYPE_LOB     7
-#define OCI_ATTR_SERVER   8
-#define OCI_ATTR_SESSION  9
-#define OCI_ATTR_USERNAME 10
-#define OCI_ATTR_PASSWORD 11
-#define OCI_CRED_RDBMS    1
 #define OCI_NTV_SYNTAX    1
 #define OCI_ONE_PIECE     1
 #define OCI_FETCH_NEXT    2
@@ -125,13 +116,12 @@ inline sword OCIHandleAlloc(const dvoid*, dvoid** hndlpp, ub4, size_t, dvoid**) 
 
 inline sword OCIHandleFree(dvoid*, ub4) { return OCI_SUCCESS; }
 
-inline sword OCIServerAttach(OCIServer*, OCIError*, const text*, sb4, ub4) { return OCI_SUCCESS; }
-inline sword OCIServerDetach(OCIServer*, OCIError*, ub4) { return OCI_SUCCESS; }
-
-inline sword OCIAttrSet(dvoid*, ub4, dvoid*, ub4, ub4, OCIError*) { return OCI_SUCCESS; }
-
-inline sword OCISessionBegin(OCISvcCtx*, OCIError*, OCISession*, ub4, ub4) { return OCI_SUCCESS; }
-inline sword OCISessionEnd(OCISvcCtx*, OCIError*, OCISession*, ub4) { return OCI_SUCCESS; }
+inline sword OCILogon2(OCIEnv*, OCIError*, OCISvcCtx** svchp,
+                        const text*, ub4, const text*, ub4, const text*, ub4, ub4) {
+    *svchp = reinterpret_cast<OCISvcCtx*>(1); // non-null sentinel; never dereferenced
+    return OCI_SUCCESS;
+}
+inline sword OCILogoff(OCISvcCtx*, OCIError*) { return OCI_SUCCESS; }
 
 inline sword OCIStmtPrepare(OCIStmt*, OCIError*, const text*, ub4, ub4, ub4) {
     binding::mock::g_defines.clear();
