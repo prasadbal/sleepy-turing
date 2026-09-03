@@ -1,12 +1,14 @@
 #pragma once
-// Oracle collection-type bind for IN (...): the alternative to
-// oci_client.h's select_with_in_list()/execute_with_in_list(), which
-// generate ":1,:2,...,:N" placeholders sized to the collection at prepare
-// time. That approach is capped at 1000 elements (ORA-01795) and, since
-// each distinct list size is different SQL text, fragments Oracle's
-// shared-pool cursor cache as sizes vary. Binding one Oracle collection
-// *object* instead keeps the SQL text completely fixed regardless of list
-// size:
+// Oracle collection-type bind for a dynamic IN (...) list: bind one Oracle
+// collection *object* holding every value, instead of generating
+// ":1,:2,...,:N" placeholders sized to the collection at prepare time (the
+// way oci_client.h's detail::bind_named_container does for a struct
+// field's own multi-value IN-list). A generated placeholder list is capped
+// at 1000 elements (ORA-01795, a parser-level limit on any syntactic
+// IN (...) list) and, since each distinct list size is different SQL
+// text, fragments Oracle's shared-pool cursor cache as sizes vary. Binding
+// one collection object keeps the SQL text completely fixed regardless of
+// list size, with neither limitation:
 //
 //   WHERE id IN (SELECT column_value FROM TABLE(:1))
 //
@@ -81,8 +83,7 @@ void append_collection_element(OciConnection& conn, OCIColl* coll, const ElemTyp
 }
 
 // Looks up ElemType's collection type, creates a new empty instance of it,
-// and appends every element of `values` -- the object-API equivalent of
-// bind_in_list() in oci_client.h.
+// and appends every element of `values`.
 template <typename ElemType>
 bool build_in_collection(OciConnection& conn, const std::set<ElemType>& values,
                           OCIType** out_tdo, dvoid** out_instance) {
@@ -112,14 +113,14 @@ bool build_in_collection(OciConnection& conn, const std::set<ElemType>& values,
 } // namespace detail
 
 // SELECT with a dynamic IN (...) list bound as a single Oracle collection
-// object, instead of a generated placeholder list. `query_text` is fixed,
-// ordinary SQL with exactly one positional bind for the collection -- e.g.
-// "SELECT trade_id, notional FROM trades WHERE trade_id IN (SELECT
-// column_value FROM TABLE(:1))" -- no {IN} marker/substitution needed,
-// since the whole collection is one bind regardless of how many elements
-// are in it. Not subject to the 1000-element ORA-01795 cap
-// select_with_in_list() has, and reuses the same SQL text (and so the same
-// cached cursor) no matter how the collection's size varies between calls.
+// object. `query_text` is fixed, ordinary SQL with exactly one positional
+// bind for the collection -- e.g. "SELECT trade_id, notional FROM trades
+// WHERE trade_id IN (SELECT column_value FROM TABLE(:1))" -- no marker/
+// substitution needed, since the whole collection is one bind regardless
+// of how many elements are in it. Not subject to the 1000-element
+// ORA-01795 cap a generated placeholder list would be, and reuses the
+// same SQL text (and so the same cached cursor) no matter how the
+// collection's size varies between calls.
 template <typename ElemType, bindable RowT>
 bool select_with_in_collection(OciConnection& conn, const std::string& query_text,
                                 const std::set<ElemType>& ids, std::vector<RowT>& results) {
@@ -175,12 +176,15 @@ bool select_with_in_collection(OciConnection& conn, const std::string& query_tex
     });
 }
 
-// Convenience overloads: dedupe/order `ids` into a std::set first (same
-// reason as oci_client.h's select_with_in_list overloads), then delegate.
-// These do NOT change which cap applies -- the set is still bound as one
-// Oracle collection object either way, so the ORA-01795 1000-element cap
-// (see oci_client.h's make_in_placeholders) never applies here regardless
-// of which of the three container types the caller started from.
+// Convenience overloads: dedupe/order `ids` into a std::set first (a
+// repeated value is never meaningful in an IN-list, only a wasted bind;
+// and iterating a set gives a deterministic order, which is what keeps
+// two calls over the same logical set of IDs producing the same generated
+// element order, useful if the collection type's element order matters
+// for a comparison downstream), then delegate. The set is bound as one
+// Oracle collection object either way here, so there's no ORA-01795 cap
+// to speak of regardless of which of the three container types the
+// caller started from.
 template <typename ElemType, bindable RowT>
 bool select_with_in_collection(OciConnection& conn, const std::string& query_text,
                                 const std::vector<ElemType>& ids, std::vector<RowT>& results) {
@@ -195,10 +199,9 @@ bool select_with_in_collection(OciConnection& conn, const std::string& query_tex
 
 // DML (e.g. "DELETE FROM trades WHERE trade_id IN (SELECT column_value
 // FROM TABLE(:1))") with a dynamic IN (...) list bound as a single Oracle
-// collection object -- the collection-bind counterpart to
-// oci_client.h's execute_with_in_list(), for the same reason
-// select_with_in_collection() exists opposite select_with_in_list(): fixed
-// SQL text regardless of collection size, no ORA-01795 cap.
+// collection object -- the no-result-rows counterpart to
+// select_with_in_collection() above: fixed SQL text regardless of
+// collection size, no ORA-01795 cap.
 template <typename ElemType>
 bool execute_with_in_collection(OciConnection& conn, const std::string& query_text,
                                  const std::set<ElemType>& ids) {

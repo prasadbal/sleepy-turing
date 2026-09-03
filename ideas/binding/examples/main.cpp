@@ -18,9 +18,6 @@
 //      dynamic IN-list, alongside an ordinary named scalar field in the
 //      same statement.
 //   5. select() with std::optional -- a NULL column maps back to nullopt.
-//   5.5. A dynamic IN (...) list: dedup + deterministic bind order via
-//      std::set, for both select_with_in_list() and execute_with_in_list()
-//      (std::vector and std::valarray ID collections both accepted).
 //   6. A NULL landing on a field that isn't std::optional -- throws,
 //      instead of silently leaving the field's stale/default value.
 //
@@ -30,7 +27,6 @@
 #include <chrono>
 #include <iostream>
 #include <set>
-#include <valarray>
 #include <vector>
 
 #include "binding/oci_client.h"
@@ -154,36 +150,6 @@ int main() {
               << " -- status bound by name (:status), trade_ids bound as its own "
               << filter.trade_ids.size() << "-element IN-list ({trade_ids} -> "
               << binding::make_named_placeholders("trade_ids", filter.trade_ids.size()) << ")\n\n";
-
-    std::cout << "--- Demo 5.5: dynamic IN (...) list -- dedup + deterministic order via std::set ---\n";
-    binding::mock::set_mode(binding::mock::FailureMode::None);
-    std::vector<int> raw_ids = {305, 101, 305, 210, 101}; // duplicates, out of order, on purpose
-    std::set<int> unique_ids(raw_ids.begin(), raw_ids.end());
-    std::cout << "input vector had " << raw_ids.size() << " elements (with duplicates, unordered); "
-              << "deduped set has " << unique_ids.size() << ": "
-              << binding::make_in_placeholders(unique_ids.size(), 1)
-              << " (positions map to the set's sorted order: 101,210,305)\n";
-
-    std::vector<TradeRow> in_rows;
-    bool in_ok = client.select_with_in_list(
-        conn, "SELECT trade_id, notional FROM trades WHERE trade_id IN ({IN})", raw_ids, in_rows);
-    std::cout << "select_with_in_list (vector overload) result=" << (in_ok ? "success" : "failed")
-              << ", rows returned=" << in_rows.size()
-              << " (the mock always returns its canned rows -- it doesn't actually filter by id)\n";
-
-    bool del_ok = client.execute_with_in_list(
-        conn, "DELETE FROM trades WHERE trade_id IN ({IN})", unique_ids);
-    std::cout << "execute_with_in_list result=" << (del_ok ? "success" : "failed") << "\n";
-
-    std::valarray<int> valarray_ids = {305, 101, 210}; // same ids, as a std::valarray this time
-    std::vector<TradeRow> valarray_rows;
-    bool valarray_ok = client.select_with_in_list(
-        conn, "SELECT trade_id, notional FROM trades WHERE trade_id IN ({IN})", valarray_ids, valarray_rows);
-    std::cout << "select_with_in_list (std::valarray overload) result=" << (valarray_ok ? "success" : "failed")
-              << ", rows returned=" << valarray_rows.size() << "\n";
-
-    std::cout << "empty ID list generates: \"" << binding::make_in_placeholders(0, 1)
-              << "\" (matches nothing, without a SQL syntax error)\n\n";
 
     std::cout << "--- Demo 5: select() with std::optional -- NULL indicator maps back to nullopt ---\n";
     binding::mock::set_simulate_null_last_column(true); // commission is the last column here

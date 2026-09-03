@@ -35,8 +35,10 @@ that's worth doing, not a committed dependency.
 - `examples/main.cpp` -- execute() with no bind struct at all, a mid-execute
   disconnect that recovers, a plain exec error that must not retry, select()
   into `vector<T>`, binding an empty `std::optional` as SQL NULL, insert()
-  with a `vector<T>` of several rows, select() with std::optional (a NULL
-  column comes back as `nullopt`), and a dynamic `IN (...)` list.
+  with a `vector<T>` of several rows, a struct field that's itself a dynamic
+  multi-value IN-list alongside an ordinary named field, select() with
+  std::optional (a NULL column comes back as `nullopt`), and a NULL landing
+  on a field that isn't `std::optional`.
 - `include/binding/field_tree.h` -- `Field`/`FieldList`: a parser-independent
   (name, value) tree that config parsing converts into, before it ever meets
   a user struct.
@@ -55,9 +57,9 @@ that's worth doing, not a committed dependency.
   linear-scan field lookup against the current indexed one (see "Field
   lookup" below); always built with optimizations on regardless of overall
   build type.
-- `include/binding/oci_collection_bind.h` -- `select_with_in_collection()`:
-  an Oracle collection-object bind for `IN (...)`, the alternative to
-  `select_with_in_list()`'s generated placeholder list (see below).
+- `include/binding/oci_collection_bind.h` -- `select_with_in_collection()`/
+  `execute_with_in_collection()`: a dynamic `IN (...)` list bound as a
+  single Oracle collection object (see below).
 
 ## The client's methods (execute / insert / select)
 
@@ -88,9 +90,10 @@ bind-mechanism jargon:
   matters for a real use case.
 - **`select(conn, query_text, results)`** -- runs a `SELECT` and returns
   its rows into `std::vector<T>&`.
-- **`select_with_in_list()` / `execute_with_in_list()` / (from
-  `oci_collection_bind.h`) `select_with_in_collection()`** -- the dynamic
-  `IN (...)` list variants (see below).
+- **(from `oci_collection_bind.h`) `select_with_in_collection()` /
+  `execute_with_in_collection()`** -- a dynamic `IN (...)` list bound as a
+  single Oracle collection object (see below), for when the values to
+  match against aren't already sitting in a bind struct's own field.
 
 ## Binding: by name for parameters, by position for result columns
 
@@ -132,9 +135,10 @@ numbered, like `:1`, or named, like `:emp_id`) refers to the Nth *distinct*
 placeholder in order of first appearance in the SQL text, not the Nth
 *occurrence*. `WHERE a = :1 OR b = :1` has exactly one bind (`:1`, reused
 in two places), not two -- the same rule applies to named binds. This
-matters for `bind_in_list()` (below): each element of the IN-list consumes
-one new placeholder, since each is a distinct value, but a struct field
-whose name is written twice in a statement's text still only binds once.
+matters for `bind_named_container()` (further down): each element of a
+container field's IN-list consumes one new, distinctly-named placeholder,
+since each is a distinct value, but an ordinary field whose name is
+written twice in a statement's text still only binds once.
 
 ## Reconnect policy
 

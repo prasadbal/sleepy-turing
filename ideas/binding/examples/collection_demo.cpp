@@ -1,8 +1,8 @@
-// Demo for oci_collection_bind.h -- the Oracle collection-type alternative
-// to oci_client.h's select_with_in_list(): one bound collection object
-// instead of a generated ":1,:2,...,:N" placeholder list, so the SQL text
-// stays fixed regardless of how many elements are in the list (and isn't
-// subject to select_with_in_list()'s 1000-element ORA-01795 cap).
+// Demo for oci_collection_bind.h: a dynamic IN (...) list bound as one
+// Oracle collection object, instead of a generated ":1,:2,...,:N"
+// placeholder list -- SQL text stays fixed regardless of how many elements
+// are in the list, and isn't subject to the 1000-element ORA-01795 cap a
+// generated placeholder list would be.
 //
 // See the warning banner at the top of oci_collection_bind.h: this exercises
 // the C++ template plumbing against this repo's own mock, which proves the
