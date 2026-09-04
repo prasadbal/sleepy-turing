@@ -160,18 +160,23 @@ concept flat_schema = struct_field_auditor<T, leaf_only_predicate>::value;
 // variant, just several same-named entries, so the struct side needs to know
 // which of its fields are meant to collect all of them).
 // ----------------------------------------------------------------------------
+// The trailing Rest... pack (rather than naming Allocator explicitly)
+// matches std::vector<U> regardless of its allocator: std::vector<U> as a
+// specialization pattern only matches the *default* std::allocator<U>, so
+// a vector using any other allocator fell through to false_type here
+// before this was a pack.
 template <typename T>
 struct is_vector_impl : std::false_type {};
-template <typename U>
-struct is_vector_impl<std::vector<U>> : std::true_type {};
+template <typename U, typename... Rest>
+struct is_vector_impl<std::vector<U, Rest...>> : std::true_type {};
 
 template <typename T>
 inline constexpr bool is_vector_v = is_vector_impl<std::remove_cv_t<T>>::value;
 
 template <typename T>
 struct vector_value_impl { using type = void; };
-template <typename U>
-struct vector_value_impl<std::vector<U>> { using type = U; };
+template <typename U, typename... Rest>
+struct vector_value_impl<std::vector<U, Rest...>> { using type = U; };
 
 // The U in std::vector<U>; only meaningful when is_vector_v<T> is true.
 template <typename T>

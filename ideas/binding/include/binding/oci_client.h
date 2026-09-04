@@ -90,10 +90,18 @@ template <typename T> inline constexpr ub2 oci_type_code_v = oci_type_code_of<T>
 // reflect.h's is_vector_v/vector_value_t, which is about config's
 // "repeated nested struct" concept -- an entirely different thing sharing
 // only the word "vector".
+//
+// The trailing Rest... packs (rather than naming Allocator/Compare
+// explicitly) match std::vector<U>/std::set<U> regardless of their
+// allocator/comparator: as a specialization pattern, std::vector<U> only
+// matches the *default* std::allocator<U> (two defaulted parameters for
+// std::set<U> -- Compare and Allocator), so a container using any other
+// allocator/comparator fell through to false_type before these were packs.
+// std::valarray<U> has no such extra parameters, so it stays as-is.
 // ----------------------------------------------------------------------------
 template <typename T> struct is_multi_bind_container_impl : std::false_type { using value_type = void; };
-template <typename U> struct is_multi_bind_container_impl<std::vector<U>>   : std::true_type  { using value_type = U; };
-template <typename U> struct is_multi_bind_container_impl<std::set<U>>     : std::true_type  { using value_type = U; };
+template <typename U, typename... Rest> struct is_multi_bind_container_impl<std::vector<U, Rest...>> : std::true_type { using value_type = U; };
+template <typename U, typename... Rest> struct is_multi_bind_container_impl<std::set<U, Rest...>>     : std::true_type { using value_type = U; };
 template <typename U> struct is_multi_bind_container_impl<std::valarray<U>> : std::true_type  { using value_type = U; };
 
 template <typename T>
