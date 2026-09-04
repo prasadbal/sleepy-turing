@@ -89,11 +89,22 @@ public:
         }
     }
 
-    // The first entry with this name, or nullptr. For a non-repeated field
-    // there's at most one; for a repeated element, use all() instead.
-    FieldPtr first(std::string_view name) const {
+    // The one entry with this name, or nullptr if there are none. Calling
+    // this is itself an assertion that the field isn't repeated -- if two
+    // or more entries share `name`, that's a genuinely ambiguous config
+    // (a duplicate key where at most one was expected), not something to
+    // silently resolve by picking whichever happened to come first, so
+    // this throws instead. A field that's actually meant to repeat should
+    // use all() below, never this.
+    FieldPtr single(std::string_view name) const {
         auto it = by_name_.find(to_lower(name));
-        return (it == by_name_.end() || it->second.empty()) ? nullptr : it->second.front();
+        if (it == by_name_.end() || it->second.empty()) return nullptr;
+        if (it->second.size() > 1) {
+            throw std::runtime_error("binding: field '" + std::string(name) +
+                                      "' appears " + std::to_string(it->second.size()) +
+                                      " times, expected at most one");
+        }
+        return it->second.front();
     }
 
     // Every entry with this name, in FieldList order (empty if none). By
@@ -141,11 +152,21 @@ public:
 
     explicit LinearFieldScannerT(SourceRef fields) : fields_(fields) {}
 
-    FieldPtr first(std::string_view name) const {
+    // Same contract as FieldIndexT::single() above: at most one match is
+    // ever legal here, so a second one found while scanning throws rather
+    // than being silently ignored in favor of the first.
+    FieldPtr single(std::string_view name) const {
+        FieldPtr found = nullptr;
         for (auto& f : fields_) {
-            if (to_lower(f.name) == to_lower(name)) return &f;
+            if (to_lower(f.name) == to_lower(name)) {
+                if (found) {
+                    throw std::runtime_error("binding: field '" + std::string(name) +
+                                              "' appears more than once, expected at most one");
+                }
+                found = &f;
+            }
         }
-        return nullptr;
+        return found;
     }
 
     std::vector<FieldPtr> all(std::string_view name) const {
@@ -345,7 +366,7 @@ void bind_one_field(const IndexT& index, T& out, std::string_view name, bool str
             field = std::move(value);
 
         } else {
-            auto* f = index.first(name);
+            auto* f = index.single(name);
             if (!f) {
                 field = std::nullopt;
                 return;
@@ -370,7 +391,7 @@ void bind_one_field(const IndexT& index, T& out, std::string_view name, bool str
 
     } else { // plain leaf, or nested config_schema struct -- bind_one_value
              // picks which via is_bindable_leaf_v<FieldType>
-        auto* f = index.first(name);
+        auto* f = index.single(name);
         if (!f) {
             throw std::runtime_error("binding: missing required field '" + std::string(name) + "'");
         }

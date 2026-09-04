@@ -79,7 +79,7 @@ int main() {
         binding::detail::FieldIndex index(fields);
         std::size_t checksum_new = 0;
         for (const auto& name : names) {
-            const Field* f = index.first(name);
+            const Field* f = index.single(name);
             checksum_new += f ? std::get<std::string>(f->as_leaf()).size() : 0;
         }
         auto t3 = std::chrono::steady_clock::now();
