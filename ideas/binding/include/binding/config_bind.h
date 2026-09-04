@@ -265,6 +265,48 @@ void parse_leaf_value(LeafRef&& raw, T& out, std::string_view field_name) {
     }, std::forward<LeafRef>(raw));
 }
 
+// Parses one already-resolved leaf Field's value into `out` -- the shared
+// tail end for every place a bindable-leaf value gets pulled out of a
+// Field*: a plain leaf field, a vector<leaf> field's own elements, and an
+// optional<leaf>/optional<vector<leaf>> field's present value, all via
+// bind_one_value below instead of each calling parse_leaf_value directly.
+//
+// std::move is safe here regardless of f's constness: moving from a
+// const Field* degrades to an ordinary copy (a std::string's
+// move-assignment can't bind to a const rvalue, so overload resolution
+// falls back to its copy-assignment instead -- see parse_leaf_text/
+// parse_leaf_value's own comments), and only actually moves when f is a
+// genuine, non-const Field*.
+template <typename FieldPtr, typename T>
+void bind_leaf(FieldPtr f, T& out, std::string_view name) {
+    if (!f->is_leaf()) {
+        throw std::runtime_error("binding: field '" + std::string(name) + "' expected a plain value");
+    }
+    parse_leaf_value(std::move(f->as_leaf()), out, name);
+}
+
+// Binds one already-resolved Field into a target of type T. T is never
+// itself a vector here: config_field_predicate only allows a vector<U>
+// field's own U to be a leaf or a struct, never another vector, so
+// config_schema<Outer> already rejects a vector<vector<T>> field before
+// this is ever reached -- there's no third shape to handle. That leaves
+// exactly the leaf-or-struct choice bind_one_field itself needs for a
+// plain field, which is what lets this one function serve three call
+// sites that used to each duplicate it: a plain (non-optional,
+// non-vector) field, one element of a vector<T> field, and an
+// optional<T> field's present value (once unwrapped).
+template <typename FieldPtr, typename T>
+void bind_one_value(FieldPtr f, T& out, std::string_view name, bool strict) {
+    if constexpr (is_bindable_leaf_v<T>) {
+        bind_leaf(f, out, name);
+    } else { // nested config_schema struct
+        if (!f->is_struct()) {
+            throw std::runtime_error("binding: field '" + std::string(name) + "' expected a nested structure");
+        }
+        bind_from_fields_impl(f->as_struct(), out, strict);
+    }
+}
+
 template <std::size_t I, typename IndexT, config_schema T>
 void bind_one_field(const IndexT& index, T& out, std::string_view name, bool strict) {
     using FieldType = boost::pfr::tuple_element_t<I, T>;
@@ -279,69 +321,60 @@ void bind_one_field(const IndexT& index, T& out, std::string_view name, bool str
     // would then always pick the const overload regardless.
     if constexpr (is_optional_v<FieldType>) {
         using ValueType = optional_value_t<FieldType>;
-        auto* f = index.first(name);
-        if (!f) {
-            field = std::nullopt;
-            return;
+
+        if constexpr (is_vector_v<ValueType>) {
+            // optional<vector<U>>: no matches by name at all means the
+            // field is absent (nullopt); one or more means present,
+            // collected exactly like a plain vector<U> field below. The
+            // Field/FieldList model has no way to distinguish "declared
+            // with zero elements" from "never declared" -- both are zero
+            // matches by name -- so both read back the same way, as
+            // nullopt; there's no third state being lost here.
+            using ElemType = vector_value_t<ValueType>;
+            auto matches = index.all(name);
+            if (matches.empty()) {
+                field = std::nullopt;
+                return;
+            }
+            ValueType value;
+            for (auto* f : matches) {
+                ElemType elem{};
+                bind_one_value(f, elem, name, strict);
+                value.push_back(std::move(elem));
+            }
+            field = std::move(value);
+
+        } else {
+            auto* f = index.first(name);
+            if (!f) {
+                field = std::nullopt;
+                return;
+            }
+            ValueType value{};
+            bind_one_value(f, value, name, strict);
+            field = std::move(value);
         }
-        if (!f->is_leaf()) {
-            throw std::runtime_error("binding: field '" + std::string(name) + "' expected a plain value");
-        }
-        ValueType value{};
-        // std::move is safe here regardless of f's constness: moving from
-        // a const Field* degrades to an ordinary copy (a std::string's
-        // move-assignment can't bind to a const rvalue, so overload
-        // resolution falls back to its copy-assignment instead -- see
-        // parse_leaf_text/parse_leaf_value's own comments), and only
-        // actually moves when f is a genuine, non-const Field*.
-        parse_leaf_value(std::move(f->as_leaf()), value, name);
-        field = std::move(value);
 
     } else if constexpr (is_vector_v<FieldType>) {
         using ElemType = vector_value_t<FieldType>;
         field.clear();
+        // Every match must actually agree with ElemType's own shape (leaf
+        // or struct) -- config_field_predicate only guarantees the
+        // *field*'s element type is one of those, not that the parsed
+        // data agrees; bind_one_value throws, naming `name`, if it doesn't.
         for (auto* f : index.all(name)) {
-            if constexpr (is_bindable_leaf_v<ElemType>) {
-                // A repeated leaf element, e.g. several <port>8080</port>
-                // siblings -> std::vector<int>. Every match must actually
-                // be a leaf, not a struct -- config_field_predicate only
-                // guarantees the *field*'s element type is leaf-shaped,
-                // not that the parsed data agrees.
-                if (!f->is_leaf()) {
-                    throw std::runtime_error("binding: field '" + std::string(name) + "' expected a plain value");
-                }
-                ElemType elem{};
-                parse_leaf_value(std::move(f->as_leaf()), elem, name);
-                field.push_back(std::move(elem));
-            } else {
-                if (!f->is_struct()) {
-                    throw std::runtime_error("binding: field '" + std::string(name) + "' expected a nested structure");
-                }
-                ElemType elem{};
-                bind_from_fields_impl(f->as_struct(), elem, strict);
-                field.push_back(std::move(elem));
-            }
+            ElemType elem{};
+            bind_one_value(f, elem, name, strict);
+            field.push_back(std::move(elem));
         }
 
-    } else if constexpr (is_bindable_leaf_v<FieldType>) {
+    } else { // plain leaf, or nested config_schema struct -- bind_one_value
+             // picks which via is_bindable_leaf_v<FieldType>
         auto* f = index.first(name);
         if (!f) {
             throw std::runtime_error("binding: missing required field '" + std::string(name) + "'");
         }
-        if (!f->is_leaf()) {
-            throw std::runtime_error("binding: field '" + std::string(name) + "' expected a plain value");
-        }
-        parse_leaf_value(std::move(f->as_leaf()), field, name);
-
-    } else { // nested config_schema struct
-        auto* f = index.first(name);
-        if (!f) {
-            throw std::runtime_error("binding: missing required field '" + std::string(name) + "'");
-        }
-        if (!f->is_struct()) {
-            throw std::runtime_error("binding: field '" + std::string(name) + "' expected a nested structure");
-        }
-        bind_from_fields_impl(f->as_struct(), field, strict);
+        bind_one_value(f, field, name, strict);
     }
 }
 

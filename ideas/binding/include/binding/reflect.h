@@ -216,7 +216,24 @@ using vector_value_t = typename vector_value_impl<std::remove_cv_t<T>>::type;
 struct config_field_predicate {
     template <typename U>
     static constexpr bool check() {
-        if constexpr (is_bindable_leaf_v<U>) {
+        if constexpr (is_optional_v<U>) {
+            // Unwrap once and re-check the inner type against these same
+            // rules. optional<leaf> is already covered by is_bindable_leaf_v
+            // below (this branch just agrees with it, since is_bindable_leaf
+            // itself special-cases an optional-wrapped arithmetic/string-like
+            // type); this is what additionally admits optional<vector<T>>
+            // (config_bind.h's bind_one_field treats "no matches by name" as
+            // absent, "one or more" as present) and optional<StructT>
+            // (absent when the field itself is missing) as legal field
+            // shapes too. This recurses into check<>() again, not into
+            // config_schema<U>/struct_field_auditor<U,...> -- the same
+            // shallow style the vector/struct branches below already use --
+            // so a self-referential optional<T> field (T's own
+            // std::optional<T> member) bottoms out at the same shallow
+            // is_bindable_struct_v check the plain self-referential
+            // vector<T> case already relies on, not a second deep audit of T.
+            return check<optional_value_t<U>>();
+        } else if constexpr (is_bindable_leaf_v<U>) {
             return true;
         } else if constexpr (is_vector_v<U>) {
             // A repeated element's several same-named entries are either
