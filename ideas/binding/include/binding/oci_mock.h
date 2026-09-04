@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -37,6 +38,15 @@ struct OCIStmt;
 struct OCIBind;
 struct OCIDefine;
 struct OCILobLocator;
+struct OCIDateTime;
+
+// Mirrors the real ::OCITime/::OCIDate struct shape exactly (field names
+// included) so binding/oci_datetime.h's OciDate -- which touches these
+// fields directly rather than through OCIDateGetDate/OCIDateSetDate (real
+// macros, not functions -- see oci_datetime.h) -- compiles and runs
+// identically against the mock and a real client.
+struct OCITime { unsigned char OCITimeHH = 0, OCITimeMI = 0, OCITimeSS = 0; };
+struct OCIDate { sb2 OCIDateYYYY = 0; unsigned char OCIDateMM = 0, OCIDateDD = 0; OCITime OCIDateTime; };
 
 // ---- Handle/attribute/mode constants -----------------------------------
 // Values are internal to this mock -- they only need to be self-consistent,
@@ -48,6 +58,7 @@ struct OCILobLocator;
 #define OCI_HTYPE_SVCCTX  3
 #define OCI_HTYPE_STMT    4
 #define OCI_DTYPE_LOB     7
+#define OCI_DTYPE_TIMESTAMP 68
 #define OCI_NTV_SYNTAX    1
 #define OCI_ONE_PIECE     1
 #define OCI_FETCH_NEXT    2
@@ -77,6 +88,8 @@ constexpr ub2 SQLT_STR     = 5;
 constexpr ub2 SQLT_BFLOAT  = 21;
 constexpr ub2 SQLT_BDOUBLE = 22;
 constexpr ub2 SQLT_CLOB    = 112;
+constexpr ub2 SQLT_ODT       = 156;
+constexpr ub2 SQLT_TIMESTAMP = 187;
 
 namespace binding::mock {
 
@@ -333,6 +346,11 @@ inline sword OCIDescriptorAlloc(const dvoid*, dvoid** descpp, ub4, size_t, dvoid
     return OCI_SUCCESS;
 }
 inline sword OCIDescriptorFree(dvoid*, ub4) { return OCI_SUCCESS; }
+
+inline sword OCIDateTimeConstruct(void*, OCIError*, OCIDateTime*, sb2, unsigned char, unsigned char,
+                                   unsigned char, unsigned char, unsigned char, ub4, text*, size_t) {
+    return OCI_SUCCESS;
+}
 
 // A descriptor straight out of OCIDescriptorAlloc is not yet a usable LOB --
 // it has no underlying storage until it is either fetched from the database

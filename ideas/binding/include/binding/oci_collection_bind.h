@@ -28,7 +28,11 @@
 // didn't change where or whether it crashes. Root cause not identified --
 // don't use select_with_in_collection()/execute_with_in_collection()
 // with a std::string element type against a real database until this is
-// resolved.
+// resolved. Use select_with_in_list()/execute_with_in_list()
+// (oci_client.h) instead for a std::string element against a real
+// database -- placeholder-expansion, capped at 1000 elements, but never
+// touches Oracle's object/collection API so it isn't exposed to this
+// crash. See docs/in_list_binding.md, mechanism 3.
 //
 // Implementation in details/oci_collection_bind.h.
 

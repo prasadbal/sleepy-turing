@@ -1,7 +1,7 @@
 # Dynamic IN (...) lists
 
-There are two distinct mechanisms here, for two distinct call shapes --
-don't confuse them:
+There are three mechanisms here, for two distinct call shapes -- don't
+confuse them:
 
 1. **A struct field that's itself a container** -- one parameter among
    several in a normal `execute()`/`insert()` bind struct, e.g. `UPDATE
@@ -9,18 +9,26 @@ don't confuse them:
    placeholder-expansion, still subject to Oracle's 1000-element cap.
 2. **A standalone ID collection**, the query's only dynamic input --
    `select_with_in_collection()`/`execute_with_in_collection()`. A single
-   bound Oracle collection object, no element-count cap.
+   bound Oracle collection object, no element-count cap -- but currently
+   broken for a `std::string` element (see mechanism 3 and its own
+   section below).
+3. **The same standalone-ID-collection call shape as #2, but placeholder-
+   expansion instead of a collection bind** -- `select_with_in_list()`/
+   `execute_with_in_list()`. Capped at 1000 elements, same as #1, but
+   works for any bindable leaf type including `std::string`, since it
+   never touches Oracle's object/collection API at all.
 
-An earlier version of this library also had a *standalone placeholder*
-mechanism (`select_with_in_list()`/`execute_with_in_list()`/
-`make_in_placeholders()`/`bind_in_list()`) for the second call shape --
-removed once collection-bind proved to dominate it in every way that
-matters (see git history, commit `binding: remove placeholder-based
-IN-list (dominated by collection bind)`, if you need the old approach as
-a reference). The two limitations that made it worth removing are exactly
-the two the struct-field mechanism (#1 below) still hasn't escaped, which
-is why that one is still called out as an open question at the end of
-this file.
+Mechanism 3 was removed once mechanism 2 proved to dominate it for every
+element type collection-bind actually supported -- see git history,
+commit `binding: remove placeholder-based IN-list (dominated by
+collection bind)` -- then **restored** once mechanism 2 turned out not to
+support `std::string` at all (a real crash, not a design gap: see
+"Known broken" under mechanism 2 below). For a numeric `ElemType`, prefer
+mechanism 2 -- it's live-verified and uncapped. For `std::string`, use
+mechanism 3 until mechanism 2's crash is resolved, or a custom collection
+type (see mechanism 2's own section) is set up and verified instead.
+Mechanism 1's own placeholder-expansion limitation is unrelated to this
+history -- see "Open question" at the end of this file.
 
 ## 1. A struct field can itself be a dynamic multi-value IN-list
 
@@ -165,7 +173,46 @@ documented way to represent a VARCHAR2 collection element) -- both crash
 in the identical place. Root cause not identified. Don't use a
 `std::string` `ElemType` against a real database until this is resolved;
 the mock-only `examples/collection_demo.cpp` still exercises it (that's
-all the mock ever proved for this case, and remains all it proves).
+all the mock ever proved for this case, and remains all it proves). Use
+mechanism 3 (`select_with_in_list()`, below) for a `std::string` element
+against a real database instead.
+
+## 3. A standalone ID collection, via placeholder expansion
+
+`select_with_in_list()`/`execute_with_in_list()` are the placeholder-
+expansion counterpart to mechanism 2, for the same standalone-collection
+call shape: `query_template` carries one `{IN}` marker, replaced with a
+`:1,:2,...,:N` placeholder list sized to the collection (via
+`make_in_placeholders()`) before preparing, then each element is bound
+positionally (`OCIBindByPos`, via `detail::bind_in_list()`):
+
+```cpp
+std::set<std::string> regions = {"EAST", "WEST"};
+std::vector<IdRow> rows;
+select_with_in_list(conn, "SELECT id FROM owners WHERE region IN ({IN})", regions, rows);
+```
+
+Same shape as mechanism 2 in every other respect: takes `std::set<ElemType>`
+directly plus `std::vector`/`std::valarray` convenience overloads that
+dedupe into a set first, same reasons (no repeated binds, deterministic
+generated SQL text). The difference is entirely in the mechanism: ordinary
+scalar `OCIBindByPos` calls, the same machinery `execute()`/`select()`
+already use for a plain field -- never `OCITypeByName`/`OCIObjectNew`/
+`OCICollAppend`, so it's not exposed to mechanism 2's `std::string` crash
+at all. The cost is mechanism 2's original one: capped at 1000 elements
+(`ORA-01795`, enforced by `make_in_placeholders()`), and each distinct
+list size is different SQL text, fragmenting Oracle's shared-pool cursor
+cache as sizes vary between calls.
+
+**Verified against a real Oracle database, specifically for `std::string`**
+-- the case mechanism 2 can't handle at all: `select_with_in_list()` and
+`execute_with_in_list()` both run successfully with a 2-element
+`std::set<std::string>` IN-list, correctly matching ~10,000 rows in a real
+20,000-row table (a region column with ~10,000 matching rows across the
+two values), immediately after the same string field's `SQLT_STR`
+trailing-null bug (see `raw_bind_args` in `details/oci_client.h`) was
+fixed elsewhere in this codebase -- this mechanism shares that same fix,
+since it binds through the identical `raw_bind_args` helper.
 
 ## Open question: should mechanism #1 move to a collection bind too?
 

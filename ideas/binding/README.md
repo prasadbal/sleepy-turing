@@ -33,6 +33,22 @@ that's worth doing, not a committed dependency.
   characters sit inline in the row struct at a fixed stride, which is what
   both `OCIDefineArrayOfStruct` and `OCIBindArrayOfStruct` need. `std::string`
   can satisfy neither, which is why it stays an input-only bind type.
+- `include/binding/oci_datetime.h` -- `OciDate` (a DATE column, `SQLT_ODT`)
+  and `OciTimestamp` (a TIMESTAMP column, `SQLT_TIMESTAMP`). `OciDate` wraps
+  the real 7-byte `::OCIDate` struct directly, with no descriptor or
+  allocation, so (like an arithmetic field or `FixedString<N>`) it needs no
+  special-casing anywhere and works in every path: scalar bind/select,
+  bulk `insert(vector<T>&)`, and `select()`'s batch array fetch -- all
+  live-verified, including 500 rows through the bulk/batch paths.
+  `OciTimestamp` is different: its `OCIDateTime*` is a per-value
+  descriptor (allocated via `OCIDescriptorAlloc`, populated via
+  `OCIDateTimeConstruct`), the same shape as `OciClob`/`OciXml`'s locator
+  -- so it's bind-side only (`execute()`/`insert()`, single-row), not
+  select()-able and not bulk-bindable, exactly like a LOB field. Use
+  `OciDate` for a plain calendar date (e.g. a COB/business date, which
+  has no meaningful time-of-day); reach for `OciTimestamp` only when
+  sub-day precision genuinely matters. Neither models fractional seconds
+  or timezones yet.
 - `include/binding/oci_connection.h` -- `OciConnection`: owns the OCI
   handles and the reconnect policy (see below).
 - `include/binding/oci_client.h` -- `OciClient`: `execute()`, `insert()`,

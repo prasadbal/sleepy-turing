@@ -65,6 +65,35 @@ inline std::string substitute_marker(const std::string& query_template, std::str
     }
 }
 
+inline std::string make_in_placeholders(std::size_t count, ub4 start_position) {
+    if (count == 0) return "NULL";
+
+    constexpr std::size_t oracle_max_in_list_size = 1000;
+    if (count > oracle_max_in_list_size) {
+        throw std::runtime_error(
+            "binding: IN list has " + std::to_string(count) +
+            " elements, but Oracle limits a plain IN (...) list to " +
+            std::to_string(oracle_max_in_list_size) +
+            " (ORA-01795) -- use select_with_in_collection() for larger lists");
+    }
+
+    std::string result;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (i) result += ',';
+        result += ':' + std::to_string(start_position + i);
+    }
+    return result;
+}
+
+// Replaces the "{IN}" marker in `query_template` -- the fixed marker name
+// for select_with_in_list()/execute_with_in_list()'s standalone id
+// collection, as opposed to substitute_container_markers' per-field
+// "{field_name}" markers (a struct has no single field here to name it
+// after).
+inline std::string substitute_in_marker(const std::string& query_template, const std::string& placeholders) {
+    return substitute_marker(query_template, "IN", placeholders);
+}
+
 namespace detail {
 
 // Keeps the first failing status seen while walking a struct's fields, so a
@@ -202,6 +231,39 @@ sword bind_named_container(OCIStmt* stmt, OciConnection& conn, Container& contai
     return status;
 }
 
+// Binds every element of `values` as a positional IN parameter, starting
+// at start_position -- the standalone-collection counterpart to
+// bind_named_container above (which binds a struct field's own container
+// by name instead of a bare id collection by position). `values` is a
+// std::set for the same reason bind_named_container's caller-facing
+// vector/valarray overloads dedupe into one first: a repeated value is
+// never meaningful in an IN-list, and iterating a set gives a
+// deterministic order, so the same logical id set always produces the
+// same generated SQL text (and so hits the same cached cursor) regardless
+// of what order the caller collected the values in.
+template <typename ElemType>
+sword bind_in_list(OCIStmt* stmt, OciConnection& conn, const std::set<ElemType>& values,
+                    ub4 start_position, std::vector<sb2>& indicators) {
+    sword status = OCI_SUCCESS;
+    ub4 position = start_position;
+    for (const ElemType& value : values) {
+        const std::size_t idx = position - start_position;
+        indicators[idx] = OCI_IND_NOTNULL;
+        OCIBind* bind_handle = nullptr;
+        // OCIBindByPos's valuep is non-const even for an IN-only bind (OCI
+        // never writes through it here); const_cast matches the same
+        // read-only-through-a-mutable-pointer pattern raw_bind_args
+        // already uses for std::string_view content.
+        auto [value_ptr, bind_size] = raw_bind_args(const_cast<ElemType&>(value));
+        record_status(status, OCIBindByPos(stmt, &bind_handle, conn.err(), position,
+                    value_ptr, bind_size, oci_type_code_v<ElemType>,
+                    &indicators[idx], nullptr, nullptr, 0, nullptr, OCI_DEFAULT));
+        if (status != OCI_SUCCESS) return status;
+        ++position;
+    }
+    return status;
+}
+
 // Binds a FixedString<N> (or an optional's FixedString staging value): the
 // buffer capacity as the bound size, with the value's own length_ref() as
 // OCI's actual-length pointer. Capacity rather than content length so the
@@ -223,6 +285,7 @@ sword bind_fixed_string(OCIStmt* stmt, OciConnection& conn, FixedStringType& val
 template <std::size_t I, bindable T>
 void bind_one_field(sword& status, OCIStmt* stmt, OciConnection& conn, T& row,
                      std::vector<OCILobLocator**>& active_locators,
+                     std::vector<OCIDateTime**>& active_datetime_locators,
                      std::vector<sb2>& indicators, std::vector<std::vector<sb2>>& container_indicators,
                      staging_tuple_t<T>& staging, std::string_view field_name) {
     if (status != OCI_SUCCESS) return; // an earlier field already failed
@@ -271,6 +334,26 @@ void bind_one_field(sword& status, OCIStmt* stmt, OciConnection& conn, T& row,
                     reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
                     reinterpret_cast<dvoid*>(&field.locator), sizeof(OCILobLocator*),
                     oci_type_code_v<FieldType>, &indicators[I], nullptr, nullptr, 0, nullptr, OCI_DEFAULT));
+    } else if constexpr (is_oci_datetime_v<FieldType>) {
+        // OciTimestamp is bind-side only (like OciClob/OciXml) -- its
+        // OCIDateTime* is an opaque descriptor allocated per value, not a
+        // fixed-size inline value, so define_one_field_array rejects it
+        // from select() output entirely (see that function's static_asserts).
+        record_status(status, OCIDescriptorAlloc(conn.env(), reinterpret_cast<void**>(&field.locator),
+                                                 OCI_DTYPE_TIMESTAMP, 0, nullptr));
+        if (status != OCI_SUCCESS) return;
+        active_datetime_locators.push_back(&field.locator);
+
+        record_status(status, OCIDateTimeConstruct(conn.env(), conn.err(), field.locator,
+                                                   field.year(), field.month(), field.day(),
+                                                   field.hour(), field.minute(), field.second(), 0,
+                                                   nullptr, 0));
+        if (status != OCI_SUCCESS) return;
+
+        record_status(status, OCIBindByName(stmt, &bind_handle, conn.err(),
+                    reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
+                    reinterpret_cast<dvoid*>(&field.locator), sizeof(OCIDateTime*),
+                    oci_type_code_v<FieldType>, &indicators[I], nullptr, nullptr, 0, nullptr, OCI_DEFAULT));
     } else if constexpr (is_fixed_string_v<FieldType>) {
         record_status(status, bind_fixed_string(stmt, conn, field, placeholder, &indicators[I]));
     } else if constexpr (is_optional_v<FieldType>) {
@@ -303,12 +386,13 @@ void bind_one_field(sword& status, OCIStmt* stmt, OciConnection& conn, T& row,
 template <bindable T, std::size_t... Is>
 sword bind_fields_impl(OCIStmt* stmt, OciConnection& conn, T& row,
                        std::vector<OCILobLocator**>& active_locators,
+                       std::vector<OCIDateTime**>& active_datetime_locators,
                        std::vector<sb2>& indicators, std::vector<std::vector<sb2>>& container_indicators,
                        staging_tuple_t<T>& staging, std::index_sequence<Is...>) {
     constexpr auto names = boost::pfr::names_as_array<T>();
     sword status = OCI_SUCCESS;
-    (bind_one_field<Is>(status, stmt, conn, row, active_locators, indicators, container_indicators,
-                        staging, names[Is]), ...);
+    (bind_one_field<Is>(status, stmt, conn, row, active_locators, active_datetime_locators, indicators,
+                        container_indicators, staging, names[Is]), ...);
     return status;
 }
 
@@ -328,9 +412,11 @@ sword bind_fields_impl(OCIStmt* stmt, OciConnection& conn, T& row,
 template <bindable T>
 sword bind_fields(OCIStmt* stmt, OciConnection& conn, T& row,
                   std::vector<OCILobLocator**>& active_locators,
+                  std::vector<OCIDateTime**>& active_datetime_locators,
                   std::vector<sb2>& indicators, std::vector<std::vector<sb2>>& container_indicators,
                   staging_tuple_t<T>& staging) {
-    return bind_fields_impl(stmt, conn, row, active_locators, indicators, container_indicators, staging,
+    return bind_fields_impl(stmt, conn, row, active_locators, active_datetime_locators, indicators,
+                      container_indicators, staging,
                       std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
 }
 
@@ -354,6 +440,11 @@ void bind_one_field_array(sword& status, OCIStmt* stmt, OciConnection& conn, std
                   "LOB fields are not supported in bulk insert(vector<T>&) yet -- array-binding "
                   "a LOB column needs a per-row array of LOB locators, not implemented here; "
                   "insert(conn, query_text, T&) in a loop for a LOB-bearing row type instead.");
+    static_assert(!is_oci_datetime_v<FieldType>,
+                  "OciTimestamp fields are not supported in bulk insert(vector<T>&) -- like a LOB, "
+                  "its OCIDateTime* is a per-value descriptor, not a fixed-size inline value; use "
+                  "OciDate for a COB/business date (that one IS bulk-bindable), or "
+                  "insert(conn, query_text, T&) in a loop for an OciTimestamp-bearing row type.");
     // FixedString<N> is exempt from the string restriction below: unlike
     // std::string, its characters live inline in T at a fixed offset, which
     // is exactly what a fixed-stride array bind needs. Its per-row length
@@ -492,6 +583,33 @@ private:
     std::vector<OCILobLocator**>& locators_;
 };
 
+// OciTimestamp's counterpart to free_locators -- a plain OCIDateTime
+// descriptor, not a temporary LOB, so this skips OCILobFreeTemporary
+// entirely (calling it on a non-LOB descriptor would be invalid) and just
+// frees the descriptor itself.
+inline void free_datetime_locators(std::vector<OCIDateTime**>& active_locators) {
+    for (auto* loc : active_locators) {
+        if (*loc) {
+            OCIDescriptorFree(reinterpret_cast<void*>(*loc), OCI_DTYPE_TIMESTAMP);
+            *loc = nullptr;
+        }
+    }
+    active_locators.clear();
+}
+
+// OciTimestamp's counterpart to LocatorGuard -- see free_datetime_locators.
+class DateTimeLocatorGuard {
+public:
+    explicit DateTimeLocatorGuard(std::vector<OCIDateTime**>& locators) : locators_(locators) {}
+    ~DateTimeLocatorGuard() { free_datetime_locators(locators_); }
+
+    DateTimeLocatorGuard(const DateTimeLocatorGuard&) = delete;
+    DateTimeLocatorGuard& operator=(const DateTimeLocatorGuard&) = delete;
+
+private:
+    std::vector<OCIDateTime**>& locators_;
+};
+
 // ---- define (select(): SELECT columns -> struct, as an array-of-struct
 // fetch -- see docs/in_list_binding.md's sibling discussion for why this
 // batches by rows rather than fetching one row per OCIStmtFetch2 call) ----
@@ -547,6 +665,13 @@ void define_one_field_array(sword& status, OCIStmt* stmt, OciConnection& conn, s
 
     static_assert(!is_oci_lob_v<FieldType>,
                   "LOB columns are not supported in select() result rows yet");
+    static_assert(!is_oci_datetime_v<FieldType> &&
+                  !(is_optional_v<FieldType> && is_oci_datetime_v<optional_value_t<FieldType>>),
+                  "OciTimestamp columns are not supported in select() result rows -- its "
+                  "OCIDateTime* is a per-value descriptor, not a fixed-size inline value the "
+                  "array fetch can define directly into. Declare a DATE/COB-date-shaped column "
+                  "as OciDate instead (that one IS select()-able); OciTimestamp is bind-side only "
+                  "for now (see execute()/insert()).");
     static_assert(fetches_as_fixed_string ||
                   (!std::is_convertible_v<FieldType, std::string_view> &&
                    !(is_optional_v<FieldType> && std::is_convertible_v<optional_value_t<FieldType>, std::string_view>)),
@@ -837,11 +962,13 @@ OciOutcome OciClient::run_execute_once(OciConnection& conn, const std::string& q
 
     std::vector<OCILobLocator**> active_locators;
     detail::LocatorGuard locator_guard(conn, active_locators);
+    std::vector<OCIDateTime**> active_datetime_locators;
+    detail::DateTimeLocatorGuard datetime_guard(active_datetime_locators);
     std::vector<sb2> indicators(boost::pfr::tuple_size_v<T>, OCI_IND_NOTNULL);
     std::vector<std::vector<sb2>> container_indicators(boost::pfr::tuple_size_v<T>);
     detail::staging_tuple_t<T> staging{};
-    const sword bind_status =
-        detail::bind_fields(stmt.get(), conn, bind_struct, active_locators, indicators, container_indicators, staging);
+    const sword bind_status = detail::bind_fields(stmt.get(), conn, bind_struct, active_locators,
+                                                  active_datetime_locators, indicators, container_indicators, staging);
     if (bind_status != OCI_SUCCESS) {
         return {false, bind_status};
     }
@@ -912,16 +1039,88 @@ OciOutcome OciClient::run_select_once(OciConnection& conn, const std::string& qu
 
     std::vector<OCILobLocator**> input_locators;
     detail::LocatorGuard locator_guard(conn, input_locators);
+    std::vector<OCIDateTime**> input_datetime_locators;
+    detail::DateTimeLocatorGuard datetime_guard(input_datetime_locators);
     std::vector<sb2> input_indicators(boost::pfr::tuple_size_v<InputT>, OCI_IND_NOTNULL);
     std::vector<std::vector<sb2>> input_container_indicators(boost::pfr::tuple_size_v<InputT>);
     detail::staging_tuple_t<InputT> input_staging{};
-    const sword bind_status = detail::bind_fields(stmt.get(), conn, input, input_locators,
+    const sword bind_status = detail::bind_fields(stmt.get(), conn, input, input_locators, input_datetime_locators,
                                                   input_indicators, input_container_indicators, input_staging);
     if (bind_status != OCI_SUCCESS) {
         return {false, bind_status};
     }
 
     return detail::run_select_fetch_loop(conn, stmt.get(), results);
+}
+
+template <typename ElemType, bindable RowT>
+bool select_with_in_list(OciConnection& conn, const std::string& query_template,
+                          const std::set<ElemType>& ids, std::vector<RowT>& results) {
+    return conn.run_with_reconnect([&]() -> OciOutcome {
+        results.clear();
+        const std::string sql = substitute_in_marker(query_template, make_in_placeholders(ids.size(), 1));
+
+        detail::StmtHandle stmt;
+        const sword prepare_status = detail::prepare_statement(conn, stmt, sql);
+        if (prepare_status != OCI_SUCCESS) {
+            return {false, prepare_status};
+        }
+
+        std::vector<sb2> in_indicators(ids.size(), OCI_IND_NOTNULL);
+        const sword bind_status = detail::bind_in_list(stmt.get(), conn, ids, 1, in_indicators);
+        if (bind_status != OCI_SUCCESS) {
+            return {false, bind_status};
+        }
+
+        return detail::run_select_fetch_loop(conn, stmt.get(), results);
+    });
+}
+
+template <typename ElemType, bindable RowT>
+bool select_with_in_list(OciConnection& conn, const std::string& query_template,
+                          const std::vector<ElemType>& ids, std::vector<RowT>& results) {
+    return select_with_in_list(conn, query_template, std::set<ElemType>(ids.begin(), ids.end()), results);
+}
+
+template <typename ElemType, bindable RowT>
+bool select_with_in_list(OciConnection& conn, const std::string& query_template,
+                          const std::valarray<ElemType>& ids, std::vector<RowT>& results) {
+    return select_with_in_list(conn, query_template, std::set<ElemType>(std::begin(ids), std::end(ids)), results);
+}
+
+template <typename ElemType>
+bool execute_with_in_list(OciConnection& conn, const std::string& query_template,
+                           const std::set<ElemType>& ids) {
+    return conn.run_with_reconnect([&]() -> OciOutcome {
+        const std::string sql = substitute_in_marker(query_template, make_in_placeholders(ids.size(), 1));
+
+        detail::StmtHandle stmt;
+        const sword prepare_status = detail::prepare_statement(conn, stmt, sql);
+        if (prepare_status != OCI_SUCCESS) {
+            return {false, prepare_status};
+        }
+
+        std::vector<sb2> indicators(ids.size(), OCI_IND_NOTNULL);
+        const sword bind_status = detail::bind_in_list(stmt.get(), conn, ids, 1, indicators);
+        if (bind_status != OCI_SUCCESS) {
+            return {false, bind_status};
+        }
+
+        const sword status = OCIStmtExecute(conn.svc(), stmt.get(), conn.err(), 1, 0, nullptr, nullptr, OCI_DEFAULT);
+        return {status == OCI_SUCCESS, status};
+    });
+}
+
+template <typename ElemType>
+bool execute_with_in_list(OciConnection& conn, const std::string& query_template,
+                           const std::vector<ElemType>& ids) {
+    return execute_with_in_list(conn, query_template, std::set<ElemType>(ids.begin(), ids.end()));
+}
+
+template <typename ElemType>
+bool execute_with_in_list(OciConnection& conn, const std::string& query_template,
+                           const std::valarray<ElemType>& ids) {
+    return execute_with_in_list(conn, query_template, std::set<ElemType>(std::begin(ids), std::end(ids)));
 }
 
 } // namespace binding

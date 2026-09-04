@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "binding/oci_connection.h"
+#include "binding/oci_datetime.h"
 #include "binding/oci_fixed_string.h"
 #include "binding/oci_lob.h"
 #include "binding/reflect.h"
@@ -31,7 +32,8 @@ struct OciTypeBinder {
     static_assert(sizeof(T) == 0,
                   "binding: no OCI external type code is defined for this field type. "
                   "Supported: the integer types, float/double, std::string (bind side only), "
-                  "FixedString<N> (binding/oci_fixed_string.h) for a CHAR/VARCHAR2 column, and "
+                  "FixedString<N> (binding/oci_fixed_string.h) for a CHAR/VARCHAR2 column, "
+                  "OciDate for a DATE column, OciTimestamp for a TIMESTAMP column, and "
                   "OciClob/OciXml. Note bool has no Oracle SQL counterpart -- use a numeric "
                   "flag or a FixedString<1>. Specialize OciTypeBinder for anything else.");
     static constexpr ub2 type_code = 0; // never reached; keeps the assert above the only error
@@ -57,6 +59,16 @@ template <> struct OciTypeBinder<double>      { static constexpr ub2 type_code =
 template <> struct OciTypeBinder<std::string> { static constexpr ub2 type_code = SQLT_STR;     };
 template <> struct OciTypeBinder<OciClob>     { static constexpr ub2 type_code = SQLT_CLOB;    };
 template <> struct OciTypeBinder<OciXml>      { static constexpr ub2 type_code = SQLT_CLOB;    };
+
+// SQLT_ODT binds/defines directly through the real ::OCIDate struct
+// OciDate wraps -- no descriptor, no allocation, fixed 7-byte value (see
+// oci_datetime.h). SQLT_TIMESTAMP binds/defines OciTimestamp's own
+// OCIDateTime* locator, the same shape as OciClob/OciXml's locator field
+// above, for the same reason (an opaque descriptor, not a fixed-size
+// value) -- handled in bind_one_field's is_oci_datetime_v branch, not
+// eligible for the array bind/fetch paths.
+template <> struct OciTypeBinder<OciDate>      { static constexpr ub2 type_code = SQLT_ODT;       };
+template <> struct OciTypeBinder<OciTimestamp> { static constexpr ub2 type_code = SQLT_TIMESTAMP; };
 
 // FixedString<N> binds and defines as SQLT_CHR: an explicit-length VARCHAR2
 // with no null terminator required, which is what lets it work as a select()
@@ -105,7 +117,13 @@ struct bindable_predicate {
         if constexpr (is_multi_bind_container_v<U>) {
             return is_bindable_leaf_v<multi_bind_value_t<U>>;
         } else {
-            return is_bindable_leaf_v<U> || is_oci_lob_v<U>;
+            // OciDate is a plain fixed-size value (see oci_datetime.h), so
+            // it's nullable the same way an arithmetic field is. OciTimestamp
+            // is locator-based like OciClob/OciXml, which aren't nullable
+            // yet either (see "What's deliberately not here" in README.md)
+            // -- not extending that scope here.
+            return is_bindable_leaf_v<U> || is_oci_lob_v<U> || is_oci_date_v<U> || is_oci_datetime_v<U> ||
+                   (is_optional_v<U> && is_oci_date_v<optional_value_t<U>>);
         }
     }
 };
@@ -135,6 +153,66 @@ concept bindable = struct_field_auditor<T, bindable_predicate>::value;
 // Oracle collection object instead -- fixed SQL text regardless of size,
 // no cap. See docs/in_list_binding.md for the tradeoffs between the two.
 std::string make_named_placeholders(std::string_view field_name, std::size_t count);
+
+// Numbered-placeholder counterpart to make_named_placeholders, for a
+// standalone IN-list marker rather than a struct field's own name -- see
+// select_with_in_list()/execute_with_in_list() below. Same ORA-01795
+// 1000-element cap, same "count == 0 produces NULL" rule, for the same
+// reasons.
+std::string make_in_placeholders(std::size_t count, ub4 start_position = 1);
+
+// Standalone dynamic IN (...) list via placeholder expansion -- the
+// fallback for an ElemType oci_collection_bind.h's collection-object bind
+// can't handle. Concretely, today, that's std::string:
+// select_with_in_collection()'s SYS.ODCIVARCHAR2LIST path segfaults inside
+// OCICollAppend (see the KNOWN BROKEN banner at the top of
+// oci_collection_bind.h) -- this mechanism never touches Oracle's
+// object/collection API at all, just ordinary scalar OCIBindByPos, so it
+// isn't exposed to that crash. The tradeoff collection-bind exists to
+// avoid still applies here in full: capped at 1000 elements (ORA-01795,
+// via make_in_placeholders), and each distinct list size is different SQL
+// text, fragmenting Oracle's shared-pool cursor cache as sizes vary
+// between calls. Prefer select_with_in_collection() for a numeric
+// ElemType, where that mechanism is live-verified and uncapped; reach for
+// this for std::string until/unless the collection-bind crash is
+// resolved (or a custom collection type -- see docs/in_list_binding.md --
+// is set up and verified instead), or for any ElemType when the schema
+// can't have a collection type added to it at all.
+//
+// `query_template` must contain exactly one "{IN}" marker, e.g. "SELECT
+// trade_id, notional FROM trades WHERE ref_code IN ({IN})", replaced with
+// a placeholder list sized to ids.size() before preparing. `ids` is a
+// std::set (std::vector/std::valarray overloads dedupe/order into a set
+// first) for the same two reasons make_in_placeholders' sibling mechanism
+// wants one: a repeated value is never meaningful in an IN-list, and a
+// deterministic element order keeps two calls over the same logical ID
+// set generating identical SQL text (and so hitting the same cached
+// cursor) regardless of what order the caller collected them in.
+template <typename ElemType, bindable RowT>
+bool select_with_in_list(OciConnection& conn, const std::string& query_template,
+                          const std::set<ElemType>& ids, std::vector<RowT>& results);
+
+template <typename ElemType, bindable RowT>
+bool select_with_in_list(OciConnection& conn, const std::string& query_template,
+                          const std::vector<ElemType>& ids, std::vector<RowT>& results);
+
+template <typename ElemType, bindable RowT>
+bool select_with_in_list(OciConnection& conn, const std::string& query_template,
+                          const std::valarray<ElemType>& ids, std::vector<RowT>& results);
+
+// DML counterpart (e.g. "DELETE FROM trades WHERE ref_code IN ({IN})") --
+// see select_with_in_list() above.
+template <typename ElemType>
+bool execute_with_in_list(OciConnection& conn, const std::string& query_template,
+                           const std::set<ElemType>& ids);
+
+template <typename ElemType>
+bool execute_with_in_list(OciConnection& conn, const std::string& query_template,
+                           const std::vector<ElemType>& ids);
+
+template <typename ElemType>
+bool execute_with_in_list(OciConnection& conn, const std::string& query_template,
+                           const std::valarray<ElemType>& ids);
 
 // ----------------------------------------------------------------------------
 // Core database execution client.
