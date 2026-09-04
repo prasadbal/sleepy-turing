@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -6,12 +7,16 @@
 
 // ============================================================================
 // A parser-independent tree of (name, value) fields -- the intermediate form
-// config parsing (XML today, via from_ptree() below; TOML/INI could produce
-// the same shape) is converted into, before it ever meets a user struct or
-// boost::pfr. Keeping this decoupled from boost::property_tree means the
-// struct-binding side (not written yet) never needs to know a ptree exists,
-// matching this project's existing rule that toml++ stays out of public
-// headers (see core/config).
+// config parsing is converted into, before it ever meets a user struct or
+// boost::pfr. Two bridges produce this same shape today: from_ptree()
+// (ptree_bridge.h, for XML, where every leaf is text -- XML has no type
+// system beyond that) and from_toml() (toml_bridge.h, for TOML, which IS
+// natively typed at the parser level: an integer, float, or bool is stored
+// as that C++ type, not as text someone happens to write digits into).
+// Keeping this decoupled from boost::property_tree/toml++ means the
+// struct-binding side never needs to know either parser exists, matching
+// this project's existing rule that toml++ stays out of public headers
+// (see core/config).
 // ============================================================================
 
 namespace binding {
@@ -36,23 +41,36 @@ inline std::string_view trim(std::string_view s) noexcept {
 struct Field;
 using FieldList = std::vector<Field>;
 
-// A leaf is a plain (name, string value) pair. A struct is a name plus its
-// own ordered FieldList. There's no separate "this is an array" case: a
+// A leaf's actual value: either still raw text (the only thing a format
+// like XML/ptree ever has -- a leaf is just whatever characters sat
+// between the tags) or already one of TOML's native scalar types. This
+// exists so from_toml() never has to force a typed value through a
+// stringify-then-reparse round trip just to fit a string-only
+// representation -- that would be wasted work at best, and lossy at
+// worst: formatting a double and parsing it back is not guaranteed to
+// reproduce the exact same bit pattern. config_bind.h's parse_leaf_value()
+// takes whichever alternative is actually here: a fast direct conversion
+// for an already-typed value, the existing text parsing (from_chars, the
+// true/false/Y/N/1/0 rules for bool) for a string one.
+using LeafValue = std::variant<std::string, std::int64_t, double, bool>;
+
+// A leaf is a (name, LeafValue) pair. A struct is a name plus its own
+// ordered FieldList. There's no separate "this is an array" case: a
 // repeated element (the vector<T> case, e.g. multiple <replica> children
-// under the same parent) isn't a distinct Field variant -- it's just several
-// Field entries in the same enclosing FieldList that happen to share a name,
-// which is also how ptree itself represents repetition (a duplicated key,
-// not an array type). A struct-binder maps that to vector<T> by grouping
-// same-named consecutive entries; a plain leaf lookup just takes the first
-// (or only) match.
+// under the same parent, or a TOML array of tables) isn't a distinct
+// Field variant -- it's just several Field entries in the same enclosing
+// FieldList that happen to share a name, which is also how ptree itself
+// represents repetition (a duplicated key, not an array type). A
+// struct-binder maps that to vector<T> by grouping same-named entries; a
+// plain leaf lookup just takes the first (or only) match.
 struct Field {
     std::string name;
-    std::variant<std::string, FieldList> value;
+    std::variant<LeafValue, FieldList> value;
 
-    bool is_leaf() const noexcept { return std::holds_alternative<std::string>(value); }
+    bool is_leaf() const noexcept { return std::holds_alternative<LeafValue>(value); }
     bool is_struct() const noexcept { return std::holds_alternative<FieldList>(value); }
 
-    const std::string& as_leaf() const { return std::get<std::string>(value); }
+    const LeafValue& as_leaf() const { return std::get<LeafValue>(value); }
     const FieldList& as_struct() const { return std::get<FieldList>(value); }
 };
 

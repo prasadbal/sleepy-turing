@@ -123,17 +123,19 @@ private:
     const FieldList& fields_;
 };
 
-// Parses one leaf's raw string into a bindable leaf value. std::string
-// fields just take the raw text; bool takes true/false, Y/N, or 1/0
-// (case-insensitive) rather than going through from_chars, which has no
-// bool overload at all -- std::is_arithmetic_v<bool> is true, so without
-// this branch a bool field would pass is_bindable_leaf_v's compile-time
-// check and then fail to compile at the from_chars call below, naming
-// neither the field nor why; arithmetic fields go through from_chars and
-// reject anything that doesn't fully consume the text (a leading-number
-// match like "10abc" -> 10 would silently hide a typo in a config file).
+// Parses one raw text value into a bindable leaf value -- the text-source
+// path (XML/ptree; also used for a TOML string value, which arrives as
+// text same as always). std::string fields just take the raw text; bool
+// takes true/false, Y/N, or 1/0 (case-insensitive) rather than going
+// through from_chars, which has no bool overload at all --
+// std::is_arithmetic_v<bool> is true, so without this branch a bool field
+// would pass is_bindable_leaf_v's compile-time check and then fail to
+// compile at the from_chars call below, naming neither the field nor why;
+// arithmetic fields go through from_chars and reject anything that
+// doesn't fully consume the text (a leading-number match like "10abc" ->
+// 10 would silently hide a typo in a config file).
 template <typename T>
-void parse_leaf_value(const std::string& raw, T& out, std::string_view field_name) {
+void parse_leaf_text(const std::string& raw, T& out, std::string_view field_name) {
     if constexpr (std::is_same_v<T, std::string>) {
         out = raw;
     } else if constexpr (std::is_same_v<T, bool>) {
@@ -161,8 +163,48 @@ void parse_leaf_value(const std::string& raw, T& out, std::string_view field_nam
                                       "' value '" + raw + "' is not a valid number");
         }
     } else {
-        static_assert(is_bindable_leaf_v<T>, "parse_leaf_value: unsupported leaf type");
+        static_assert(is_bindable_leaf_v<T>, "parse_leaf_text: unsupported leaf type");
     }
+}
+
+// Converts an already-typed TOML scalar (int64_t/double/bool) directly
+// into a bindable leaf value -- no text round trip. V is whichever
+// LeafValue alternative was actually stored (see config_field.h);
+// converting it to a string field is the one direction that still
+// produces text, for a caller whose struct field happens to be
+// std::string even though the source value was typed.
+template <typename T, typename V>
+void assign_typed_leaf(const V& v, T& out, std::string_view field_name) {
+    if constexpr (std::is_same_v<T, std::string>) {
+        if constexpr (std::is_same_v<V, bool>) {
+            out = v ? "true" : "false";
+        } else {
+            out = std::to_string(v);
+        }
+    } else if constexpr (std::is_same_v<T, bool> || std::is_arithmetic_v<T>) {
+        out = static_cast<T>(v);
+    } else {
+        static_assert(is_bindable_leaf_v<T>, "assign_typed_leaf: unsupported leaf type");
+    }
+    (void)field_name; // only used in the thrown-error paths of the text branch above
+}
+
+// Parses one leaf's value into a bindable leaf value T -- dispatches on
+// which LeafValue alternative is actually present: raw text goes through
+// parse_leaf_text (from_chars, the bool text rules); an already-typed
+// TOML scalar goes through assign_typed_leaf (a direct conversion, no
+// text round trip at all -- see LeafValue's own comment in config_field.h
+// for why that matters).
+template <typename T>
+void parse_leaf_value(const LeafValue& raw, T& out, std::string_view field_name) {
+    std::visit([&](const auto& v) {
+        using V = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<V, std::string>) {
+            parse_leaf_text(v, out, field_name);
+        } else {
+            assign_typed_leaf(v, out, field_name);
+        }
+    }, raw);
 }
 
 template <std::size_t I, typename IndexT, config_schema T>
