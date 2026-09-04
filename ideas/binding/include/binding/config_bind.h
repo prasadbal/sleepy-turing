@@ -51,6 +51,13 @@ namespace detail {
 template <config_schema T>
 void bind_from_fields_impl(const FieldList& fields, T& out, bool strict);
 
+// The mutable-source overload -- see its own definition, further down,
+// for why this is safe (never reached on anything actually const) and
+// what it buys (a leaf value moves instead of copies, all the way down
+// through bind_one_field/parse_leaf_value).
+template <config_schema T>
+void bind_from_fields_impl(FieldList& fields, T& out, bool strict);
+
 // Case-insensitive name -> Field* index over one FieldList level, built once
 // per bind_from_fields() call rather than re-scanning `fields` linearly for
 // every field of T. Binding a T with M fields against an N-entry FieldList
@@ -59,36 +66,54 @@ void bind_from_fields_impl(const FieldList& fields, T& out, bool strict);
 // for O(N+M) overall. Keeps a vector per name, not a single Field*, because
 // a repeated element (see config_field.h) means several entries can
 // legitimately share a name.
-class FieldIndex {
+// FieldPtr is `const Field*` for a read-only source -- the common case,
+// used whenever `fields` might reasonably be read again later by some
+// other call (bind_from_fields' const-lvalue overload; see its own
+// comment for why that has to stay non-destructive) -- or `Field*` for a
+// source this index is allowed to move values out of. That's only ever
+// safe over a genuinely non-const FieldList, which is exactly what
+// bind_from_fields' rvalue overload guarantees: templating on the
+// pointer type, rather than always storing const Field*, is what makes
+// that guarantee checked by the type system instead of asserted by a
+// const_cast somewhere.
+template <typename FieldPtr>
+class FieldIndexT {
 public:
-    explicit FieldIndex(const FieldList& fields) {
+    using SourceRef = std::conditional_t<std::is_const_v<std::remove_pointer_t<FieldPtr>>,
+                                          const FieldList&, FieldList&>;
+
+    explicit FieldIndexT(SourceRef fields) {
         by_name_.reserve(fields.size());
-        for (const auto& f : fields) {
+        for (auto& f : fields) {
             by_name_[to_lower(f.name)].push_back(&f);
         }
     }
 
     // The first entry with this name, or nullptr. For a non-repeated field
     // there's at most one; for a repeated element, use all() instead.
-    const Field* first(std::string_view name) const {
+    FieldPtr first(std::string_view name) const {
         auto it = by_name_.find(to_lower(name));
         return (it == by_name_.end() || it->second.empty()) ? nullptr : it->second.front();
     }
 
     // Every entry with this name, in FieldList order (empty if none). By
     // value rather than by pointer into by_name_, so this has the same
-    // signature as LinearFieldScanner::all() below -- bind_one_field/
-    // bind_all_fields are templated on whichever of the two strategies
-    // bind_from_fields<T> picks, and need one common interface to call
+    // signature as LinearFieldScannerT::all() below -- bind_one_field/
+    // bind_all_fields are templated on whichever of the (now four, two
+    // strategies times two constness modes) concrete types
+    // bind_from_fields_impl picks, and need one common interface to call
     // through regardless of which it is.
-    std::vector<const Field*> all(std::string_view name) const {
+    std::vector<FieldPtr> all(std::string_view name) const {
         auto it = by_name_.find(to_lower(name));
-        return it == by_name_.end() ? std::vector<const Field*>{} : it->second;
+        return it == by_name_.end() ? std::vector<FieldPtr>{} : it->second;
     }
 
 private:
-    std::unordered_map<std::string, std::vector<const Field*>> by_name_;
+    std::unordered_map<std::string, std::vector<FieldPtr>> by_name_;
 };
+
+using FieldIndex = FieldIndexT<const Field*>;
+using MutableFieldIndex = FieldIndexT<Field*>;
 
 // Threshold matching examples/lookup_benchmark.cpp's measured crossover:
 // below roughly this many fields, building FieldIndex's hash map costs
@@ -108,28 +133,35 @@ inline constexpr std::size_t kLinearScanFieldThreshold = 16;
 // <replica>'s host/port/priority): O(1) to construct, and each lookup is
 // only a handful of string comparisons, cheaper overall than FieldIndex's
 // hash map for a T with few fields (see kLinearScanFieldThreshold above).
-class LinearFieldScanner {
+template <typename FieldPtr>
+class LinearFieldScannerT {
 public:
-    explicit LinearFieldScanner(const FieldList& fields) : fields_(fields) {}
+    using SourceRef = std::conditional_t<std::is_const_v<std::remove_pointer_t<FieldPtr>>,
+                                          const FieldList&, FieldList&>;
 
-    const Field* first(std::string_view name) const {
-        for (const Field& f : fields_) {
+    explicit LinearFieldScannerT(SourceRef fields) : fields_(fields) {}
+
+    FieldPtr first(std::string_view name) const {
+        for (auto& f : fields_) {
             if (to_lower(f.name) == to_lower(name)) return &f;
         }
         return nullptr;
     }
 
-    std::vector<const Field*> all(std::string_view name) const {
-        std::vector<const Field*> matches;
-        for (const Field& f : fields_) {
+    std::vector<FieldPtr> all(std::string_view name) const {
+        std::vector<FieldPtr> matches;
+        for (auto& f : fields_) {
             if (to_lower(f.name) == to_lower(name)) matches.push_back(&f);
         }
         return matches;
     }
 
 private:
-    const FieldList& fields_;
+    SourceRef fields_;
 };
+
+using LinearFieldScanner = LinearFieldScannerT<const Field*>;
+using MutableLinearFieldScanner = LinearFieldScannerT<Field*>;
 
 // Parses one raw text value into a bindable leaf value -- the text-source
 // path (XML/ptree; also used for a TOML string value, which arrives as
@@ -142,10 +174,20 @@ private:
 // arithmetic fields go through from_chars and reject anything that
 // doesn't fully consume the text (a leading-number match like "10abc" ->
 // 10 would silently hide a typo in a config file).
-template <typename T>
-void parse_leaf_text(const std::string& raw, T& out, std::string_view field_name) {
+// RawRef is a forwarding reference, not a fixed const std::string& --
+// when the caller (ultimately bind_from_fields' rvalue overload, via
+// parse_leaf_value below) actually owns a movable std::string, `out =
+// std::forward<RawRef>(raw)` moves instead of copies. Only the
+// std::string branch below does that: it's the only branch that
+// consumes `raw` exactly once, so it's the only one a move is safe (and
+// meaningful) in -- the bool/arithmetic branches read `raw` normally
+// (trim/from_chars/the error message), which works identically
+// regardless of RawRef's deduced value category, since none of those
+// reads move anything themselves.
+template <typename RawRef, typename T>
+void parse_leaf_text(RawRef&& raw, T& out, std::string_view field_name) {
     if constexpr (std::is_same_v<T, std::string>) {
-        out = raw;
+        out = std::forward<RawRef>(raw);
     } else if constexpr (std::is_same_v<T, bool>) {
         const std::string lower = to_lower(trim(raw));
         if (lower == "true" || lower == "y" || lower == "1") {
@@ -203,16 +245,24 @@ void assign_typed_leaf(const V& v, T& out, std::string_view field_name) {
 // TOML scalar goes through assign_typed_leaf (a direct conversion, no
 // text round trip at all -- see LeafValue's own comment in config_field.h
 // for why that matters).
-template <typename T>
-void parse_leaf_value(const LeafValue& raw, T& out, std::string_view field_name) {
-    std::visit([&](const auto& v) {
+//
+// LeafRef is a forwarding reference: std::visit propagates its argument's
+// value category to the visitor (the active alternative comes out as an
+// rvalue reference when `raw` itself is one), so when this is ultimately
+// reached from bind_from_fields' rvalue overload, the std::string
+// alternative arrives at parse_leaf_text as a genuine rvalue and gets
+// moved, not copied -- int64_t/double/bool are cheap to copy regardless,
+// so assign_typed_leaf doesn't need (or take) the same treatment.
+template <typename LeafRef, typename T>
+void parse_leaf_value(LeafRef&& raw, T& out, std::string_view field_name) {
+    std::visit([&](auto&& v) {
         using V = std::decay_t<decltype(v)>;
         if constexpr (std::is_same_v<V, std::string>) {
-            parse_leaf_text(v, out, field_name);
+            parse_leaf_text(std::forward<decltype(v)>(v), out, field_name);
         } else {
             assign_typed_leaf(v, out, field_name);
         }
-    }, raw);
+    }, std::forward<LeafRef>(raw));
 }
 
 template <std::size_t I, typename IndexT, config_schema T>
@@ -220,9 +270,16 @@ void bind_one_field(const IndexT& index, T& out, std::string_view name, bool str
     using FieldType = boost::pfr::tuple_element_t<I, T>;
     auto& field = boost::pfr::get<I>(out);
 
+    // `auto*`, not `const Field*` -- IndexT may be one of the Mutable*
+    // strategies (see FieldIndexT/LinearFieldScannerT's comment), whose
+    // first()/all() return plain Field*. Forcing that into a const Field*
+    // here would compile fine (Field* converts implicitly) but silently
+    // throw away the mutability that's the entire point of this being
+    // reachable from bind_from_fields' rvalue overload -- f->as_leaf()
+    // would then always pick the const overload regardless.
     if constexpr (is_optional_v<FieldType>) {
         using ValueType = optional_value_t<FieldType>;
-        const Field* f = index.first(name);
+        auto* f = index.first(name);
         if (!f) {
             field = std::nullopt;
             return;
@@ -231,13 +288,19 @@ void bind_one_field(const IndexT& index, T& out, std::string_view name, bool str
             throw std::runtime_error("binding: field '" + std::string(name) + "' expected a plain value");
         }
         ValueType value{};
-        parse_leaf_value(f->as_leaf(), value, name);
+        // std::move is safe here regardless of f's constness: moving from
+        // a const Field* degrades to an ordinary copy (a std::string's
+        // move-assignment can't bind to a const rvalue, so overload
+        // resolution falls back to its copy-assignment instead -- see
+        // parse_leaf_text/parse_leaf_value's own comments), and only
+        // actually moves when f is a genuine, non-const Field*.
+        parse_leaf_value(std::move(f->as_leaf()), value, name);
         field = std::move(value);
 
     } else if constexpr (is_vector_v<FieldType>) {
         using ElemType = vector_value_t<FieldType>;
         field.clear();
-        for (const Field* f : index.all(name)) {
+        for (auto* f : index.all(name)) {
             if constexpr (is_bindable_leaf_v<ElemType>) {
                 // A repeated leaf element, e.g. several <port>8080</port>
                 // siblings -> std::vector<int>. Every match must actually
@@ -248,7 +311,7 @@ void bind_one_field(const IndexT& index, T& out, std::string_view name, bool str
                     throw std::runtime_error("binding: field '" + std::string(name) + "' expected a plain value");
                 }
                 ElemType elem{};
-                parse_leaf_value(f->as_leaf(), elem, name);
+                parse_leaf_value(std::move(f->as_leaf()), elem, name);
                 field.push_back(std::move(elem));
             } else {
                 if (!f->is_struct()) {
@@ -261,17 +324,17 @@ void bind_one_field(const IndexT& index, T& out, std::string_view name, bool str
         }
 
     } else if constexpr (is_bindable_leaf_v<FieldType>) {
-        const Field* f = index.first(name);
+        auto* f = index.first(name);
         if (!f) {
             throw std::runtime_error("binding: missing required field '" + std::string(name) + "'");
         }
         if (!f->is_leaf()) {
             throw std::runtime_error("binding: field '" + std::string(name) + "' expected a plain value");
         }
-        parse_leaf_value(f->as_leaf(), field, name);
+        parse_leaf_value(std::move(f->as_leaf()), field, name);
 
     } else { // nested config_schema struct
-        const Field* f = index.first(name);
+        auto* f = index.first(name);
         if (!f) {
             throw std::runtime_error("binding: missing required field '" + std::string(name) + "'");
         }
@@ -326,6 +389,26 @@ void bind_from_fields_impl(const FieldList& fields, T& out, bool strict) {
     // construct -- into one.
     using Scanner = std::conditional_t<(boost::pfr::tuple_size_v<T> < kLinearScanFieldThreshold),
                                         LinearFieldScanner, FieldIndex>;
+    Scanner scanner(fields);
+    bind_all_fields(scanner, out, std::make_index_sequence<boost::pfr::tuple_size_v<T>>{}, strict);
+}
+
+// Same as the const-lvalue overload above, but over a genuinely mutable
+// `fields` -- only ever reached from bind_from_fields' rvalue overload
+// (a temporary FieldList the caller has no further use for), so this
+// picks the Mutable* scanner variant, letting leaf values move out
+// instead of copy all the way down through bind_one_field/
+// parse_leaf_value. Never called on anything actually const: overload
+// resolution alone decides which of these two bind_from_fields_impl
+// overloads a given call reaches, based on whether the caller's `fields`
+// argument is an lvalue or rvalue.
+template <config_schema T>
+void bind_from_fields_impl(FieldList& fields, T& out, bool strict) {
+    if (strict) {
+        check_no_unknown_fields<T>(fields);
+    }
+    using Scanner = std::conditional_t<(boost::pfr::tuple_size_v<T> < kLinearScanFieldThreshold),
+                                        MutableLinearFieldScanner, MutableFieldIndex>;
     Scanner scanner(fields);
     bind_all_fields(scanner, out, std::make_index_sequence<boost::pfr::tuple_size_v<T>>{}, strict);
 }
@@ -401,6 +484,23 @@ void bind_from_fields(const FieldList& fields, T& out, bool strict = false) {
     detail::bind_from_fields_impl(fields, out, strict);
 }
 
+// Same binding, over a `fields` the caller is handing off rather than
+// keeping -- a temporary built inline (e.g. from_toml(tbl), or a
+// path-resolved sub-FieldList that's about to be discarded either way),
+// not something read again afterward. Every std::string leaf value is
+// moved into its target field instead of copied, all the way down
+// through bind_one_field/parse_leaf_value -- for a config with many
+// string fields, that's real, free savings for exactly the call shape
+// this overload exists for. Ordinary overload resolution routes a call
+// here automatically for an rvalue `fields` argument; a named FieldList
+// variable still goes through the const-lvalue overload above and is
+// left completely untouched, so nothing changes for existing callers
+// that keep and reuse their FieldList.
+template <config_schema T>
+void bind_from_fields(FieldList&& fields, T& out, bool strict = false) {
+    detail::bind_from_fields_impl(fields, out, strict);
+}
+
 // Same as bind_from_fields, but requires flat_schema<T> instead of the more
 // permissive config_schema<T>. Use this at call sites where a struct is
 // meant to stay strictly flat -- a plain DB row/record shape being the
@@ -411,6 +511,13 @@ void bind_from_fields(const FieldList& fields, T& out, bool strict = false) {
 template <flat_schema T>
 void bind_flat_fields(const FieldList& fields, T& out, bool strict = false) {
     bind_from_fields(fields, out, strict);
+}
+
+// The rvalue counterpart to bind_flat_fields above, same relationship
+// the two bind_from_fields overloads have to each other.
+template <flat_schema T>
+void bind_flat_fields(FieldList&& fields, T& out, bool strict = false) {
+    bind_from_fields(std::move(fields), out, strict);
 }
 
 // Reads a single scalar value at a dot-separated path (e.g. "pool.size",

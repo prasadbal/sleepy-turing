@@ -72,6 +72,15 @@ struct Field {
 
     const LeafValue& as_leaf() const { return std::get<LeafValue>(value); }
     const FieldList& as_struct() const { return std::get<FieldList>(value); }
+
+    // Non-const overloads -- exist only so a Field reached through a
+    // genuinely non-const FieldList (see config_bind.h's FieldIndexT/
+    // LinearFieldScannerT, templated on Field*/const Field* so this is
+    // never called on something actually const) can have its leaf value
+    // moved out during binding instead of copied, without ever needing a
+    // const_cast anywhere in that path.
+    LeafValue& as_leaf() { return std::get<LeafValue>(value); }
+    FieldList& as_struct() { return std::get<FieldList>(value); }
 };
 
 } // namespace binding
