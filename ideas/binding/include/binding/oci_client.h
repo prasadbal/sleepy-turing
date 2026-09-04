@@ -1,4 +1,5 @@
 #pragma once
+#include <memory>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -196,17 +197,17 @@ std::string make_in_placeholders(std::size_t count, ub4 start_position = 1);
 // deterministic element order keeps two calls over the same logical ID
 // set generating identical SQL text (and so hitting the same cached
 // cursor) regardless of what order the caller collected them in.
-template <typename ElemType, bindable RowT>
+template <typename ElemType, bindable RowT, typename Alloc = std::allocator<RowT>>
 bool select_with_in_list(OciConnection& conn, const std::string& query_template,
-                          const std::set<ElemType>& ids, std::vector<RowT>& results);
+                          const std::set<ElemType>& ids, std::vector<RowT, Alloc>& results);
 
-template <typename ElemType, bindable RowT>
+template <typename ElemType, bindable RowT, typename Alloc = std::allocator<RowT>>
 bool select_with_in_list(OciConnection& conn, const std::string& query_template,
-                          const std::vector<ElemType>& ids, std::vector<RowT>& results);
+                          const std::vector<ElemType>& ids, std::vector<RowT, Alloc>& results);
 
-template <typename ElemType, bindable RowT>
+template <typename ElemType, bindable RowT, typename Alloc = std::allocator<RowT>>
 bool select_with_in_list(OciConnection& conn, const std::string& query_template,
-                          const std::valarray<ElemType>& ids, std::vector<RowT>& results);
+                          const std::valarray<ElemType>& ids, std::vector<RowT, Alloc>& results);
 
 // DML counterpart (e.g. "DELETE FROM trades WHERE ref_code IN ({IN})") --
 // see select_with_in_list() above.
@@ -303,8 +304,13 @@ public:
     // run_with_reconnect the same way every other method here is:
     // reconnect-and-redo-the-whole-call only on a disconnect-class error.
     // Transaction/commit boundaries remain the caller's responsibility.
-    template <bindable T>
-    bool insert(OciConnection& conn, const std::string& query_text, std::vector<T>& rows);
+    // Alloc defaults to std::allocator<T> but isn't fixed to it: std::vector<T>
+    // as a template parameter pattern only deduces against the *default*
+    // allocator, so a caller passing std::vector<T, CustomAllocator<T>>&
+    // (a pool/arena allocator, say, for a latency-sensitive row buffer)
+    // would otherwise fail to match this overload at all.
+    template <bindable T, typename Alloc = std::allocator<T>>
+    bool insert(OciConnection& conn, const std::string& query_text, std::vector<T, Alloc>& rows);
 
     // Runs a SELECT with no bind parameters and returns its rows -- the
     // "vector<S> as a result set" case, for a query that's fully literal in
@@ -326,8 +332,11 @@ public:
     //
     // On a disconnect mid-fetch, results are cleared and the whole SELECT is
     // re-run from scratch on reconnect (there's no cursor to resume from).
-    template <bindable OutputT>
-    bool select(OciConnection& conn, const std::string& query_text, std::vector<OutputT>& results);
+    // Alloc defaults to std::allocator<OutputT> but, as with insert()'s
+    // rows above, isn't fixed to it -- a caller-supplied results vector
+    // with a custom allocator is deduced and threaded straight through.
+    template <bindable OutputT, typename Alloc = std::allocator<OutputT>>
+    bool select(OciConnection& conn, const std::string& query_text, std::vector<OutputT, Alloc>& results);
 
     // Runs a SELECT that also binds parameters from `input`'s fields --
     // e.g. "SELECT trade_id, notional FROM trades WHERE status = :status",
@@ -337,8 +346,9 @@ public:
     // `input`). `results`' column-order/type rules are exactly the
     // no-input overload above -- `input` only ever supplies parameters,
     // never result columns.
-    template <bindable InputT, bindable OutputT>
-    bool select(OciConnection& conn, const std::string& query_text, InputT& input, std::vector<OutputT>& results);
+    template <bindable InputT, bindable OutputT, typename Alloc = std::allocator<OutputT>>
+    bool select(OciConnection& conn, const std::string& query_text,
+                InputT& input, std::vector<OutputT, Alloc>& results);
 
 private:
     OciOutcome run_execute_once(OciConnection& conn, const std::string& query_text);
@@ -346,15 +356,15 @@ private:
     template <bindable T>
     OciOutcome run_execute_once(OciConnection& conn, const std::string& query_text, T& bind_struct);
 
-    template <bindable T>
-    OciOutcome run_insert_array_once(OciConnection& conn, const std::string& query_text, std::vector<T>& rows);
+    template <bindable T, typename Alloc>
+    OciOutcome run_insert_array_once(OciConnection& conn, const std::string& query_text, std::vector<T, Alloc>& rows);
 
-    template <bindable OutputT>
-    OciOutcome run_select_once(OciConnection& conn, const std::string& query_text, std::vector<OutputT>& results);
+    template <bindable OutputT, typename Alloc>
+    OciOutcome run_select_once(OciConnection& conn, const std::string& query_text, std::vector<OutputT, Alloc>& results);
 
-    template <bindable InputT, bindable OutputT>
+    template <bindable InputT, bindable OutputT, typename Alloc>
     OciOutcome run_select_once(OciConnection& conn, const std::string& query_text,
-                                InputT& input, std::vector<OutputT>& results);
+                                InputT& input, std::vector<OutputT, Alloc>& results);
 };
 
 } // namespace binding

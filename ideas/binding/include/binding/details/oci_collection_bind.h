@@ -130,9 +130,9 @@ private:
 
 } // namespace detail
 
-template <typename ElemType, bindable RowT>
+template <typename ElemType, bindable RowT, typename Alloc>
 bool select_with_in_collection(OciConnection& conn, const std::string& query_text,
-                                const std::set<ElemType>& ids, std::vector<RowT>& results) {
+                                const std::set<ElemType>& ids, std::vector<RowT, Alloc>& results) {
     return conn.run_with_reconnect([&]() -> OciOutcome {
         results.clear();
 
@@ -164,15 +164,15 @@ bool select_with_in_collection(OciConnection& conn, const std::string& query_tex
     });
 }
 
-template <typename ElemType, bindable RowT>
+template <typename ElemType, bindable RowT, typename Alloc>
 bool select_with_in_collection(OciConnection& conn, const std::string& query_text,
-                                const std::vector<ElemType>& ids, std::vector<RowT>& results) {
+                                const std::vector<ElemType>& ids, std::vector<RowT, Alloc>& results) {
     return select_with_in_collection(conn, query_text, std::set<ElemType>(ids.begin(), ids.end()), results);
 }
 
-template <typename ElemType, bindable RowT>
+template <typename ElemType, bindable RowT, typename Alloc>
 bool select_with_in_collection(OciConnection& conn, const std::string& query_text,
-                                const std::valarray<ElemType>& ids, std::vector<RowT>& results) {
+                                const std::valarray<ElemType>& ids, std::vector<RowT, Alloc>& results) {
     return select_with_in_collection(conn, query_text, std::set<ElemType>(std::begin(ids), std::end(ids)), results);
 }
 

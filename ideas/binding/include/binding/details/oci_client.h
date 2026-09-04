@@ -432,8 +432,8 @@ sword bind_fields(OCIStmt* stmt, OciConnection& conn, T& row,
 //
 // See the doc comment on OciClient::insert(vector<T>&) in oci_client.h
 // for exactly which field kinds this does and doesn't support and why.
-template <std::size_t I, bindable T>
-void bind_one_field_array(sword& status, OCIStmt* stmt, OciConnection& conn, std::vector<T>& rows,
+template <std::size_t I, bindable T, typename Alloc>
+void bind_one_field_array(sword& status, OCIStmt* stmt, OciConnection& conn, std::vector<T, Alloc>& rows,
                            std::vector<std::vector<sb2>>& field_indicators, std::string_view field_name) {
     using FieldType = boost::pfr::tuple_element_t<I, T>;
     static_assert(!is_oci_lob_v<FieldType>,
@@ -497,8 +497,8 @@ void bind_one_field_array(sword& status, OCIStmt* stmt, OciConnection& conn, std
     }
 }
 
-template <bindable T, std::size_t... Is>
-sword bind_fields_array_impl(OCIStmt* stmt, OciConnection& conn, std::vector<T>& rows,
+template <bindable T, typename Alloc, std::size_t... Is>
+sword bind_fields_array_impl(OCIStmt* stmt, OciConnection& conn, std::vector<T, Alloc>& rows,
                              std::vector<std::vector<sb2>>& field_indicators, std::index_sequence<Is...>) {
     constexpr auto names = boost::pfr::names_as_array<T>();
     sword status = OCI_SUCCESS;
@@ -506,8 +506,8 @@ sword bind_fields_array_impl(OCIStmt* stmt, OciConnection& conn, std::vector<T>&
     return status;
 }
 
-template <bindable T>
-sword bind_fields_array(OCIStmt* stmt, OciConnection& conn, std::vector<T>& rows,
+template <bindable T, typename Alloc>
+sword bind_fields_array(OCIStmt* stmt, OciConnection& conn, std::vector<T, Alloc>& rows,
                         std::vector<std::vector<sb2>>& field_indicators) {
     return bind_fields_array_impl(stmt, conn, rows, field_indicators,
                             std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
@@ -833,8 +833,12 @@ std::string substitute_container_markers(const std::string& query_text, const T&
 // `stmt` -- that (and, for the with-input overload, its own input
 // locators) stays the caller's responsibility, since what needs freeing
 // alongside it differs between the two overloads.
-template <bindable OutputT>
-OciOutcome run_select_fetch_loop(OciConnection& conn, OCIStmt* stmt, std::vector<OutputT>& results) {
+// `results` may have any allocator (see OciClient::select()'s doc comment);
+// `batch` below is this function's own internal scratch buffer, never
+// exposed to the caller, so it deliberately stays plain std::vector<OutputT>
+// regardless of what allocator `results` uses.
+template <bindable OutputT, typename Alloc>
+OciOutcome run_select_fetch_loop(OciConnection& conn, OCIStmt* stmt, std::vector<OutputT, Alloc>& results) {
     ub4 prefetch_rows = static_cast<ub4>(kSelectBatchRows);
     sword status = OCIAttrSet(stmt, OCI_HTYPE_STMT, &prefetch_rows, 0, OCI_ATTR_PREFETCH_ROWS, conn.err());
     if (status != OCI_SUCCESS) {
@@ -912,24 +916,24 @@ bool OciClient::insert(OciConnection& conn, const std::string& query_text, T& ro
     return execute(conn, query_text, row);
 }
 
-template <bindable T>
-bool OciClient::insert(OciConnection& conn, const std::string& query_text, std::vector<T>& rows) {
+template <bindable T, typename Alloc>
+bool OciClient::insert(OciConnection& conn, const std::string& query_text, std::vector<T, Alloc>& rows) {
     if (rows.empty()) return true; // nothing to bind rows[0]'s address through
     return conn.run_with_reconnect([&]() -> OciOutcome {
         return run_insert_array_once(conn, query_text, rows);
     });
 }
 
-template <bindable OutputT>
-bool OciClient::select(OciConnection& conn, const std::string& query_text, std::vector<OutputT>& results) {
+template <bindable OutputT, typename Alloc>
+bool OciClient::select(OciConnection& conn, const std::string& query_text, std::vector<OutputT, Alloc>& results) {
     return conn.run_with_reconnect([&]() -> OciOutcome {
         return run_select_once(conn, query_text, results);
     });
 }
 
-template <bindable InputT, bindable OutputT>
+template <bindable InputT, bindable OutputT, typename Alloc>
 bool OciClient::select(OciConnection& conn, const std::string& query_text,
-                        InputT& input, std::vector<OutputT>& results) {
+                        InputT& input, std::vector<OutputT, Alloc>& results) {
     return conn.run_with_reconnect([&]() -> OciOutcome {
         return run_select_once(conn, query_text, input, results);
     });
@@ -984,9 +988,9 @@ OciOutcome OciClient::run_execute_once(OciConnection& conn, const std::string& q
     return {false, status};
 }
 
-template <bindable T>
+template <bindable T, typename Alloc>
 OciOutcome OciClient::run_insert_array_once(OciConnection& conn, const std::string& query_text,
-                                             std::vector<T>& rows) {
+                                             std::vector<T, Alloc>& rows) {
     detail::StmtHandle stmt;
     const sword prepare_status = detail::prepare_statement(conn, stmt, query_text);
     if (prepare_status != OCI_SUCCESS) {
@@ -1004,9 +1008,9 @@ OciOutcome OciClient::run_insert_array_once(OciConnection& conn, const std::stri
     return {status == OCI_SUCCESS, status};
 }
 
-template <bindable OutputT>
+template <bindable OutputT, typename Alloc>
 OciOutcome OciClient::run_select_once(OciConnection& conn, const std::string& query_text,
-                                       std::vector<OutputT>& results) {
+                                       std::vector<OutputT, Alloc>& results) {
     results.clear();
 
     detail::StmtHandle stmt;
@@ -1024,9 +1028,9 @@ OciOutcome OciClient::run_select_once(OciConnection& conn, const std::string& qu
 // run_execute_once(conn, query_text, bind_struct). `input`'s own
 // {field_name} container markers (a vector/set/valarray field) are
 // substituted exactly as on the execute() side.
-template <bindable InputT, bindable OutputT>
+template <bindable InputT, bindable OutputT, typename Alloc>
 OciOutcome OciClient::run_select_once(OciConnection& conn, const std::string& query_text,
-                                       InputT& input, std::vector<OutputT>& results) {
+                                       InputT& input, std::vector<OutputT, Alloc>& results) {
     results.clear();
 
     const std::string sql = detail::substitute_container_markers(query_text, input);
@@ -1053,9 +1057,9 @@ OciOutcome OciClient::run_select_once(OciConnection& conn, const std::string& qu
     return detail::run_select_fetch_loop(conn, stmt.get(), results);
 }
 
-template <typename ElemType, bindable RowT>
+template <typename ElemType, bindable RowT, typename Alloc>
 bool select_with_in_list(OciConnection& conn, const std::string& query_template,
-                          const std::set<ElemType>& ids, std::vector<RowT>& results) {
+                          const std::set<ElemType>& ids, std::vector<RowT, Alloc>& results) {
     return conn.run_with_reconnect([&]() -> OciOutcome {
         results.clear();
         const std::string sql = substitute_in_marker(query_template, make_in_placeholders(ids.size(), 1));
@@ -1076,15 +1080,15 @@ bool select_with_in_list(OciConnection& conn, const std::string& query_template,
     });
 }
 
-template <typename ElemType, bindable RowT>
+template <typename ElemType, bindable RowT, typename Alloc>
 bool select_with_in_list(OciConnection& conn, const std::string& query_template,
-                          const std::vector<ElemType>& ids, std::vector<RowT>& results) {
+                          const std::vector<ElemType>& ids, std::vector<RowT, Alloc>& results) {
     return select_with_in_list(conn, query_template, std::set<ElemType>(ids.begin(), ids.end()), results);
 }
 
-template <typename ElemType, bindable RowT>
+template <typename ElemType, bindable RowT, typename Alloc>
 bool select_with_in_list(OciConnection& conn, const std::string& query_template,
-                          const std::valarray<ElemType>& ids, std::vector<RowT>& results) {
+                          const std::valarray<ElemType>& ids, std::vector<RowT, Alloc>& results) {
     return select_with_in_list(conn, query_template, std::set<ElemType>(std::begin(ids), std::end(ids)), results);
 }
 

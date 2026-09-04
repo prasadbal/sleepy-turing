@@ -36,6 +36,7 @@
 //
 // Implementation in details/oci_collection_bind.h.
 
+#include <memory>
 #include <set>
 #include <string>
 #include <string_view>
@@ -76,9 +77,13 @@ template <> struct OciCollectionTypeBinder<std::string> {
 // ORA-01795 cap a generated placeholder list would be, and reuses the
 // same SQL text (and so the same cached cursor) no matter how the
 // collection's size varies between calls.
-template <typename ElemType, bindable RowT>
+// Alloc defaults to std::allocator<RowT> but isn't fixed to it -- see
+// OciClient::select()'s doc comment (oci_client.h) for why a fixed single
+// template parameter here would silently reject a caller's custom-
+// allocator results vector instead of just using it.
+template <typename ElemType, bindable RowT, typename Alloc = std::allocator<RowT>>
 bool select_with_in_collection(OciConnection& conn, const std::string& query_text,
-                                const std::set<ElemType>& ids, std::vector<RowT>& results);
+                                const std::set<ElemType>& ids, std::vector<RowT, Alloc>& results);
 
 // Convenience overloads: dedupe/order `ids` into a std::set first (a
 // repeated value is never meaningful in an IN-list, only a wasted bind;
@@ -89,13 +94,13 @@ bool select_with_in_collection(OciConnection& conn, const std::string& query_tex
 // Oracle collection object either way here, so there's no ORA-01795 cap
 // to speak of regardless of which of the three container types the
 // caller started from.
-template <typename ElemType, bindable RowT>
+template <typename ElemType, bindable RowT, typename Alloc = std::allocator<RowT>>
 bool select_with_in_collection(OciConnection& conn, const std::string& query_text,
-                                const std::vector<ElemType>& ids, std::vector<RowT>& results);
+                                const std::vector<ElemType>& ids, std::vector<RowT, Alloc>& results);
 
-template <typename ElemType, bindable RowT>
+template <typename ElemType, bindable RowT, typename Alloc = std::allocator<RowT>>
 bool select_with_in_collection(OciConnection& conn, const std::string& query_text,
-                                const std::valarray<ElemType>& ids, std::vector<RowT>& results);
+                                const std::valarray<ElemType>& ids, std::vector<RowT, Alloc>& results);
 
 // DML (e.g. "DELETE FROM trades WHERE trade_id IN (SELECT column_value
 // FROM TABLE(:1))") with a dynamic IN (...) list bound as a single Oracle
