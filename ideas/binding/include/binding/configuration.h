@@ -33,20 +33,25 @@ public:
     explicit Configuration(FieldList fields) : fields_(std::move(fields)) {}
 
     // Reads one ad hoc scalar at a dot-separated path (e.g. "pool.size").
-    // See get_leaf's own comment (config_bind.h) for the exact failure
-    // modes -- a missing path, a non-leaf at the terminal segment, or a
-    // value that doesn't parse as T all throw, naming the path.
+    // One method, not a get/try_get pair: T itself says whether `path` is
+    // allowed to be absent, exactly the same rule bind_from_fields already
+    // uses for a struct field (see config_bind.h's is_optional_v branch in
+    // bind_one_field) -- so the config_schema struct case and this ad hoc
+    // case stay consistent rather than needing two different absence
+    // conventions to remember.
+    //   - get<int>("port")                 -> throws if "port" is absent
+    //   - get<std::optional<int>>("port")  -> nullopt if "port" is absent
+    // Either way, a value that IS present but fails to parse as the
+    // underlying leaf type still throws -- that's a real data error, not
+    // absence, so wrapping T in std::optional never papers over malformed
+    // data, only a missing path.
     template <is_bindable_leaf T>
     T get(std::string_view path) const {
-        return get_leaf<T>(fields_, path);
-    }
-
-    // Same, but returns std::nullopt instead of throwing when `path`
-    // itself is absent. A present-but-malformed value still throws --
-    // that's a real data error, not absence.
-    template <is_bindable_leaf T>
-    std::optional<T> try_get(std::string_view path) const {
-        return try_get_leaf<T>(fields_, path);
+        if constexpr (is_optional_v<T>) {
+            return try_get_leaf<optional_value_t<T>>(fields_, path);
+        } else {
+            return get_leaf<T>(fields_, path);
+        }
     }
 
     // Binds the whole document onto a config_schema struct, matching each
@@ -92,5 +97,17 @@ public:
 private:
     FieldList fields_;
 };
+
+// get/try_get are constrained to is_bindable_leaf, bind/bind_into to
+// config_schema -- FieldList (and Field) satisfy neither, so there is no
+// instantiation of any public method here that could hand one back out,
+// and the constructor is the only way one gets in. Asserted directly,
+// not just left as an implied consequence of those constraints, so a
+// future change that widens either concept enough to admit FieldList/
+// Field fails to compile right here instead of silently reopening this.
+static_assert(!is_bindable_leaf_v<FieldList>);
+static_assert(!config_schema<FieldList>);
+static_assert(!is_bindable_leaf_v<Field>);
+static_assert(!config_schema<Field>);
 
 } // namespace binding
