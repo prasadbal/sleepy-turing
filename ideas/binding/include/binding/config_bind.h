@@ -57,6 +57,36 @@ inline bool iequals(std::string_view a, std::string_view b) noexcept {
            });
 }
 
+// A case-insensitive hash for Field lookup keys -- folds each byte through
+// std::tolower() while hashing (FNV-1a) instead of hashing a lowered copy,
+// so no string is ever materialized just to compute a hash, matching
+// iequals()'s own no-allocation approach. is_transparent opts into C++20's
+// heterogeneous unordered_map lookup (P0919), so find()/count() etc. can
+// take a std::string_view lookup key directly -- probing the map never
+// needs to construct a std::string first, on either the stored-key or the
+// lookup-key side.
+struct ICaseHash {
+    using is_transparent = void;
+    std::size_t operator()(std::string_view s) const noexcept {
+        std::size_t h = 14695981039346656037ull; // FNV-1a offset basis
+        for (unsigned char c : s) {
+            h ^= static_cast<unsigned char>(std::tolower(c));
+            h *= 1099511628211ull; // FNV-1a prime
+        }
+        return h;
+    }
+};
+
+// Paired with ICaseHash above: the standard's bucket invariant requires
+// equal keys to hash equal, so equality has to fold case exactly the way
+// ICaseHash does -- which is exactly what iequals() already does.
+struct ICaseEqual {
+    using is_transparent = void;
+    bool operator()(std::string_view a, std::string_view b) const noexcept {
+        return iequals(a, b);
+    }
+};
+
 namespace detail {
 
 // `strict` is a runtime bool, deliberately, threaded through every level
@@ -104,7 +134,12 @@ public:
     explicit FieldIndexT(SourceRef fields) {
         by_name_.reserve(fields.size());
         for (auto& f : fields) {
-            by_name_[to_lower(f.name)].push_back(&f);
+            // f.name itself (whatever casing it happens to have) becomes
+            // the stored key -- ICaseHash/ICaseEqual make that fine
+            // regardless: any other spelling of the same name hashes and
+            // compares equal to it, so they all land in the same bucket
+            // no matter which occurrence's casing ends up stored.
+            by_name_[f.name].push_back(&f);
         }
     }
 
@@ -116,7 +151,7 @@ public:
     // this throws instead. A field that's actually meant to repeat should
     // use all() below, never this.
     FieldPtr single(std::string_view name) const {
-        auto it = by_name_.find(to_lower(name));
+        auto it = by_name_.find(name);
         if (it == by_name_.end() || it->second.empty()) return nullptr;
         if (it->second.size() > 1) {
             throw std::runtime_error("binding: field '" + std::string(name) +
@@ -134,12 +169,12 @@ public:
     // bind_from_fields_impl picks, and need one common interface to call
     // through regardless of which it is.
     std::vector<FieldPtr> all(std::string_view name) const {
-        auto it = by_name_.find(to_lower(name));
+        auto it = by_name_.find(name);
         return it == by_name_.end() ? std::vector<FieldPtr>{} : it->second;
     }
 
 private:
-    std::unordered_map<std::string, std::vector<FieldPtr>> by_name_;
+    std::unordered_map<std::string, std::vector<FieldPtr>, ICaseHash, ICaseEqual> by_name_;
 };
 
 using FieldIndex = FieldIndexT<const Field*>;
