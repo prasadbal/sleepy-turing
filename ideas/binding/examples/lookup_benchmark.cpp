@@ -70,7 +70,7 @@ int main() {
         std::size_t checksum_old = 0;
         for (const auto& name : names) {
             const Field* f = find_field_old(fields, name);
-            checksum_old += f ? f->as_leaf().size() : 0;
+            checksum_old += f ? std::get<std::string>(f->as_leaf()).size() : 0;
         }
         auto t1 = std::chrono::steady_clock::now();
 
@@ -80,7 +80,7 @@ int main() {
         std::size_t checksum_new = 0;
         for (const auto& name : names) {
             const Field* f = index.first(name);
-            checksum_new += f ? f->as_leaf().size() : 0;
+            checksum_new += f ? std::get<std::string>(f->as_leaf()).size() : 0;
         }
         auto t3 = std::chrono::steady_clock::now();
 
