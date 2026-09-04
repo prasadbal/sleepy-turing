@@ -18,7 +18,7 @@
 #include <vector>
 
 #include "binding/config_bind.h"
-#include "binding/field_tree.h"
+#include "binding/config_field.h"
 #include "binding/ptree_bridge.h"
 #include "binding/reflect.h"
 

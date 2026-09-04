@@ -16,7 +16,7 @@
 #include <string>
 #include <vector>
 
-#include "binding/field_tree.h"
+#include "binding/config_field.h"
 #include "binding/config_bind.h" // pulls in the new detail::FieldIndex
 
 using binding::Field;

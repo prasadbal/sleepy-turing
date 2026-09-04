@@ -62,7 +62,7 @@ that's worth doing, not a committed dependency.
   multi-value IN-list alongside an ordinary named field, select() with
   std::optional (a NULL column comes back as `nullopt`), and a NULL landing
   on a field that isn't `std::optional`.
-- `include/binding/field_tree.h` -- `Field`/`FieldList`: a parser-independent
+- `include/binding/config_field.h` -- `Field`/`FieldList`: a parser-independent
   (name, value) tree that config parsing converts into, before it ever meets
   a user struct.
 - `include/binding/ptree_bridge.h` -- `from_ptree()`, the one place
@@ -343,7 +343,7 @@ retry budget reproducing the same throw.
 
 ## Config binding (FieldList -> struct)
 
-`field_tree.h` defines the shape parsed config data takes before it meets a
+`config_field.h` defines the shape parsed config data takes before it meets a
 struct:
 
 ```cpp

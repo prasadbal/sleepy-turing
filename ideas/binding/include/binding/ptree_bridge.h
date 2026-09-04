@@ -1,12 +1,12 @@
 #pragma once
 #include <boost/property_tree/ptree.hpp>
 
-#include "binding/field_tree.h"
+#include "binding/config_field.h"
 
 // ============================================================================
 // The one place boost::property_tree is allowed to be named: converts a
 // parsed ptree (from read_xml, but nothing here is XML-specific) into the
-// parser-independent binding::FieldList (see field_tree.h). Everything past
+// parser-independent binding::FieldList (see config_field.h). Everything past
 // this header deals in Field/FieldList only.
 // ============================================================================
 

@@ -156,7 +156,7 @@ concept flat_schema = struct_field_auditor<T, leaf_only_predicate>::value;
 
 // ----------------------------------------------------------------------------
 // std::vector<U> recognition -- the "repeated element" case for config_schema
-// below (see field_tree.h: a repeated XML element isn't a distinct Field
+// below (see config_field.h: a repeated XML element isn't a distinct Field
 // variant, just several same-named entries, so the struct side needs to know
 // which of its fields are meant to collect all of them).
 // ----------------------------------------------------------------------------
@@ -214,7 +214,14 @@ struct config_field_predicate {
         if constexpr (is_bindable_leaf_v<U>) {
             return true;
         } else if constexpr (is_vector_v<U>) {
-            return is_bindable_struct_v<vector_value_t<U>>;
+            // A repeated element's several same-named entries are either
+            // all leaves (e.g. several <port>8080</port> siblings -> a
+            // plain list of values) or all nested structs (e.g. several
+            // <replica host="..."/> siblings) -- never a mix, since they
+            // share one XML tag and so one shape. Both collect into the
+            // same std::vector<U> field either way; bind_from_fields'
+            // is_vector_v branch dispatches on which at bind time.
+            return is_bindable_leaf_v<vector_value_t<U>> || is_bindable_struct_v<vector_value_t<U>>;
         } else {
             return is_bindable_struct_v<U>;
         }

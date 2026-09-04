@@ -12,11 +12,11 @@
 
 #include <boost/pfr.hpp>
 
-#include "binding/field_tree.h"
+#include "binding/config_field.h"
 #include "binding/reflect.h"
 
 // ============================================================================
-// Binds a parser-independent FieldList (see field_tree.h) onto a
+// Binds a parser-independent FieldList (see config_field.h) onto a
 // config_schema struct (see reflect.h), matching a struct field to a
 // same-named Field case-insensitively via boost::pfr::names_as_array<T>().
 //
@@ -49,7 +49,7 @@ namespace detail {
 // via a linear scan (the original implementation) is O(M*N); building this
 // index costs O(N) once, after which each of T's M lookups is O(1) average,
 // for O(N+M) overall. Keeps a vector per name, not a single Field*, because
-// a repeated element (see field_tree.h) means several entries can
+// a repeated element (see config_field.h) means several entries can
 // legitimately share a name.
 class FieldIndex {
 public:
@@ -127,12 +127,26 @@ void bind_one_field(const FieldIndex& index, T& out, std::string_view name) {
         field.clear();
         if (const auto* matches = index.all(name)) {
             for (const Field* f : *matches) {
-                if (!f->is_struct()) {
-                    throw std::runtime_error("binding: field '" + std::string(name) + "' expected a nested structure");
+                if constexpr (is_bindable_leaf_v<ElemType>) {
+                    // A repeated leaf element, e.g. several <port>8080</port>
+                    // siblings -> std::vector<int>. Every match must actually
+                    // be a leaf, not a struct -- config_field_predicate only
+                    // guarantees the *field*'s element type is leaf-shaped,
+                    // not that the parsed data agrees.
+                    if (!f->is_leaf()) {
+                        throw std::runtime_error("binding: field '" + std::string(name) + "' expected a plain value");
+                    }
+                    ElemType elem{};
+                    parse_leaf_value(f->as_leaf(), elem, name);
+                    field.push_back(std::move(elem));
+                } else {
+                    if (!f->is_struct()) {
+                        throw std::runtime_error("binding: field '" + std::string(name) + "' expected a nested structure");
+                    }
+                    ElemType elem{};
+                    bind_from_fields(f->as_struct(), elem);
+                    field.push_back(std::move(elem));
                 }
-                ElemType elem{};
-                bind_from_fields(f->as_struct(), elem);
-                field.push_back(std::move(elem));
             }
         }
 
