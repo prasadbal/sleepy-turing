@@ -67,24 +67,86 @@ public:
         return (it == by_name_.end() || it->second.empty()) ? nullptr : it->second.front();
     }
 
-    // Every entry with this name, in FieldList order, or nullptr if none.
-    const std::vector<const Field*>* all(std::string_view name) const {
+    // Every entry with this name, in FieldList order (empty if none). By
+    // value rather than by pointer into by_name_, so this has the same
+    // signature as LinearFieldScanner::all() below -- bind_one_field/
+    // bind_all_fields are templated on whichever of the two strategies
+    // bind_from_fields<T> picks, and need one common interface to call
+    // through regardless of which it is.
+    std::vector<const Field*> all(std::string_view name) const {
         auto it = by_name_.find(to_lower(name));
-        return it == by_name_.end() ? nullptr : &it->second;
+        return it == by_name_.end() ? std::vector<const Field*>{} : it->second;
     }
 
 private:
     std::unordered_map<std::string, std::vector<const Field*>> by_name_;
 };
 
+// Threshold matching examples/lookup_benchmark.cpp's measured crossover:
+// below roughly this many fields, building FieldIndex's hash map costs
+// more than a linear scan saves (real fixed overhead -- allocating
+// buckets, hashing every string -- that a handful of string comparisons
+// doesn't pay). This is a compile-time constant, so bind_from_fields<T>'s
+// choice below is fixed once per T at compile time, not decided per call:
+// one instantiation of bind_from_fields<ElemType> serves every element of
+// a vector<ElemType> the same way, whether it's called once (a nested
+// struct) or a thousand times (a thousand repeated <replica> elements),
+// always through the same strategy for that ElemType.
+inline constexpr std::size_t kLinearScanFieldThreshold = 16;
+
+// Scans `fields` linearly for each lookup instead of building an index
+// upfront -- the right tool for a small FieldList (the common case for
+// one repeated element's own handful of sub-fields, e.g. a single
+// <replica>'s host/port/priority): O(1) to construct, and each lookup is
+// only a handful of string comparisons, cheaper overall than FieldIndex's
+// hash map for a T with few fields (see kLinearScanFieldThreshold above).
+class LinearFieldScanner {
+public:
+    explicit LinearFieldScanner(const FieldList& fields) : fields_(fields) {}
+
+    const Field* first(std::string_view name) const {
+        for (const Field& f : fields_) {
+            if (to_lower(f.name) == to_lower(name)) return &f;
+        }
+        return nullptr;
+    }
+
+    std::vector<const Field*> all(std::string_view name) const {
+        std::vector<const Field*> matches;
+        for (const Field& f : fields_) {
+            if (to_lower(f.name) == to_lower(name)) matches.push_back(&f);
+        }
+        return matches;
+    }
+
+private:
+    const FieldList& fields_;
+};
+
 // Parses one leaf's raw string into a bindable leaf value. std::string
-// fields just take the raw text; arithmetic fields go through from_chars
-// and reject anything that doesn't fully consume the text (a leading-number
+// fields just take the raw text; bool takes true/false, Y/N, or 1/0
+// (case-insensitive) rather than going through from_chars, which has no
+// bool overload at all -- std::is_arithmetic_v<bool> is true, so without
+// this branch a bool field would pass is_bindable_leaf_v's compile-time
+// check and then fail to compile at the from_chars call below, naming
+// neither the field nor why; arithmetic fields go through from_chars and
+// reject anything that doesn't fully consume the text (a leading-number
 // match like "10abc" -> 10 would silently hide a typo in a config file).
 template <typename T>
 void parse_leaf_value(const std::string& raw, T& out, std::string_view field_name) {
     if constexpr (std::is_same_v<T, std::string>) {
         out = raw;
+    } else if constexpr (std::is_same_v<T, bool>) {
+        const std::string lower = to_lower(trim(raw));
+        if (lower == "true" || lower == "y" || lower == "1") {
+            out = true;
+        } else if (lower == "false" || lower == "n" || lower == "0") {
+            out = false;
+        } else {
+            throw std::runtime_error("binding: field '" + std::string(field_name) +
+                                      "' value '" + raw + "' is not a valid bool "
+                                      "(expected true/false, Y/N, or 1/0)");
+        }
     } else if constexpr (std::is_arithmetic_v<T>) {
         // Trimmed first: from_chars rejects leading whitespace outright, so a
         // value that arrived with any surrounding formatting would otherwise
@@ -103,8 +165,8 @@ void parse_leaf_value(const std::string& raw, T& out, std::string_view field_nam
     }
 }
 
-template <std::size_t I, config_schema T>
-void bind_one_field(const FieldIndex& index, T& out, std::string_view name) {
+template <std::size_t I, typename IndexT, config_schema T>
+void bind_one_field(const IndexT& index, T& out, std::string_view name) {
     using FieldType = boost::pfr::tuple_element_t<I, T>;
     auto& field = boost::pfr::get<I>(out);
 
@@ -125,28 +187,26 @@ void bind_one_field(const FieldIndex& index, T& out, std::string_view name) {
     } else if constexpr (is_vector_v<FieldType>) {
         using ElemType = vector_value_t<FieldType>;
         field.clear();
-        if (const auto* matches = index.all(name)) {
-            for (const Field* f : *matches) {
-                if constexpr (is_bindable_leaf_v<ElemType>) {
-                    // A repeated leaf element, e.g. several <port>8080</port>
-                    // siblings -> std::vector<int>. Every match must actually
-                    // be a leaf, not a struct -- config_field_predicate only
-                    // guarantees the *field*'s element type is leaf-shaped,
-                    // not that the parsed data agrees.
-                    if (!f->is_leaf()) {
-                        throw std::runtime_error("binding: field '" + std::string(name) + "' expected a plain value");
-                    }
-                    ElemType elem{};
-                    parse_leaf_value(f->as_leaf(), elem, name);
-                    field.push_back(std::move(elem));
-                } else {
-                    if (!f->is_struct()) {
-                        throw std::runtime_error("binding: field '" + std::string(name) + "' expected a nested structure");
-                    }
-                    ElemType elem{};
-                    bind_from_fields(f->as_struct(), elem);
-                    field.push_back(std::move(elem));
+        for (const Field* f : index.all(name)) {
+            if constexpr (is_bindable_leaf_v<ElemType>) {
+                // A repeated leaf element, e.g. several <port>8080</port>
+                // siblings -> std::vector<int>. Every match must actually
+                // be a leaf, not a struct -- config_field_predicate only
+                // guarantees the *field*'s element type is leaf-shaped,
+                // not that the parsed data agrees.
+                if (!f->is_leaf()) {
+                    throw std::runtime_error("binding: field '" + std::string(name) + "' expected a plain value");
                 }
+                ElemType elem{};
+                parse_leaf_value(f->as_leaf(), elem, name);
+                field.push_back(std::move(elem));
+            } else {
+                if (!f->is_struct()) {
+                    throw std::runtime_error("binding: field '" + std::string(name) + "' expected a nested structure");
+                }
+                ElemType elem{};
+                bind_from_fields(f->as_struct(), elem);
+                field.push_back(std::move(elem));
             }
         }
 
@@ -172,8 +232,8 @@ void bind_one_field(const FieldIndex& index, T& out, std::string_view name) {
     }
 }
 
-template <config_schema T, std::size_t... Is>
-void bind_all_fields(const FieldIndex& index, T& out, std::index_sequence<Is...>) {
+template <typename IndexT, config_schema T, std::size_t... Is>
+void bind_all_fields(const IndexT& index, T& out, std::index_sequence<Is...>) {
     constexpr auto names = boost::pfr::names_as_array<T>();
     (bind_one_field<Is>(index, out, names[Is]), ...);
 }
@@ -185,13 +245,24 @@ void bind_all_fields(const FieldIndex& index, T& out, std::index_sequence<Is...>
 // Throws std::runtime_error, naming the offending field, on a missing
 // required field or a value that doesn't parse as its field's type.
 //
-// Builds one detail::FieldIndex over `fields` (O(N) for N entries) and looks
-// up each of T's M fields in it (O(1) average each), for O(N+M) total,
-// rather than linearly re-scanning `fields` for every field of T (O(M*N)).
+// Picks its lookup strategy once per T, at compile time: below
+// kLinearScanFieldThreshold fields, detail::LinearFieldScanner (O(1) to
+// construct, O(M*N) total for T's M fields against an N-entry FieldList,
+// which wins outright for small M/N -- see that constant's comment); at
+// or above it, detail::FieldIndex (O(N) to build once, then O(1) average
+// per lookup, O(N+M) total). Either way this is the same choice for every
+// call of bind_from_fields<T>, including once per element of a
+// vector<T> -- the type's own field count decides it, not how many times
+// or where it's invoked.
 template <config_schema T>
 void bind_from_fields(const FieldList& fields, T& out) {
-    detail::FieldIndex index(fields);
-    detail::bind_all_fields(index, out, std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
+    if constexpr (boost::pfr::tuple_size_v<T> < detail::kLinearScanFieldThreshold) {
+        detail::LinearFieldScanner scanner(fields);
+        detail::bind_all_fields(scanner, out, std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
+    } else {
+        detail::FieldIndex index(fields);
+        detail::bind_all_fields(index, out, std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
+    }
 }
 
 // Same as bind_from_fields, but requires flat_schema<T> instead of the more
