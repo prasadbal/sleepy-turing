@@ -238,6 +238,43 @@ void bind_all_fields(const IndexT& index, T& out, std::index_sequence<Is...>) {
     (bind_one_field<Is>(index, out, names[Is]), ...);
 }
 
+// Splits "a.b.c" into ("a", "b.c"); splits "a" (no dot) into ("a", "").
+inline std::pair<std::string_view, std::string_view> split_first_path_segment(std::string_view path) {
+    const auto dot = path.find('.');
+    if (dot == std::string_view::npos) return {path, {}};
+    return {path.substr(0, dot), path.substr(dot + 1)};
+}
+
+// Finds the Field named `name` in `fields` -- a plain linear scan, since a
+// one-off path lookup (get_leaf/try_get_leaf below) doesn't warrant
+// building any index over `fields` just to find a single entry.
+inline const Field* find_field(const FieldList& fields, std::string_view name) {
+    for (const Field& f : fields) {
+        if (to_lower(f.name) == to_lower(name)) return &f;
+    }
+    return nullptr;
+}
+
+// Walks `path`'s dot-separated segments through nested structs, returning
+// the terminal Field* -- or nullptr if any segment is missing, or an
+// intermediate (non-terminal) segment isn't itself a nested struct to
+// descend into. Doesn't distinguish which of those two happened, or which
+// segment failed; get_leaf/try_get_leaf don't need that distinction, and
+// resolve_leaf_path stays a single, simple pass either way.
+inline const Field* resolve_leaf_path(const FieldList& fields, std::string_view path) {
+    const FieldList* current = &fields;
+    std::string_view remaining = path;
+    for (;;) {
+        auto [segment, rest] = split_first_path_segment(remaining);
+        const Field* found = find_field(*current, segment);
+        if (!found) return nullptr;
+        if (rest.empty()) return found;
+        if (!found->is_struct()) return nullptr;
+        current = &found->as_struct();
+        remaining = rest;
+    }
+}
+
 } // namespace detail
 
 // Binds `fields` onto `out` field-by-field, matching each field's own
@@ -275,6 +312,52 @@ void bind_from_fields(const FieldList& fields, T& out) {
 template <flat_schema T>
 void bind_flat_fields(const FieldList& fields, T& out) {
     bind_from_fields(fields, out);
+}
+
+// Reads a single scalar value at a dot-separated path (e.g. "pool.size",
+// or just "port" for a top-level field), parsed as T -- the escape hatch
+// for reading one ad hoc setting where defining a whole config_schema
+// struct and calling bind_from_fields() just to read one field would be
+// overkill. Each path segment matches case-insensitively, same as
+// bind_from_fields(). A plain linear scan per segment, not a FieldIndex --
+// a one-off lookup has nothing to amortize an index's construction cost
+// against.
+//
+// Throws std::runtime_error, naming the path, if any segment is missing,
+// a non-terminal segment isn't a nested struct, the terminal isn't a leaf
+// value, or its text doesn't parse as T -- the same failure modes
+// bind_from_fields() has for a required (non-optional) field, for the
+// same reason: a missing or malformed ad hoc value is a real config
+// problem to fail loudly on, not something to paper over with a default.
+template <is_bindable_leaf T>
+T get_leaf(const FieldList& fields, std::string_view path) {
+    const Field* f = detail::resolve_leaf_path(fields, path);
+    if (!f) {
+        throw std::runtime_error("binding: missing field (from path '" + std::string(path) + "')");
+    }
+    if (!f->is_leaf()) {
+        throw std::runtime_error("binding: field '" + std::string(path) + "' expected a plain value");
+    }
+    T value{};
+    detail::parse_leaf_value(f->as_leaf(), value, path);
+    return value;
+}
+
+// Same as get_leaf, but returns std::nullopt instead of throwing when
+// `path` itself doesn't resolve to an existing leaf -- for a setting
+// that's genuinely allowed to be absent, read ad hoc (the std::optional<T>
+// struct-field equivalent of get_leaf, for callers not binding a whole
+// struct). A value that IS present but fails to parse as T still throws:
+// that's a real data error, not absence, exactly as a std::optional<T>
+// field in bind_from_fields() only tolerates the field being missing, not
+// being present with garbage in it.
+template <is_bindable_leaf T>
+std::optional<T> try_get_leaf(const FieldList& fields, std::string_view path) {
+    const Field* f = detail::resolve_leaf_path(fields, path);
+    if (!f || !f->is_leaf()) return std::nullopt;
+    T value{};
+    detail::parse_leaf_value(f->as_leaf(), value, path);
+    return value;
 }
 
 } // namespace binding
