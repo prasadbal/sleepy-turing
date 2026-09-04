@@ -38,6 +38,25 @@ inline std::string to_lower(std::string_view s) {
     return out;
 }
 
+// Case-insensitive comparison with no allocation on either side -- unlike
+// to_lower(a) == to_lower(b), which builds two temporary lowercased
+// strings just to throw them away, this compares characters directly.
+// FieldIndexT below still uses to_lower() (an unordered_map key has to be
+// a real, materialized string, so lowering once per Field at construction
+// is unavoidable there), but every plain scan-and-compare lookup --
+// LinearFieldScannerT, find_field, check_no_unknown_fields -- uses this
+// instead: those were re-lowering the same Field::name on every single
+// comparison it took part in, which for LinearFieldScannerT in particular
+// meant relowering the same N names once per struct field being bound
+// (M times over), for O(M*N) wasted allocations layered on top of the
+// O(M*N) comparisons the scan already costs.
+inline bool iequals(std::string_view a, std::string_view b) noexcept {
+    return a.size() == b.size() &&
+           std::equal(a.begin(), a.end(), b.begin(), [](unsigned char x, unsigned char y) {
+               return std::tolower(x) == std::tolower(y);
+           });
+}
+
 namespace detail {
 
 // `strict` is a runtime bool, deliberately, threaded through every level
@@ -158,7 +177,7 @@ public:
     FieldPtr single(std::string_view name) const {
         FieldPtr found = nullptr;
         for (auto& f : fields_) {
-            if (to_lower(f.name) == to_lower(name)) {
+            if (iequals(f.name, name)) {
                 if (found) {
                     throw std::runtime_error("binding: field '" + std::string(name) +
                                               "' appears more than once, expected at most one");
@@ -172,7 +191,7 @@ public:
     std::vector<FieldPtr> all(std::string_view name) const {
         std::vector<FieldPtr> matches;
         for (auto& f : fields_) {
-            if (to_lower(f.name) == to_lower(name)) matches.push_back(&f);
+            if (iequals(f.name, name)) matches.push_back(&f);
         }
         return matches;
     }
@@ -419,7 +438,7 @@ void check_no_unknown_fields(const FieldList& fields) {
     for (const Field& f : fields) {
         bool known = false;
         for (const auto& name : names) {
-            if (to_lower(f.name) == to_lower(name)) {
+            if (iequals(f.name, name)) {
                 known = true;
                 break;
             }
@@ -479,7 +498,7 @@ inline std::pair<std::string_view, std::string_view> split_first_path_segment(st
 // building any index over `fields` just to find a single entry.
 inline const Field* find_field(const FieldList& fields, std::string_view name) {
     for (const Field& f : fields) {
-        if (to_lower(f.name) == to_lower(name)) return &f;
+        if (iequals(f.name, name)) return &f;
     }
     return nullptr;
 }
