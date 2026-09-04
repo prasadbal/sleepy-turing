@@ -18,6 +18,7 @@
 
 #if !BINDING_HAS_REAL_OCI
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -25,6 +26,11 @@ using uword = unsigned int;
 
 struct OCIType;
 struct OCIColl;
+
+// Real OCIString is an opaque descriptor; the mock only needs it to hold
+// the actual text so OCIStringAssignText/OCIStringResize can round-trip
+// consistently with each other (mirroring the OCINumber comment below).
+struct OCIString { std::string value; };
 
 // Oracle's real OCINumber is a small fixed-size opaque buffer holding its
 // internal decimal representation; the exact byte layout doesn't matter
@@ -75,6 +81,15 @@ inline sword OCIObjectNew(OCIEnv*, OCIError*, const OCISvcCtx*,
     return OCI_SUCCESS;
 }
 
+// Oracle NUMBER is decimal; a floating-point value must go through
+// OCINumberFromReal, not be truncated to an int first (see
+// details/oci_collection_bind.h::append_collection_element).
+inline sword OCINumberFromReal(OCIError*, const dvoid* rnum, uword rnum_length, OCINumber* number) {
+    std::memset(number->data, 0, sizeof(number->data));
+    std::memcpy(number->data, rnum, std::min<std::size_t>(rnum_length, sizeof(number->data)));
+    return OCI_SUCCESS;
+}
+
 inline sword OCINumberFromInt(OCIError*, const dvoid* inum, uword inum_length,
                                uword /*inum_s_flag*/, OCINumber* number) {
     std::memset(number->data, 0, sizeof(number->data));
@@ -82,13 +97,32 @@ inline sword OCINumberFromInt(OCIError*, const dvoid* inum, uword inum_length,
     return OCI_SUCCESS;
 }
 
-inline sword OCICollAppend(OCIEnv*, OCIError*, const dvoid* elem, const dvoid* /*elemind*/, OCIColl* coll) {
-    // The mock can't know here whether `elem` is an OCINumber* or a
-    // NUL-terminated string -- collection_bind.h always passes something
-    // it can safely round-trip to a debug string, since that's all this
-    // mock's OCIStmtExecute/OCIStmtFetch2 need to demonstrate the flow.
+inline sword OCICollAppend(OCIEnv*, OCIError*, const dvoid* /*elem*/, const dvoid* /*elemind*/, OCIColl* coll) {
+    // `elem` is an OCINumber* for an arithmetic element or an OCIString**
+    // for a string one -- two unrelated representations behind one
+    // const void*, with no runtime tag to tell them apart. The mock
+    // doesn't need to know which: this recorded count is never inspected
+    // by anything (OCIStmtExecute/OCIStmtFetch2 always return canned
+    // rows regardless of what was appended -- see the demo's own
+    // comments), so a placeholder avoids reinterpreting `elem`'s bytes as
+    // a C-string, which for the OCIString** case would read a stack
+    // address as text instead of the real content.
     auto* values = reinterpret_cast<std::vector<std::string>*>(coll);
-    values->push_back(reinterpret_cast<const char*>(elem));
+    values->push_back("appended");
+    return OCI_SUCCESS;
+}
+
+inline sword OCIStringAssignText(OCIEnv*, OCIError*, const text* rhs, ub4 rhs_len, OCIString** lhs) {
+    delete *lhs; // matches real OCIStringAssignText reusing/reallocating *lhs
+    *lhs = new OCIString{std::string(reinterpret_cast<const char*>(rhs), rhs_len)};
+    return OCI_SUCCESS;
+}
+
+inline sword OCIStringResize(OCIEnv*, OCIError*, ub4 new_size, OCIString** str) {
+    if (new_size == 0) {
+        delete *str;
+        *str = nullptr;
+    }
     return OCI_SUCCESS;
 }
 

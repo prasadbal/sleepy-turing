@@ -32,8 +32,15 @@ public:
     // truncate an oversized bind value against a fixed column width.
     void assign(std::string_view s) {
         length_ = static_cast<ub2>(s.size() > Capacity ? Capacity : s.size());
-        std::memcpy(data_, s.data(), length_);
+        if (length_ > 0) std::memcpy(data_, s.data(), length_);
+        // Clear the tail so the unused capacity never carries bytes from a
+        // previous, longer value. Matters because the whole Capacity-sized
+        // buffer is what gets handed to OCI on a bind, and because a row
+        // struct is reused across rows in the array-bind path.
+        if (length_ < Capacity) std::memset(data_ + length_, 0, Capacity - length_);
     }
+
+    void clear() { assign(std::string_view{}); }
 
     std::string_view view() const { return std::string_view(data_, length_); }
     operator std::string_view() const { return view(); } // picked up by is_bindable_leaf / raw_bind_args automatically
