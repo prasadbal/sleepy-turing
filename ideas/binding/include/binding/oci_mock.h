@@ -267,9 +267,19 @@ inline sword OCIStmtFetch2(OCIStmt*, OCIError*, ub4 nrows, ub2, sb4, ub4) {
             }
             if (ind_ptr) *ind_ptr = OCI_IND_NOTNULL;
 
-            if (d.dty == SQLT_INT && d.size == sizeof(int)) {
-                int v = 100 + g_fetch_row * 10 + static_cast<int>(i);
-                std::memcpy(row_ptr, &v, sizeof(v));
+            if (d.dty == SQLT_INT || d.dty == SQLT_UIN) {
+                // Any integer width, not just sizeof(int): OCI takes the width
+                // from the define's value_sz, so a std::int64_t or
+                // std::uint32_t column is as ordinary as an int one. Writing
+                // only 4-byte values here left a wider column reading back as
+                // zero, which looked like a binder bug rather than a mock gap.
+                const long long v = 100 + g_fetch_row * 10 + static_cast<int>(i);
+                switch (d.size) {
+                    case 2: { auto n = static_cast<short>(v);     std::memcpy(row_ptr, &n, sizeof(n)); break; }
+                    case 4: { auto n = static_cast<int>(v);       std::memcpy(row_ptr, &n, sizeof(n)); break; }
+                    case 8: { auto n = static_cast<long long>(v); std::memcpy(row_ptr, &n, sizeof(n)); break; }
+                    default: break;
+                }
             } else if (d.dty == SQLT_BDOUBLE && d.size == sizeof(double)) {
                 double v = 1.5 * (g_fetch_row + 1) + static_cast<double>(i);
                 std::memcpy(row_ptr, &v, sizeof(v));

@@ -43,6 +43,7 @@ struct OCINumber { unsigned char data[22]; };
 #define OCI_TYPEGET_HEADER 1
 #define OCI_TYPEGET_ALL 2
 #define OCI_NUMBER_SIGNED 2
+#define OCI_NUMBER_UNSIGNED 0
 #define OCI_OBJECTFREE_FORCE 1
 #define SQLT_NTY 108
 

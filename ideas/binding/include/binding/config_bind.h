@@ -31,13 +31,6 @@
 
 namespace binding {
 
-inline bool iequals(std::string_view a, std::string_view b) noexcept {
-    return a.size() == b.size() &&
-           std::equal(a.begin(), a.end(), b.begin(), [](unsigned char x, unsigned char y) {
-               return std::tolower(x) == std::tolower(y);
-           });
-}
-
 inline std::string to_lower(std::string_view s) {
     std::string out(s);
     std::transform(out.begin(), out.end(), out.begin(),
@@ -93,8 +86,13 @@ void parse_leaf_value(const std::string& raw, T& out, std::string_view field_nam
     if constexpr (std::is_same_v<T, std::string>) {
         out = raw;
     } else if constexpr (std::is_arithmetic_v<T>) {
-        const auto* begin = raw.data();
-        const auto* end = raw.data() + raw.size();
+        // Trimmed first: from_chars rejects leading whitespace outright, so a
+        // value that arrived with any surrounding formatting would otherwise
+        // fail as "not a valid number". The XML bridge already trims (see
+        // ptree_bridge.h); this covers every other FieldList source too.
+        const std::string_view text = trim(raw);
+        const auto* begin = text.data();
+        const auto* end = text.data() + text.size();
         auto [ptr, ec] = std::from_chars(begin, end, out);
         if (ec != std::errc{} || ptr != end) {
             throw std::runtime_error("binding: field '" + std::string(field_name) +

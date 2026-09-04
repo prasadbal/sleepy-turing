@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -14,6 +15,23 @@
 // ============================================================================
 
 namespace binding {
+
+// The reserved name an element's own text content is stored under when that
+// element also has attributes or child elements, and so becomes a nested
+// struct rather than a leaf (see ptree_bridge.h). Deliberately not a legal
+// XML element name or C++ identifier, so it can never collide with a real
+// child element's name.
+inline constexpr std::string_view kTextFieldKey = "#text";
+
+// Strips leading/trailing ASCII whitespace. Shared by the parser bridges (an
+// XML document's indentation is formatting, not part of a config value) and
+// by config_bind.h's numeric parsing.
+inline std::string_view trim(std::string_view s) noexcept {
+    constexpr std::string_view ws = " \t\r\n\f\v";
+    const auto first = s.find_first_not_of(ws);
+    if (first == std::string_view::npos) return {};
+    return s.substr(first, s.find_last_not_of(ws) - first + 1);
+}
 
 struct Field;
 using FieldList = std::vector<Field>;

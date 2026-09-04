@@ -29,8 +29,13 @@ inline FieldList from_ptree(const boost::property_tree::ptree& pt) {
         }
 
         if (child.empty()) {
-            // No children -> this node's own text is its whole value.
-            fields.push_back(Field{key, child.data()});
+            // No children -> this node's own text is its whole value. Trimmed
+            // because an XML document's indentation and line breaks around a
+            // value are formatting, not part of the value: without this, a
+            // config pretty-printed as "<threads>\n    8\n  </threads>"
+            // reached from_chars as "\n    8\n  " and was rejected as not a
+            // number, so only single-line values happened to work.
+            fields.push_back(Field{key, std::string(trim(child.data()))});
         } else {
             // Has children (plain child elements and/or attributes) -> a
             // nested struct. Note this also applies to an attribute-only,
@@ -38,7 +43,21 @@ inline FieldList from_ptree(const boost::property_tree::ptree& pt) {
             // one-field nested struct {pool: {size: "10"}}, not a bare leaf
             // {pool: "10"} -- the attribute's own name would otherwise be
             // lost.
-            fields.push_back(Field{key, from_ptree(child)});
+            FieldList nested = from_ptree(child);
+
+            // An element can have both attributes/children AND its own text
+            // ("<host port=\"5432\">db1</host>"). That text used to be
+            // dropped silently, because the node is not empty() and only the
+            // nested-struct branch ran. It is kept under the reserved
+            // kTextFieldKey name instead, so no configured value is lost.
+            // Whitespace-only data is genuinely just formatting between child
+            // elements and is still discarded.
+            const std::string_view own_text = trim(child.data());
+            if (!own_text.empty()) {
+                nested.push_back(Field{std::string(kTextFieldKey), std::string(own_text)});
+            }
+
+            fields.push_back(Field{key, std::move(nested)});
         }
     }
 

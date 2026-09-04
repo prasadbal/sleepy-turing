@@ -26,6 +26,13 @@ that's worth doing, not a committed dependency.
   and a missing `OCIErrorGet` (the connection class needs it to tell a
   dropped session apart from an ordinary SQL error).
 - `include/binding/oci_lob.h` -- `OciClob`/`OciXml` wrapper types.
+- `include/binding/oci_fixed_string.h` -- `FixedString<N>` (`OciChar<N>` /
+  `OciVarchar2<N>`), a fixed-capacity character buffer. This is the type a
+  CHAR/VARCHAR2 column binds *and* defines through: `N` is the maximum output
+  buffer size OCI needs before it knows how long a value is, and the
+  characters sit inline in the row struct at a fixed stride, which is what
+  both `OCIDefineArrayOfStruct` and `OCIBindArrayOfStruct` need. `std::string`
+  can satisfy neither, which is why it stays an input-only bind type.
 - `include/binding/oci_connection.h` -- `OciConnection`: owns the OCI
   handles and the reconnect policy (see below).
 - `include/binding/oci_client.h` -- `OciClient`: `execute()`, `insert()`,
@@ -59,7 +66,8 @@ that's worth doing, not a committed dependency.
   build type.
 - `include/binding/oci_collection_bind.h` -- `select_with_in_collection()`/
   `execute_with_in_collection()`: a dynamic `IN (...)` list bound as a
-  single Oracle collection object (see below).
+  single Oracle collection object (see
+  [docs/in_list_binding.md](docs/in_list_binding.md)).
 
 ## The client's methods (execute / insert / select)
 
@@ -78,22 +86,62 @@ bind-mechanism jargon:
   reading as intent at the call site when the statement actually is an
   `INSERT`.
 - **`insert(conn, query_text, std::vector<T>& rows)`** -- inserts several
-  rows. For now this is a naive per-row loop: one `OCIStmtExecute` (with
-  its own independent reconnect-retry) per row, not a real Oracle array
-  bind. It stops at the first failed row without rolling back rows already
-  inserted -- transaction/commit boundaries are the caller's responsibility
-  here exactly as with every other method (see "What's deliberately not
-  here"). **A real bulk-bind implementation (`OCIBindByName` against an
-  array of values, one `OCIStmtExecute` with `iters = rows.size()`) is a
-  deliberately deferred TODO** -- the per-row loop is correct, just not
-  fast for a large `rows`; revisit when bulk-insert throughput actually
-  matters for a real use case.
-- **`select(conn, query_text, results)`** -- runs a `SELECT` and returns
-  its rows into `std::vector<T>&`.
+  rows as a real Oracle array bind: one `OCIBindByName` per field (pointing
+  at `rows[0]`'s field) plus `OCIBindArrayOfStruct` (telling OCI the byte
+  stride to the same field in the next row), then a single `OCIStmtExecute`
+  with `iters = rows.size()` -- one round trip for the whole batch, reading
+  values directly out of `rows`' own contiguous storage. Verified live
+  against a real database: 2000 rows inserted in one call, all values
+  confirmed correct on read-back.
+  Scope: a plain (non-optional) arithmetic leaf field, or a `FixedString<N>`
+  field, binds this way -- both have their bytes inline in `T` at a fixed
+  offset, which is exactly what a fixed-stride array bind needs (a
+  `FixedString`'s per-row length travels through `OCIBindArrayOfStruct`'s
+  `alskip`, the same way its value travels through `pvskip`). `std::string`,
+  `std::optional<U>`, LOB, and vector/set/valarray fields all `static_assert`
+  here instead of silently binding garbage (a string's characters live in its
+  own heap/SSO storage, not inline in `T` at a fixed stride -- declare the
+  field `FixedString<N>` instead; an empty `std::optional` has no address to
+  bind through; LOB needs a per-row locator array; a container field has no
+  per-row meaning at all). For a row type with any of those, insert each row
+  in a loop via `insert(conn, query_text, T&)` instead.
+  Transaction/commit boundaries are the caller's responsibility here
+  exactly as with every other method (see "What's deliberately not here").
+- **`select(conn, query_text, results)`** -- runs a `SELECT` with no bind
+  parameters and returns its rows into `std::vector<T>&`.
+- **`select(conn, query_text, input, results)`** -- same, but also binds
+  `input`'s fields as named parameters first (e.g. a `WHERE` clause) --
+  the read-side counterpart to `execute(conn, query_text, bind_struct)`.
+  `input` only ever supplies parameters; `results`' column-order/type
+  rules are unchanged from the no-input overload above.
+
+  Both overloads fetch as a real array-of-struct batch: `OCIDefineByPos` +
+  `OCIDefineArrayOfStruct` define every column directly into a
+  `kSelectBatchRows`-sized (100) `std::vector<T>`, and each
+  `OCIStmtFetch2` call asks for up to that many rows at once (via
+  `OCI_ATTR_ROWS_FETCHED` to learn how many actually came back, since the
+  final batch is usually partial), appending each batch to `results` in
+  one bulk `insert()` rather than one `push_back()` per row. This is
+  deliberately *not* about network round trips -- Oracle's own
+  client-side prefetch cache (`OCI_ATTR_PREFETCH_ROWS`, set here
+  regardless) already collapses round trips for a plain one-row-at-a-time
+  fetch loop; measured directly against a real database, fetching 500
+  rows one at a time took 252 round trips at the client's small default
+  prefetch setting, and 2 round trips with `OCI_ATTR_PREFETCH_ROWS` set to
+  500 -- no change to the fetch loop itself required. What batching the
+  fetch call *does* buy, independent of that: fewer `OCIStmtFetch2`/
+  `OCIAttrGet` calls and fewer, larger `results` growth operations for a
+  large result set, instead of one small step per row. Verified live
+  against a real database: a 20,000-row result (an exact multiple of the
+  batch size) and a 2,050-row one (forcing a partial final batch of 50),
+  both an exact row-count and checksum match; `std::optional<double>`
+  NULL handling verified correct across multiple batches too, not just
+  within one.
 - **(from `oci_collection_bind.h`) `select_with_in_collection()` /
   `execute_with_in_collection()`** -- a dynamic `IN (...)` list bound as a
-  single Oracle collection object (see below), for when the values to
-  match against aren't already sitting in a bind struct's own field.
+  single Oracle collection object (see
+  [docs/in_list_binding.md](docs/in_list_binding.md)), for when the values
+  to match against aren't already sitting in a bind struct's own field.
 
 ## Binding: by name for parameters, by position for result columns
 
@@ -135,7 +183,8 @@ numbered, like `:1`, or named, like `:emp_id`) refers to the Nth *distinct*
 placeholder in order of first appearance in the SQL text, not the Nth
 *occurrence*. `WHERE a = :1 OR b = :1` has exactly one bind (`:1`, reused
 in two places), not two -- the same rule applies to named binds. This
-matters for `bind_named_container()` (further down): each element of a
+matters for `bind_named_container()`
+([docs/in_list_binding.md](docs/in_list_binding.md)): each element of a
 container field's IN-list consumes one new, distinctly-named placeholder,
 since each is a distinct value, but an ordinary field whose name is
 written twice in a statement's text still only binds once.
@@ -154,6 +203,27 @@ by every method above:
 - If it's anything else (bad SQL, a constraint violation, no data found):
   return failure immediately. It is not retried, because retrying an exec
   error just reproduces it.
+- The operation only runs at all while there *is* a session. An earlier
+  version went straight back into the operation after a failed reconnect,
+  with `env_`/`svc_`/`err_` all null -- `OCIHandleAlloc(nullptr, ...)`
+  followed by `OCIStmtPrepare` on the null statement it handed back. A
+  failed reconnect is now just another consumed retry.
+
+Every OCI call the client makes is status-checked, not only the ones in
+`connect()`. `OCIHandleAlloc`, `OCIStmtPrepare`, every `OCIBindByName`/
+`OCIDefineByPos`/`ArrayOfStruct`, `OCIAttrSet`/`OCIAttrGet`, `OCILobWrite2`,
+`OCITypeByName`/`OCIObjectNew`/`OCICollAppend` all previously ran unchecked,
+so a failure part-way through configuring a statement was skipped and every
+later call ran against the half-configured result -- the same shape of bug
+the `connect()` rewrite below removed from the session-setup path. A failing
+field bind now aborts the attempt and reports that call's status.
+
+Statement handles and collection instances are owned by RAII guards
+(`detail::StmtHandle`, `detail::LocatorGuard`, `detail::ObjectInstanceGuard`)
+rather than freed on each return path. Several paths here throw -- an
+unexpected NULL on a non-optional column, an over-cap IN-list, a missing
+container marker -- and an explicit free at the end of a method is skipped
+entirely when the stack unwinds through it, leaking one handle per throw.
 
 ### connect() uses OCILogon2, and checks every call
 
@@ -201,10 +271,35 @@ the indicator says which after each fetched row.
 `std::string`/`optional<std::string>` **binds** fine on the
 `execute()`/`insert()` side (size = content length, not `sizeof(std::string)`
 -- an earlier version of this file had that bug too, since no demo
-exercised a raw string bind). `select()`'s output side still rejects string
-columns via `static_assert` (same reason as LOB columns): OCI needs a
-fixed max buffer size to write into before it knows how long the value is,
-and this client doesn't manage that yet.
+exercised a raw string bind). It is still rejected by `static_assert` as a
+`select()` output column, and as a bulk-insert column: OCI needs a fixed max
+buffer size to write into before it knows how long a value is, and a
+`std::string`'s characters are not inline in the row at a fixed stride.
+
+**A string column uses `FixedString<N>` instead** (`binding/oci_fixed_string.h`),
+in either direction and in both the scalar and the array paths:
+
+```cpp
+struct ReportRow {
+    std::int64_t             position_id;
+    binding::FixedString<16> desk;        // a VARCHAR2(16) column
+    binding::FixedString<8>  risk_class;
+    double                   delta;
+    std::optional<double>    vega;
+};
+```
+
+`N` is the buffer OCI defines into, and the field's own `length_ref()` is
+passed as OCI's actual-length pointer (`rlenp` on define, `alenp` on bind),
+strided by `sizeof(T)` so every row reports its own length. A value longer
+than `N` truncates, exactly as it would against a VARCHAR2(N) column.
+`std::optional<FixedString<N>>` works for a nullable string column, staged
+per batch the same way an `optional<double>` is.
+
+Binding through `FixedString<N>` is also what makes an **OUT** parameter safe
+(`RETURNING ... INTO`): the bound size is the buffer capacity, which is what
+OCI is allowed to fill. A `std::string` bound at content length would be
+overflowed by a longer returned value.
 
 ### NULL on a field that isn't std::optional
 
@@ -253,6 +348,22 @@ parent level; and an attribute-only self-closing element like
 `<pool size="10"/>` becomes a one-field nested struct
 (`{pool: {size: "10"}}`), not a bare leaf, since collapsing it further would
 lose the attribute's own name.
+
+Two things `from_ptree()` used to get wrong, both fixed:
+
+- **An element with attributes *and* its own text** (`<host port="5432">db1</host>`)
+  lost the text entirely: the node isn't `empty()`, so only the nested-struct
+  branch ran and `db1` was silently dropped. The text is now kept inside the
+  nested struct under the reserved name `binding::kTextFieldKey` (`"#text"`,
+  which no XML element can be named). Nothing binds it to a struct field yet
+  -- deciding that convention is a separate call -- but it is no longer lost.
+- **Whitespace.** `read_xml` keeps a value's surrounding indentation, and
+  `std::from_chars` rejects leading whitespace outright, so a config
+  pretty-printed as `<threads>\n    8\n  </threads>` failed as "not a valid
+  number" and only single-line values happened to work. Leaf text is trimmed
+  in the bridge (an XML document's indentation is formatting, not data), and
+  `parse_leaf_value` trims again before `from_chars` so any other `FieldList`
+  source gets the same treatment.
 
 `reflect.h`'s `config_schema<T>` extends `flat_schema` to also allow a field
 that's a nested struct, or a `std::vector<U>` of one (the repeated-element
@@ -372,153 +483,75 @@ starts to matter for a `FieldList` with hundreds-to-thousands of entries
 nesting level), where the old linear-scan version would visibly slow down
 config loading and the indexed one won't.
 
-## A struct field can itself be a dynamic multi-value IN-list
-
-Before this, `execute()`/`insert()`'s struct-based binding only accepted
-scalar leaf fields (plus `std::optional<leaf>` and the LOB types) -- there
-was no way to bind a query that mixes ordinary named parameters with a
-collection-typed one, e.g. `UPDATE trades SET status = :status WHERE
-trade_id IN (...)`. The only place a collection could be bound at all was
-`select_with_in_list()`/`execute_with_in_list()` below, which assume the
-collection is the query's *only* parameter.
-
-`bindable`'s field predicate now also accepts a `std::vector<U>`/
-`std::set<U>`/`std::valarray<U>` field, for U a bindable leaf:
-
-```cpp
-struct TradeStatusUpdate {
-    std::string status;      // an ordinary named parameter: :status
-    std::set<int> trade_ids; // a dynamic multi-value IN-list: {trade_ids}
-};
-
-client.execute(conn, "UPDATE trades SET status = :status WHERE trade_id IN ({trade_ids})", filter);
-```
-
-The mechanism is the field-scoped version of the standalone `{IN}` marker
-below: `detail::substitute_container_markers` (called once, unconditionally,
-at the top of `run_execute_once` -- a no-op if `T` has no container field)
-replaces each container field's own `{field_name}` marker with a named
-placeholder list sized to that field's current element count
-(`make_named_placeholders`, e.g. `:trade_ids_0,:trade_ids_1,:trade_ids_2`),
-*before* `OCIStmtPrepare` -- Oracle needs the exact placeholder count fixed
-in the SQL text itself, the same reason `{IN}` substitution exists.
-`detail::bind_named_container` then binds each element by that generated
-name (`OCIBindByName`, matching how every other field on this side binds).
-A missing marker for a container field -- forgetting to write
-`{field_name}` where the values should go -- throws immediately rather than
-silently preparing a statement whose binds have nowhere to land.
-
-Unlike `select_with_in_list()`'s ID collection, a struct's container field
-is **not** deduped/sorted into a set first (a `std::set<U>` field is
-naturally already ordered/deduped by being a set, but a `std::vector<U>`/
-`std::valarray<U>` field binds exactly what the caller put there, in
-order, duplicates included) -- that deduping was a deliberate,
-documented optimization specific to the standalone IN-list convenience
-functions, not a property every collection bind should silently apply to
-a caller's own data.
-
-`select()`'s output side explicitly rejects a container-typed field via
-`static_assert` -- a single result column can't fetch into a
-variable-length container (that's what multiple *rows* are for), so this
-is bind-side-only by design, not an oversight.
-
 ## Dynamic IN (...) lists
 
-`OciClient::select_with_in_list()` / `execute_with_in_list()` handle a
-variable-length `WHERE col IN (...)`. `query_template` carries one `{IN}`
-marker -- e.g. `"SELECT trade_id, notional FROM trades WHERE trade_id IN
-({IN})"` -- which `make_in_placeholders()` expands to `:1,:2,...,:N` sized
-to the ID collection, before `OCIStmtPrepare` (Oracle needs the exact
-placeholder count fixed in the SQL text itself; there's no variable-arity
-bind). `bind_in_list()` then binds each element positionally, reusing the
-same `raw_bind_args`/`oci_type_code_v` machinery the struct binder uses.
+Two distinct mechanisms -- a struct field that's itself a container
+(still placeholder-expansion, still capped at 1000 elements), and a
+standalone ID collection bound as a single Oracle collection object (no
+cap, verified against a real Oracle database) -- are documented in
+[docs/in_list_binding.md](docs/in_list_binding.md), including the
+`OCI_OBJECT` environment-mode requirement the collection bind needs and
+the live 10,000-element test that found it.
 
-The ID collection is a `std::set<ElemType>` (`std::vector<ElemType>` and
-`std::valarray<ElemType>` overloads exist too, both purely as a convenience
-that dedupes into a set before delegating) -- for two reasons:
+## Collection bind: number precision, and the VARCHAR2 crash
 
-- **Dedup.** A repeated value in an `IN` list is never meaningful, only a
-  wasted bind.
-- **Deterministic order.** Oracle's shared-pool cursor cache is keyed on
-  SQL text. Two calls with the same *logical* set of IDs must generate
-  identical placeholder text and bind order regardless of what order the
-  caller happened to collect them in, or they needlessly fragment into
-  separate cached cursors.
+`append_collection_element` used to funnel every arithmetic element through
+`static_cast<int>` before `OCINumberFromInt`, so a `std::set<double>` bound as
+an IN-list silently matched on truncated integers -- wrong rows, no error
+anywhere, even though `OciCollectionTypeBinder<double>` is specialized and so
+that path is reachable by design. A floating-point element now goes through
+`OCINumberFromReal`, and an integral one keeps its own width and signedness
+instead of narrowing to `int`.
 
-An empty collection expands to the literal `NULL` rather than an empty
-placeholder list -- `... IN ()` is a SQL syntax error, but `... IN (NULL)`
-is valid and (per SQL's three-valued logic, `x = NULL` is never true)
-correctly matches zero rows. No special-casing needed at the call site for
-an empty ID list.
+The `std::string` element crash (see the KNOWN BROKEN note in
+`oci_collection_bind.h`) is **not** fixed. The cheap way around it, rather
+than root-causing `SYS.ODCIVARCHAR2LIST`: create your own collection type and
+point the binder at it -- the specialization hook already exists.
 
-`make_in_placeholders()` also enforces Oracle's other, sharper limit here:
-**ORA-01795** -- a plain `IN (...)` list, whether its elements are literals
-or bind placeholders, is capped at 1000 expressions by the parser itself.
-That's unrelated to (and hit long before) the 64KB max SQL statement text
-length -- a 1000-placeholder list is nowhere near that. Passing more than
-1000 elements throws a clear error naming the actual limit, instead of
-letting it surface as an opaque `ORA-01795` from `OCIStmtExecute`. Beyond
-1000, or to avoid shared-pool fragmentation as list sizes vary, see the
-collection bind below.
+```sql
+CREATE TYPE frtb_id_list AS TABLE OF VARCHAR2(64);
+```
 
-## Dynamic IN (...) lists via a collection bind (oci_collection_bind.h)
+```cpp
+template <> struct binding::OciCollectionTypeBinder<std::string> {
+    static constexpr std::string_view schema = "FRTB";
+    static constexpr std::string_view type_name = "FRTB_ID_LIST";
+};
+```
 
-`select_with_in_collection()` is the alternative to `select_with_in_list()`
-above: instead of generating a placeholder list sized to the collection, it
-binds *one* Oracle collection object and queries
-`WHERE id IN (SELECT column_value FROM TABLE(:1))`. The SQL text is fixed
-regardless of how many elements are in the collection -- no ORA-01795 cap,
-no shared-pool fragmentation as sizes vary between calls.
-
-`OciCollectionTypeBinder<ElemType>` maps the element type to an Oracle SQL
-collection type to bind through, defaulting to Oracle's built-in ODCI
-schema types so the common case needs no schema setup:
-`SYS.ODCINUMBERLIST` for arithmetic types, `SYS.ODCIVARCHAR2LIST` for
-strings. `build_in_collection()` looks up that type (`OCITypeByName`),
-creates a new empty instance of it (`OCIObjectNew`), and appends every
-element (`OCICollAppend`, via `OCINumberFromInt` for a NUMBER element).
-`select_with_in_collection()` then binds the whole collection as one
-parameter (`OCIBindByPos` with `SQLT_NTY`, followed by `OCIBindObject`) and
-frees it (`OCIObjectFree`) after the fetch loop -- otherwise the same
-shape as `select()` in `oci_client.h`.
-
-**This is meaningfully lower-confidence than the rest of this directory.**
-Everything else here binds/defines through `OCIBindByName`/`OCIBindByPos`/
-`OCIDefineByPos` -- a handful of well-documented, thoroughly-used scalar
-OCI calls. Oracle's object/collection API (`OCIType`, `OCIObjectNew`,
-`OCICollAppend`, `OCIBindObject`) is a genuinely more obscure corner of
-OCI, and there's no real `oci.h`/`ociap.h` on this machine to check
-`oci_object_mock.h`'s signatures against -- they're written from
-documentation recall, not verified the way the rest of this codebase's OCI
-signatures have been. What *is* verified: `oci_collection_bind.h` compiles
-and runs correctly against its own mock (`examples/collection_demo.cpp`,
-both a `std::string` and an `int` element type), proving the C++ template
-plumbing hangs together. What's *not* verified is that the mock's
-signatures faithfully match a real client's. Diff `oci_object_mock.h`
-against the actual `oci.h`/`ociap.h` before trusting this against a live
-database -- see the warning banner at the top of `oci_collection_bind.h`.
-
-`execute_with_in_collection()` is the DML counterpart (e.g. `"DELETE FROM
-trades WHERE trade_id IN (SELECT column_value FROM TABLE(:1))"`) -- same
-mechanism, no result rows. Both it and `select_with_in_collection()` take
-`std::vector<ElemType>`/`std::valarray<ElemType>` convenience overloads
-too, matching `select_with_in_list()`/`execute_with_in_list()`'s shape --
-**but don't confuse the two**: a `vector`/`valarray` passed to the
-`_with_in_list()` functions still goes through `make_in_placeholders()`
-and is still subject to the 1000-element ORA-01795 cap above. Only the
-`_with_in_collection()` functions -- regardless of which of the three
-container types you hand them -- bind a single Oracle collection object
-and are exempt from that cap. The container type you pass in doesn't
-determine which limit applies; which *function* you call does.
+The `SYS.ODCI*` types are Oracle's own helper types for extensible indexing,
+not general-purpose bind vehicles; a bounded user-defined nested table is
+what you would want in production regardless. Untested against a real
+database -- it replaces one unverified path with another, but with a type
+whose definition you control.
 
 ## What's deliberately not here
 
-- Real bulk/array-bind for `insert(conn, query_text, std::vector<T>&)` --
-  see "The client's methods" above. It's a correct but naive per-row loop.
+- Bulk array-bind for `insert(conn, query_text, std::vector<T>&)` when `T`
+  has a `std::string`/`std::optional<U>`/LOB/container field -- see "The
+  client's methods" above for exactly which field kinds the real array
+  bind supports today (`FixedString<N>` is supported; `std::string` is not);
+  a row type with any of the others still needs a per-row loop via
+  `insert(conn, query_text, T&)`.
+- Chunking `insert(conn, query_text, std::vector<T>&)`: the whole vector is
+  bound and executed as one `OCIStmtExecute` with `iters = rows.size()`. For
+  a very large batch that is one enormous bind with no partial progress --
+  worth splitting once transaction boundaries exist to split it *on*.
+- Making `kSelectBatchRows`/`OCI_ATTR_PREFETCH_ROWS` (both 100) configurable.
+  100 is small for an extract of millions of rows.
 - Transaction/commit handling (`OCITransCommit` / `OCI_COMMIT_ON_SUCCESS`) --
   left to the caller.
-- String and LOB columns in `select()`'s result rows (`static_assert`s
-  against both, for the same fixed-buffer-size reason).
+- `std::string` and LOB columns in `select()`'s result rows (`static_assert`s
+  against both, for the same fixed-buffer-size reason). A string column is
+  supported as `FixedString<N>` -- see "NULL handling" above.
+- Exact decimal. Every numeric field binds as `SQLT_INT`/`SQLT_UIN`/
+  `SQLT_BDOUBLE`, i.e. binary. Oracle `NUMBER` is decimal with up to 38
+  digits, so a value that has to reconcile to the cent should go through
+  `OCINumber`/`SQLT_VNU` (or be fetched as text) rather than a `double`.
+  `float`/`SQLT_BFLOAT` is kept only for compatibility; ~7 significant
+  digits is not enough for anything money-shaped.
+- Date/timestamp columns. There is no `SQLT_DAT`/`SQLT_TIMESTAMP` mapping
+  and no date type here at all.
 - Nullable LOBs (`std::optional<OciClob>`) -- LOB fields always bind/define
   as not-null for now.
 - Non-`std::string` string-like leaf types in `config_bind.h`'s
@@ -559,8 +592,10 @@ Boost's own `core_name20_static.hpp`, unrelated to this code).
 `config_demo` additionally needs `boost::property_tree`, which the
 FetchContent fallback (standalone `pfr` only) doesn't provide -- it only
 builds when `BINDING_BOOST_INCLUDE_DIR` resolves to a real local Boost
-install. See "Dynamic IN (...) lists via a collection bind" above for why
-`collection_demo` passing here is weaker evidence than the other two.
+install. `collection_demo` here only exercises the mock -- see
+[docs/in_list_binding.md](docs/in_list_binding.md) for the separate live
+test against a real Oracle database that actually verified this code
+path.
 
 Not yet verified against MSVC in this session -- but `boost::pfr::names_as_array()`
 being available there at all (see "Binding: by name for parameters..."

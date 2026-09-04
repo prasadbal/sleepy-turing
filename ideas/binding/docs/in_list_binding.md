@@ -37,6 +37,15 @@ struct TradeStatusUpdate {
 client.execute(conn, "UPDATE trades SET status = :status WHERE trade_id IN ({trade_ids})", filter);
 ```
 
+Every occurrence of a field's `{field_name}` marker is replaced, not just
+the first: a container field can legitimately be matched against more than
+one column (`WHERE a IN ({ids}) OR b IN ({ids})`), and replacing only the
+first left a literal `{ids}` in the SQL handed to `OCIStmtPrepare`, which
+surfaced as an opaque ORA-00911. Both expansions generate the same
+placeholder names, and a placeholder repeated in one statement is a single
+bind (see "on placeholder reuse" in README.md), so the repeated list binds
+correctly against one set of values.
+
 `detail::substitute_container_markers` (called once, unconditionally, at
 the top of `run_execute_once` -- a no-op if `T` has no container field)
 replaces each container field's own `{field_name}` marker with a named

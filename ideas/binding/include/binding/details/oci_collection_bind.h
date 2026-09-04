@@ -24,13 +24,31 @@ namespace detail {
 // converting it to the representation Oracle's collection element type
 // expects (OCINumber for a NUMBER-typed collection, raw text for a
 // VARCHAR2-typed one).
+inline void record_collection_status(sword& accumulated, sword status) noexcept {
+    if (accumulated == OCI_SUCCESS && status != OCI_SUCCESS) accumulated = status;
+}
+
 template <typename ElemType>
-void append_collection_element(OciConnection& conn, OCIColl* coll, const ElemType& value) {
-    if constexpr (std::is_arithmetic_v<ElemType>) {
+void append_collection_element(sword& status, OciConnection& conn, OCIColl* coll, const ElemType& value) {
+    if constexpr (std::is_floating_point_v<ElemType>) {
+        // Oracle NUMBER is decimal and holds a double's full range; going
+        // through OCINumberFromInt truncated every fractional value to an int
+        // before it was ever appended, so a collection built from doubles
+        // silently matched on truncated integers -- wrong rows, no error
+        // anywhere. OciCollectionTypeBinder<double> exists, so this path is
+        // reachable by design.
         OCINumber num{};
-        auto raw = static_cast<int>(value); // ODCINUMBERLIST elements are NUMBER; int covers the common id/key case
-        OCINumberFromInt(conn.err(), &raw, sizeof(raw), OCI_NUMBER_SIGNED, &num);
-        OCICollAppend(conn.env(), conn.err(), &num, nullptr, coll);
+        double raw = static_cast<double>(value);
+        record_collection_status(status, OCINumberFromReal(conn.err(), &raw, sizeof(raw), &num));
+        record_collection_status(status, OCICollAppend(conn.env(), conn.err(), &num, nullptr, coll));
+    } else if constexpr (std::is_integral_v<ElemType>) {
+        // The element's own width and signedness, not int: a 64-bit id
+        // narrowed to int is the same silent-truncation bug as above.
+        OCINumber num{};
+        ElemType raw = value;
+        record_collection_status(status, OCINumberFromInt(conn.err(), &raw, sizeof(raw),
+                                 std::is_signed_v<ElemType> ? OCI_NUMBER_SIGNED : OCI_NUMBER_UNSIGNED, &num));
+        record_collection_status(status, OCICollAppend(conn.env(), conn.err(), &num, nullptr, coll));
     } else if constexpr (std::is_convertible_v<ElemType, std::string_view>) {
         std::string_view sv = value;
         // A VARCHAR2 collection element's OCI representation is an
@@ -45,15 +63,15 @@ void append_collection_element(OciConnection& conn, OCIColl* coll, const ElemTyp
         // mock or by the earlier collection-bind demos, which only ever
         // exercised an int element type live.
         OCIString* ocistr = nullptr;
-        OCIStringAssignText(conn.env(), conn.err(),
+        record_collection_status(status, OCIStringAssignText(conn.env(), conn.err(),
                              reinterpret_cast<const text*>(sv.data()), static_cast<ub4>(sv.size()),
-                             &ocistr);
-        OCICollAppend(conn.env(), conn.err(), &ocistr, nullptr, coll);
+                             &ocistr));
+        record_collection_status(status, OCICollAppend(conn.env(), conn.err(), &ocistr, nullptr, coll));
         // OCICollAppend copies the string's content into the collection's
         // own storage, so the temporary descriptor is released right away
         // rather than held until build_in_collection's caller frees the
         // whole collection.
-        OCIStringResize(conn.env(), conn.err(), 0, &ocistr);
+        record_collection_status(status, OCIStringResize(conn.env(), conn.err(), 0, &ocistr));
     } else {
         static_assert(sizeof(ElemType) == 0, "no collection element encoder for this ElemType");
     }
@@ -67,25 +85,48 @@ bool build_in_collection(OciConnection& conn, const std::set<ElemType>& values,
     using Binder = OciCollectionTypeBinder<ElemType>;
 
     OCIType* tdo = nullptr;
-    OCITypeByName(conn.env(), conn.err(), conn.svc(),
+    sword status = OCITypeByName(conn.env(), conn.err(), conn.svc(),
                   reinterpret_cast<const text*>(Binder::schema.data()), static_cast<ub4>(Binder::schema.size()),
                   reinterpret_cast<const text*>(Binder::type_name.data()), static_cast<ub4>(Binder::type_name.size()),
                   nullptr, 0, OCI_DURATION_SESSION, OCI_TYPEGET_ALL, &tdo);
-    if (!tdo) return false;
+    if (status != OCI_SUCCESS || !tdo) return false;
 
     dvoid* instance = nullptr;
-    OCIObjectNew(conn.env(), conn.err(), conn.svc(), OCI_TYPECODE_NAMEDCOLLECTION, tdo,
+    status = OCIObjectNew(conn.env(), conn.err(), conn.svc(), OCI_TYPECODE_NAMEDCOLLECTION, tdo,
                  nullptr, OCI_DURATION_SESSION, /*value=*/1, &instance);
-    if (!instance) return false;
+    if (status != OCI_SUCCESS || !instance) return false;
 
     for (const ElemType& v : values) {
-        append_collection_element(conn, reinterpret_cast<OCIColl*>(instance), v);
+        append_collection_element(status, conn, reinterpret_cast<OCIColl*>(instance), v);
+        if (status != OCI_SUCCESS) {
+            // Do not hand back a partially built collection: binding it would
+            // silently query against a subset of the requested ids.
+            OCIObjectFree(conn.env(), conn.err(), instance, OCI_OBJECTFREE_FORCE);
+            return false;
+        }
     }
 
     *out_tdo = tdo;
     *out_instance = instance;
     return true;
 }
+
+// Frees a built collection instance on every exit path, including a throw out
+// of the fetch loop (apply_field_null_semantics throws on an unexpected NULL).
+class ObjectInstanceGuard {
+public:
+    ObjectInstanceGuard(OciConnection& conn, dvoid* instance) : conn_(conn), instance_(instance) {}
+    ~ObjectInstanceGuard() {
+        if (instance_) OCIObjectFree(conn_.env(), conn_.err(), instance_, OCI_OBJECTFREE_FORCE);
+    }
+
+    ObjectInstanceGuard(const ObjectInstanceGuard&) = delete;
+    ObjectInstanceGuard& operator=(const ObjectInstanceGuard&) = delete;
+
+private:
+    OciConnection& conn_;
+    dvoid* instance_;
+};
 
 } // namespace detail
 
@@ -101,23 +142,25 @@ bool select_with_in_collection(OciConnection& conn, const std::string& query_tex
             return {false, OCI_ERROR};
         }
 
-        OCIStmt* stmt = nullptr;
-        OCIHandleAlloc(conn.env(), reinterpret_cast<void**>(&stmt), OCI_HTYPE_STMT, 0, nullptr);
-        OCIStmtPrepare(stmt, conn.err(),
-                       reinterpret_cast<const text*>(query_text.c_str()),
-                       static_cast<ub4>(query_text.size()),
-                       OCI_NTV_SYNTAX, OCI_DEFAULT);
+        detail::ObjectInstanceGuard instance_guard(conn, instance);
+
+        detail::StmtHandle stmt;
+        const sword prepare_status = detail::prepare_statement(conn, stmt, query_text);
+        if (prepare_status != OCI_SUCCESS) {
+            return {false, prepare_status};
+        }
 
         OCIBind* bind_handle = nullptr;
-        OCIBindByPos(stmt, &bind_handle, conn.err(), 1, &instance, 0, SQLT_NTY,
+        sword bind_status = OCIBindByPos(stmt.get(), &bind_handle, conn.err(), 1, &instance, 0, SQLT_NTY,
                     nullptr, nullptr, nullptr, 0, nullptr, OCI_DEFAULT);
-        OCIBindObject(bind_handle, conn.err(), tdo, &instance, nullptr, nullptr, nullptr);
+        if (bind_status == OCI_SUCCESS) {
+            bind_status = OCIBindObject(bind_handle, conn.err(), tdo, &instance, nullptr, nullptr, nullptr);
+        }
+        if (bind_status != OCI_SUCCESS) {
+            return {false, bind_status};
+        }
 
-        const OciOutcome outcome = detail::run_select_fetch_loop(conn, stmt, results);
-
-        OCIObjectFree(conn.env(), conn.err(), instance, OCI_OBJECTFREE_FORCE);
-        OCIHandleFree(stmt, OCI_HTYPE_STMT);
-        return outcome;
+        return detail::run_select_fetch_loop(conn, stmt.get(), results);
     });
 }
 
@@ -143,21 +186,25 @@ bool execute_with_in_collection(OciConnection& conn, const std::string& query_te
             return {false, OCI_ERROR};
         }
 
-        OCIStmt* stmt = nullptr;
-        OCIHandleAlloc(conn.env(), reinterpret_cast<void**>(&stmt), OCI_HTYPE_STMT, 0, nullptr);
-        OCIStmtPrepare(stmt, conn.err(),
-                       reinterpret_cast<const text*>(query_text.c_str()),
-                       static_cast<ub4>(query_text.size()),
-                       OCI_NTV_SYNTAX, OCI_DEFAULT);
+        detail::ObjectInstanceGuard instance_guard(conn, instance);
+
+        detail::StmtHandle stmt;
+        const sword prepare_status = detail::prepare_statement(conn, stmt, query_text);
+        if (prepare_status != OCI_SUCCESS) {
+            return {false, prepare_status};
+        }
 
         OCIBind* bind_handle = nullptr;
-        OCIBindByPos(stmt, &bind_handle, conn.err(), 1, &instance, 0, SQLT_NTY,
+        sword bind_status = OCIBindByPos(stmt.get(), &bind_handle, conn.err(), 1, &instance, 0, SQLT_NTY,
                     nullptr, nullptr, nullptr, 0, nullptr, OCI_DEFAULT);
-        OCIBindObject(bind_handle, conn.err(), tdo, &instance, nullptr, nullptr, nullptr);
+        if (bind_status == OCI_SUCCESS) {
+            bind_status = OCIBindObject(bind_handle, conn.err(), tdo, &instance, nullptr, nullptr, nullptr);
+        }
+        if (bind_status != OCI_SUCCESS) {
+            return {false, bind_status};
+        }
 
-        const sword status = OCIStmtExecute(conn.svc(), stmt, conn.err(), 1, 0, nullptr, nullptr, OCI_DEFAULT);
-        OCIObjectFree(conn.env(), conn.err(), instance, OCI_OBJECTFREE_FORCE);
-        OCIHandleFree(stmt, OCI_HTYPE_STMT);
+        const sword status = OCIStmtExecute(conn.svc(), stmt.get(), conn.err(), 1, 0, nullptr, nullptr, OCI_DEFAULT);
         return {status == OCI_SUCCESS, status};
     });
 }

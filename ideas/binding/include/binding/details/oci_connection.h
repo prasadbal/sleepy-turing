@@ -79,15 +79,23 @@ inline bool OciConnection::is_disconnect_error() const {
 template <typename Fn>
 bool OciConnection::run_with_reconnect(Fn&& attempt) {
     for (int try_num = 0;; ++try_num) {
-        const OciOutcome outcome = attempt();
-        if (outcome.success) return true;
+        // Only run the operation when there is a live session to run it on.
+        // A failed reconnect below leaves env_/svc_/err_ null, and the
+        // previous version went straight back into attempt(), which then made
+        // OCI calls through those null handles -- OCIHandleAlloc(nullptr, ...)
+        // followed by OCIStmtPrepare on the null statement that came back.
+        if (connected_) {
+            const OciOutcome outcome = attempt();
+            if (outcome.success) return true;
 
-        if (!is_disconnect_error()) return false; // exec error: never retried
+            if (!is_disconnect_error()) return false; // exec error: never retried
+        }
+
         if (try_num >= max_retries_) return false; // retries exhausted
 
         std::this_thread::sleep_for(retry_interval_);
         disconnect();
-        connect(); // if this fails too, err_ stays null -> next loop retries again
+        connect(); // if this fails, connected_ stays false -> next loop retries the connect
     }
 }
 

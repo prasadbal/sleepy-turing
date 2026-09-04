@@ -33,29 +33,99 @@ inline std::string make_named_placeholders(std::string_view field_name, std::siz
     return result;
 }
 
-// Replaces the first occurrence of "{marker_name}" in `query_template` with
+// Replaces *every* occurrence of "{marker_name}" in `query_template` with
 // `placeholders` -- used for the per-field container marker (that field's
 // own name, see detail::substitute_container_markers).
+//
+// All occurrences, not just the first: a container field can legitimately be
+// matched against more than one column ("WHERE a IN ({ids}) OR b IN ({ids})"),
+// and replacing only the first left a literal "{ids}" in the SQL handed to
+// OCIStmtPrepare, surfacing as an opaque ORA-00911. Every expansion generates
+// the same placeholder names, and a placeholder repeated in one statement is
+// a single bind (see "on placeholder reuse" in README.md), so the repeated
+// list binds correctly against one set of values.
 inline std::string substitute_marker(const std::string& query_template, std::string_view marker_name,
                                       const std::string& placeholders) {
     const std::string marker = "{" + std::string(marker_name) + "}";
-    const auto pos = query_template.find(marker);
-    if (pos == std::string::npos) {
+    if (query_template.find(marker) == std::string::npos) {
         throw std::runtime_error("binding: query template is missing the " + marker + " placeholder marker");
     }
-    std::string result = query_template;
-    result.replace(pos, marker.size(), placeholders);
-    return result;
+    std::string result;
+    result.reserve(query_template.size());
+    std::size_t pos = 0;
+    for (;;) {
+        const auto hit = query_template.find(marker, pos);
+        if (hit == std::string::npos) {
+            result.append(query_template, pos, std::string::npos);
+            return result;
+        }
+        result.append(query_template, pos, hit - pos);
+        result += placeholders;
+        pos = hit + marker.size();
+    }
 }
 
 namespace detail {
+
+// Keeps the first failing status seen while walking a struct's fields, so a
+// fold over every field still reports which call actually failed. Every OCI
+// call in this file is now checked: an unchecked failure leaves a
+// half-configured statement that later calls then run against, the same class
+// of bug the connect() rewrite (see README.md) removed from the setup path.
+inline void record_status(sword& accumulated, sword status) noexcept {
+    if (accumulated == OCI_SUCCESS && status != OCI_SUCCESS) accumulated = status;
+}
+
+// Owns an OCI statement handle for the duration of one attempt. Needed
+// because several paths through this file throw -- apply_field_null_semantics
+// on an unexpected NULL, make_named_placeholders past the ORA-01795 cap,
+// substitute_marker on a missing marker -- and an explicit OCIHandleFree at
+// the end of a method is skipped entirely when the stack unwinds through it,
+// leaking one statement handle per throw over a long reporting batch.
+class StmtHandle {
+public:
+    StmtHandle() = default;
+    ~StmtHandle() { if (stmt_) OCIHandleFree(stmt_, OCI_HTYPE_STMT); }
+
+    StmtHandle(const StmtHandle&) = delete;
+    StmtHandle& operator=(const StmtHandle&) = delete;
+
+    sword alloc(OCIEnv* env) {
+        return OCIHandleAlloc(env, reinterpret_cast<void**>(&stmt_), OCI_HTYPE_STMT, 0, nullptr);
+    }
+
+    OCIStmt* get() const noexcept { return stmt_; }
+
+private:
+    OCIStmt* stmt_ = nullptr;
+};
+
+// Allocates and prepares in one checked step. A failure here (a null env
+// after a failed reconnect, a handle alloc that ran out, a statement the
+// server rejects at prepare) previously went unnoticed, and execution
+// continued on to OCIStmtExecute against a null or unprepared handle.
+inline sword prepare_statement(OciConnection& conn, StmtHandle& stmt, const std::string& sql) {
+    const sword alloc_status = stmt.alloc(conn.env());
+    if (alloc_status != OCI_SUCCESS) return alloc_status;
+    return OCIStmtPrepare(stmt.get(), conn.err(),
+                          reinterpret_cast<const text*>(sql.c_str()),
+                          static_cast<ub4>(sql.size()),
+                          OCI_NTV_SYNTAX, OCI_DEFAULT);
+}
 
 // Reads the raw bytes to bind/define for `value`: for a string-convertible
 // leaf, its content (pointer + length); for anything else, its own address
 // and size. Shared by the plain-field and the std::optional<value> cases.
 template <typename ValueType>
 std::pair<dvoid*, sb4> raw_bind_args(ValueType& value) {
-    if constexpr (std::is_convertible_v<ValueType, std::string_view>) {
+    if constexpr (is_fixed_string_v<ValueType>) {
+        // SQLT_CHR: explicit length, no null terminator, so the bound size is
+        // the content length, not the buffer capacity. Checked before the
+        // string_view branch below, which FixedString would otherwise match
+        // (it converts to string_view) and be bound as SQLT_STR with a
+        // trailing null it does not guarantee.
+        return { reinterpret_cast<dvoid*>(value.data()), static_cast<sb4>(value.length()) };
+    } else if constexpr (std::is_convertible_v<ValueType, std::string_view>) {
         std::string_view sv = value;
         // +1 for the trailing null: OciTypeBinder<std::string> binds as
         // SQLT_STR, which requires the null terminator to fall *within*
@@ -108,10 +178,11 @@ using staging_tuple_t = decltype(staging_tuple_type<T>(std::make_index_sequence<
 // is naturally already ordered/deduped by virtue of being a set, so
 // behaves the same either way.
 template <typename Container>
-void bind_named_container(OCIStmt* stmt, OciConnection& conn, Container& container,
+sword bind_named_container(OCIStmt* stmt, OciConnection& conn, Container& container,
                            std::string_view field_name, std::vector<sb2>& elem_indicators) {
     using ElemType = multi_bind_value_t<Container>;
     elem_indicators.assign(container.size(), OCI_IND_NOTNULL);
+    sword status = OCI_SUCCESS;
     std::size_t idx = 0;
     for (auto& elem : container) {
         const std::string placeholder = ":" + std::string(field_name) + "_" + std::to_string(idx);
@@ -121,19 +192,40 @@ void bind_named_container(OCIStmt* stmt, OciConnection& conn, Container& contain
         // the same read-only-through-a-mutable-pointer pattern raw_bind_args
         // already uses for std::string_view content.
         auto [value_ptr, bind_size] = raw_bind_args(const_cast<ElemType&>(elem));
-        OCIBindByName(stmt, &bind_handle, conn.err(),
+        record_status(status, OCIBindByName(stmt, &bind_handle, conn.err(),
                     reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
                     value_ptr, bind_size, oci_type_code_v<ElemType>,
-                    &elem_indicators[idx], nullptr, nullptr, 0, nullptr, OCI_DEFAULT);
+                    &elem_indicators[idx], nullptr, nullptr, 0, nullptr, OCI_DEFAULT));
+        if (status != OCI_SUCCESS) return status;
         ++idx;
     }
+    return status;
+}
+
+// Binds a FixedString<N> (or an optional's FixedString staging value): the
+// buffer capacity as the bound size, with the value's own length_ref() as
+// OCI's actual-length pointer. Capacity rather than content length so the
+// same bind also works as an OUT parameter (RETURNING ... INTO), where OCI
+// writes the returned value back through this pointer and treats the bound
+// size as the buffer it may fill. That is exactly what a raw std::string
+// cannot safely do, which is why an output bind needs this type.
+template <typename FixedStringType>
+sword bind_fixed_string(OCIStmt* stmt, OciConnection& conn, FixedStringType& value,
+                         const std::string& placeholder, sb2* indicator) {
+    OCIBind* bind_handle = nullptr;
+    return OCIBindByName(stmt, &bind_handle, conn.err(),
+                reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
+                reinterpret_cast<dvoid*>(value.data()), static_cast<sb4>(FixedStringType::capacity),
+                oci_type_code_v<FixedStringType>, indicator,
+                &value.length_ref(), nullptr, 0, nullptr, OCI_DEFAULT);
 }
 
 template <std::size_t I, bindable T>
-void bind_one_field(OCIStmt* stmt, OciConnection& conn, T& row,
+void bind_one_field(sword& status, OCIStmt* stmt, OciConnection& conn, T& row,
                      std::vector<OCILobLocator**>& active_locators,
                      std::vector<sb2>& indicators, std::vector<std::vector<sb2>>& container_indicators,
                      staging_tuple_t<T>& staging, std::string_view field_name) {
+    if (status != OCI_SUCCESS) return; // an earlier field already failed
     using FieldType = boost::pfr::tuple_element_t<I, T>;
     auto& field = boost::pfr::get<I>(row);
     const std::string placeholder = ":" + std::string(field_name);
@@ -141,10 +233,24 @@ void bind_one_field(OCIStmt* stmt, OciConnection& conn, T& row,
     indicators[I] = OCI_IND_NOTNULL;
 
     if constexpr (is_multi_bind_container_v<FieldType>) {
-        bind_named_container(stmt, conn, field, field_name, container_indicators[I]);
+        record_status(status, bind_named_container(stmt, conn, field, field_name, container_indicators[I]));
     } else if constexpr (is_oci_lob_v<FieldType>) {
-        OCIDescriptorAlloc(conn.env(), reinterpret_cast<void**>(&field.locator), OCI_DTYPE_LOB, 0, nullptr);
+        record_status(status, OCIDescriptorAlloc(conn.env(), reinterpret_cast<void**>(&field.locator),
+                                                 OCI_DTYPE_LOB, 0, nullptr));
+        if (status != OCI_SUCCESS) return;
         active_locators.push_back(&field.locator);
+
+        // A descriptor straight out of OCIDescriptorAlloc is not yet a usable
+        // LOB -- it has no underlying storage, and OCILobWrite2 against one
+        // fails on a real database (ORA-22275, invalid LOB locator). Writing
+        // an inbound LOB needs either a locator fetched from the row
+        // (EMPTY_CLOB() + RETURNING ... INTO, or SELECT ... FOR UPDATE) or a
+        // temporary LOB, which is what this creates and binds. Released in
+        // free_locators / drain_lobs below.
+        record_status(status, OCILobCreateTemporary(conn.svc(), conn.err(), field.locator,
+                                                    OCI_DEFAULT, SQLCS_IMPLICIT, OCI_TEMP_CLOB,
+                                                    0, OCI_DURATION_SESSION));
+        if (status != OCI_SUCCESS) return;
 
         std::string& buffer = [&]() -> std::string& {
             if constexpr (std::is_same_v<FieldType, OciClob>) return field.text_data;
@@ -154,15 +260,19 @@ void bind_one_field(OCIStmt* stmt, OciConnection& conn, T& row,
         if (!buffer.empty()) {
             oraub8 bytes_written = 0;
             oraub8 chars_written = 0;
-            OCILobWrite2(conn.svc(), conn.err(), field.locator, &bytes_written, &chars_written, 1,
-                         reinterpret_cast<dvoid*>(buffer.data()), buffer.size(), OCI_ONE_PIECE,
-                         nullptr, nullptr, 0, 0);
+            record_status(status,
+                OCILobWrite2(conn.svc(), conn.err(), field.locator, &bytes_written, &chars_written, 1,
+                             reinterpret_cast<dvoid*>(buffer.data()), buffer.size(), OCI_ONE_PIECE,
+                             nullptr, nullptr, 0, 0));
+            if (status != OCI_SUCCESS) return;
         }
 
-        OCIBindByName(stmt, &bind_handle, conn.err(),
+        record_status(status, OCIBindByName(stmt, &bind_handle, conn.err(),
                     reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
                     reinterpret_cast<dvoid*>(&field.locator), sizeof(OCILobLocator*),
-                    oci_type_code_v<FieldType>, &indicators[I], nullptr, nullptr, 0, nullptr, OCI_DEFAULT);
+                    oci_type_code_v<FieldType>, &indicators[I], nullptr, nullptr, 0, nullptr, OCI_DEFAULT));
+    } else if constexpr (is_fixed_string_v<FieldType>) {
+        record_status(status, bind_fixed_string(stmt, conn, field, placeholder, &indicators[I]));
     } else if constexpr (is_optional_v<FieldType>) {
         auto& stage = std::get<I>(staging);
         if (field.has_value()) {
@@ -172,27 +282,34 @@ void bind_one_field(OCIStmt* stmt, OciConnection& conn, T& row,
             stage = {};
             indicators[I] = OCI_IND_NULL;
         }
-        auto [value_ptr, bind_size] = raw_bind_args(stage);
-        OCIBindByName(stmt, &bind_handle, conn.err(),
-                    reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
-                    value_ptr, bind_size, oci_type_code_v<FieldType>,
-                    &indicators[I], nullptr, nullptr, 0, nullptr, OCI_DEFAULT);
+        if constexpr (is_fixed_string_v<optional_value_t<FieldType>>) {
+            record_status(status, bind_fixed_string(stmt, conn, stage, placeholder, &indicators[I]));
+        } else {
+            auto [value_ptr, bind_size] = raw_bind_args(stage);
+            record_status(status, OCIBindByName(stmt, &bind_handle, conn.err(),
+                        reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
+                        value_ptr, bind_size, oci_type_code_v<FieldType>,
+                        &indicators[I], nullptr, nullptr, 0, nullptr, OCI_DEFAULT));
+        }
     } else {
         auto [value_ptr, bind_size] = raw_bind_args(field);
-        OCIBindByName(stmt, &bind_handle, conn.err(),
+        record_status(status, OCIBindByName(stmt, &bind_handle, conn.err(),
                     reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
                     value_ptr, bind_size, oci_type_code_v<FieldType>,
-                    &indicators[I], nullptr, nullptr, 0, nullptr, OCI_DEFAULT);
+                    &indicators[I], nullptr, nullptr, 0, nullptr, OCI_DEFAULT));
     }
 }
 
 template <bindable T, std::size_t... Is>
-void bind_fields_impl(OCIStmt* stmt, OciConnection& conn, T& row,
+sword bind_fields_impl(OCIStmt* stmt, OciConnection& conn, T& row,
                        std::vector<OCILobLocator**>& active_locators,
                        std::vector<sb2>& indicators, std::vector<std::vector<sb2>>& container_indicators,
                        staging_tuple_t<T>& staging, std::index_sequence<Is...>) {
     constexpr auto names = boost::pfr::names_as_array<T>();
-    (bind_one_field<Is>(stmt, conn, row, active_locators, indicators, container_indicators, staging, names[Is]), ...);
+    sword status = OCI_SUCCESS;
+    (bind_one_field<Is>(status, stmt, conn, row, active_locators, indicators, container_indicators,
+                        staging, names[Is]), ...);
+    return status;
 }
 
 // Binds every field of `row` as a named IN parameter (OCIBindByName) using
@@ -209,11 +326,11 @@ void bind_fields_impl(OCIStmt* stmt, OciConnection& conn, T& row,
 // IN-list instead of a single value -- see bind_named_container and
 // substitute_container_markers.
 template <bindable T>
-void bind_fields(OCIStmt* stmt, OciConnection& conn, T& row,
+sword bind_fields(OCIStmt* stmt, OciConnection& conn, T& row,
                   std::vector<OCILobLocator**>& active_locators,
                   std::vector<sb2>& indicators, std::vector<std::vector<sb2>>& container_indicators,
                   staging_tuple_t<T>& staging) {
-    bind_fields_impl(stmt, conn, row, active_locators, indicators, container_indicators, staging,
+    return bind_fields_impl(stmt, conn, row, active_locators, indicators, container_indicators, staging,
                       std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
 }
 
@@ -230,19 +347,25 @@ void bind_fields(OCIStmt* stmt, OciConnection& conn, T& row,
 // See the doc comment on OciClient::insert(vector<T>&) in oci_client.h
 // for exactly which field kinds this does and doesn't support and why.
 template <std::size_t I, bindable T>
-void bind_one_field_array(OCIStmt* stmt, OciConnection& conn, std::vector<T>& rows,
+void bind_one_field_array(sword& status, OCIStmt* stmt, OciConnection& conn, std::vector<T>& rows,
                            std::vector<std::vector<sb2>>& field_indicators, std::string_view field_name) {
     using FieldType = boost::pfr::tuple_element_t<I, T>;
     static_assert(!is_oci_lob_v<FieldType>,
                   "LOB fields are not supported in bulk insert(vector<T>&) yet -- array-binding "
                   "a LOB column needs a per-row array of LOB locators, not implemented here; "
                   "insert(conn, query_text, T&) in a loop for a LOB-bearing row type instead.");
-    static_assert(!std::is_convertible_v<FieldType, std::string_view> &&
-                  !(is_optional_v<FieldType> && std::is_convertible_v<optional_value_t<FieldType>, std::string_view>),
-                  "std::string fields are not supported in bulk insert(vector<T>&) yet -- a "
+    // FixedString<N> is exempt from the string restriction below: unlike
+    // std::string, its characters live inline in T at a fixed offset, which
+    // is exactly what a fixed-stride array bind needs. Its per-row length
+    // travels through OCIBindArrayOfStruct's alskip the same way.
+    static_assert(is_fixed_string_v<FieldType> ||
+                  (!std::is_convertible_v<FieldType, std::string_view> &&
+                   !(is_optional_v<FieldType> && std::is_convertible_v<optional_value_t<FieldType>, std::string_view>)),
+                  "std::string fields are not supported in bulk insert(vector<T>&) -- a "
                   "string's characters live in its own heap/SSO storage, not inline in T at a "
-                  "fixed stride, which a real Oracle array bind needs; a fixed-capacity string "
-                  "type (see oci_fixed_string.h) would work here once it's wired in.");
+                  "fixed stride, which a real Oracle array bind needs. Declare the field as "
+                  "FixedString<N> (binding/oci_fixed_string.h) to bulk-insert a CHAR/VARCHAR2 "
+                  "column, or insert(conn, query_text, T&) in a loop.");
     static_assert(!is_multi_bind_container_v<FieldType>,
                   "a vector/set/valarray field has no per-row bulk-insert meaning -- it's a "
                   "single query's dynamic IN-list, not a per-row column value.");
@@ -253,30 +376,49 @@ void bind_one_field_array(OCIStmt* stmt, OciConnection& conn, std::vector<T>& ro
                   "consistent across rows; use insert(conn, query_text, T&) in a loop for a "
                   "row type with a nullable field instead.");
 
+    if (status != OCI_SUCCESS) return; // an earlier field already failed
+
     auto& indicators = field_indicators[I];
     indicators.assign(rows.size(), OCI_IND_NOTNULL);
 
     const std::string placeholder = ":" + std::string(field_name);
     OCIBind* bind_handle = nullptr;
-    OCIBindByName(stmt, &bind_handle, conn.err(),
-                reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
-                reinterpret_cast<dvoid*>(&boost::pfr::get<I>(rows[0])), static_cast<sb4>(sizeof(FieldType)),
-                oci_type_code_v<FieldType>, indicators.data(), nullptr, nullptr, 0, nullptr, OCI_DEFAULT);
-    OCIBindArrayOfStruct(bind_handle, conn.err(),
-                          static_cast<ub4>(sizeof(T)), static_cast<ub4>(sizeof(sb2)), 0, 0);
+
+    if constexpr (is_fixed_string_v<FieldType>) {
+        auto& first = boost::pfr::get<I>(rows[0]);
+        record_status(status, OCIBindByName(stmt, &bind_handle, conn.err(),
+                    reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
+                    reinterpret_cast<dvoid*>(first.data()), static_cast<sb4>(FieldType::capacity),
+                    oci_type_code_v<FieldType>, indicators.data(),
+                    &first.length_ref(), nullptr, 0, nullptr, OCI_DEFAULT));
+        // alskip = sizeof(T): each row's own length_ field sits inside its own
+        // FixedString, one whole row apart from the previous row's.
+        record_status(status, OCIBindArrayOfStruct(bind_handle, conn.err(),
+                              static_cast<ub4>(sizeof(T)), static_cast<ub4>(sizeof(sb2)),
+                              static_cast<ub4>(sizeof(T)), 0));
+    } else {
+        record_status(status, OCIBindByName(stmt, &bind_handle, conn.err(),
+                    reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
+                    reinterpret_cast<dvoid*>(&boost::pfr::get<I>(rows[0])), static_cast<sb4>(sizeof(FieldType)),
+                    oci_type_code_v<FieldType>, indicators.data(), nullptr, nullptr, 0, nullptr, OCI_DEFAULT));
+        record_status(status, OCIBindArrayOfStruct(bind_handle, conn.err(),
+                              static_cast<ub4>(sizeof(T)), static_cast<ub4>(sizeof(sb2)), 0, 0));
+    }
 }
 
 template <bindable T, std::size_t... Is>
-void bind_fields_array_impl(OCIStmt* stmt, OciConnection& conn, std::vector<T>& rows,
+sword bind_fields_array_impl(OCIStmt* stmt, OciConnection& conn, std::vector<T>& rows,
                              std::vector<std::vector<sb2>>& field_indicators, std::index_sequence<Is...>) {
     constexpr auto names = boost::pfr::names_as_array<T>();
-    (bind_one_field_array<Is>(stmt, conn, rows, field_indicators, names[Is]), ...);
+    sword status = OCI_SUCCESS;
+    (bind_one_field_array<Is>(status, stmt, conn, rows, field_indicators, names[Is]), ...);
+    return status;
 }
 
 template <bindable T>
-void bind_fields_array(OCIStmt* stmt, OciConnection& conn, std::vector<T>& rows,
+sword bind_fields_array(OCIStmt* stmt, OciConnection& conn, std::vector<T>& rows,
                         std::vector<std::vector<sb2>>& field_indicators) {
-    bind_fields_array_impl(stmt, conn, rows, field_indicators,
+    return bind_fields_array_impl(stmt, conn, rows, field_indicators,
                             std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
 }
 
@@ -306,6 +448,12 @@ void drain_lobs(OciConnection& conn, T& row) {
                 } else {
                     target.clear();
                 }
+                // Bound LOBs are temporary LOBs (see bind_one_field), so the
+                // server-side temporary has to be released before the
+                // descriptor itself is freed -- otherwise it lives until the
+                // session ends, which for a long batch means the temporary
+                // LOB tablespace grows for the whole run.
+                OCILobFreeTemporary(conn.svc(), conn.err(), field.locator);
                 OCIDescriptorFree(reinterpret_cast<void*>(field.locator), OCI_DTYPE_LOB);
                 field.locator = nullptr;
             }
@@ -313,15 +461,36 @@ void drain_lobs(OciConnection& conn, T& row) {
     });
 }
 
-inline void free_locators(std::vector<OCILobLocator**>& active_locators) {
+inline void free_locators(OciConnection& conn, std::vector<OCILobLocator**>& active_locators) {
     for (auto* loc : active_locators) {
         if (*loc) {
+            OCILobFreeTemporary(conn.svc(), conn.err(), *loc); // see drain_lobs
             OCIDescriptorFree(reinterpret_cast<void*>(*loc), OCI_DTYPE_LOB);
             *loc = nullptr;
         }
     }
     active_locators.clear();
 }
+
+// Releases whatever an attempt allocated for a bind struct's LOB fields on
+// any exit path, including a throw out of the middle of a bind or fetch.
+class LocatorGuard {
+public:
+    LocatorGuard(OciConnection& conn, std::vector<OCILobLocator**>& locators)
+        : conn_(conn), locators_(locators) {}
+    ~LocatorGuard() { free_locators(conn_, locators_); }
+
+    LocatorGuard(const LocatorGuard&) = delete;
+    LocatorGuard& operator=(const LocatorGuard&) = delete;
+
+    // Hands ownership back when the caller has already drained the LOBs
+    // itself (drain_lobs frees each descriptor as it reads it back).
+    void release() { locators_.clear(); }
+
+private:
+    OciConnection& conn_;
+    std::vector<OCILobLocator**>& locators_;
+};
 
 // ---- define (select(): SELECT columns -> struct, as an array-of-struct
 // fetch -- see docs/in_list_binding.md's sibling discussion for why this
@@ -364,21 +533,34 @@ using batch_staging_tuple_t = decltype(batch_staging_tuple_type<T>(std::make_ind
 // the batch). Same field-kind restrictions as the bind side's array
 // helper, for the same reasons -- see oci_client.h's select() doc comment.
 template <std::size_t I, bindable T>
-void define_one_field_array(OCIStmt* stmt, OciConnection& conn, std::vector<T>& batch,
+void define_one_field_array(sword& status, OCIStmt* stmt, OciConnection& conn, std::vector<T>& batch,
                              std::vector<std::vector<sb2>>& field_indicators,
                              batch_staging_tuple_t<T>& batch_staging) {
     using FieldType = boost::pfr::tuple_element_t<I, T>;
+    // A FixedString<N> column (optionally wrapped in std::optional) is the
+    // supported way to fetch a CHAR/VARCHAR2 -- N is the fixed maximum output
+    // buffer size OCI needs up front, which is precisely what std::string
+    // cannot supply.
+    static constexpr bool fetches_as_fixed_string =
+        is_fixed_string_v<FieldType> ||
+        (is_optional_v<FieldType> && is_fixed_string_v<optional_value_t<FieldType>>);
+
     static_assert(!is_oci_lob_v<FieldType>,
                   "LOB columns are not supported in select() result rows yet");
-    static_assert(!std::is_convertible_v<FieldType, std::string_view> &&
-                  !(is_optional_v<FieldType> && std::is_convertible_v<optional_value_t<FieldType>, std::string_view>),
-                  "string columns are not supported in select() result rows yet -- OCI needs a "
-                  "fixed max output buffer size to define into, which this minimal client "
-                  "doesn't manage. Bind side (execute()/insert()) supports std::string fine.");
+    static_assert(fetches_as_fixed_string ||
+                  (!std::is_convertible_v<FieldType, std::string_view> &&
+                   !(is_optional_v<FieldType> && std::is_convertible_v<optional_value_t<FieldType>, std::string_view>)),
+                  "std::string columns are not supported in select() result rows -- OCI needs a "
+                  "fixed max output buffer size to define into before it knows how long the "
+                  "value is. Declare the field as FixedString<N> (binding/oci_fixed_string.h), "
+                  "or std::optional<FixedString<N>> for a nullable column. The bind side "
+                  "(execute()/insert()) still takes std::string fine.");
     static_assert(!is_multi_bind_container_v<FieldType>,
                   "vector/set/valarray fields are an execute()/insert() input-side concept only "
                   "(a dynamic multi-value IN-list parameter) -- a single result column can't "
                   "fetch into a variable-length container; that's multiple rows, not one field.");
+
+    if (status != OCI_SUCCESS) return; // an earlier column already failed
 
     constexpr ub4 position = I + 1;
     auto& indicators = field_indicators[I];
@@ -389,32 +571,55 @@ void define_one_field_array(OCIStmt* stmt, OciConnection& conn, std::vector<T>& 
         using ElemType = optional_value_t<FieldType>;
         auto& stage = std::get<I>(batch_staging);
         stage.assign(batch.size(), ElemType{});
-        OCIDefineByPos(stmt, &define_handle, conn.err(), position,
-                      reinterpret_cast<dvoid*>(stage.data()), static_cast<sb4>(sizeof(ElemType)),
-                      oci_type_code_v<FieldType>, indicators.data(), nullptr, nullptr, OCI_DEFAULT);
-        OCIDefineArrayOfStruct(define_handle, conn.err(),
-                                static_cast<ub4>(sizeof(ElemType)), static_cast<ub4>(sizeof(sb2)), 0, 0);
+        if constexpr (is_fixed_string_v<ElemType>) {
+            record_status(status, OCIDefineByPos(stmt, &define_handle, conn.err(), position,
+                          reinterpret_cast<dvoid*>(stage[0].data()), static_cast<sb4>(ElemType::capacity),
+                          oci_type_code_v<FieldType>, indicators.data(),
+                          &stage[0].length_ref(), nullptr, OCI_DEFAULT));
+            record_status(status, OCIDefineArrayOfStruct(define_handle, conn.err(),
+                                    static_cast<ub4>(sizeof(ElemType)), static_cast<ub4>(sizeof(sb2)),
+                                    static_cast<ub4>(sizeof(ElemType)), 0));
+        } else {
+            record_status(status, OCIDefineByPos(stmt, &define_handle, conn.err(), position,
+                          reinterpret_cast<dvoid*>(stage.data()), static_cast<sb4>(sizeof(ElemType)),
+                          oci_type_code_v<FieldType>, indicators.data(), nullptr, nullptr, OCI_DEFAULT));
+            record_status(status, OCIDefineArrayOfStruct(define_handle, conn.err(),
+                                    static_cast<ub4>(sizeof(ElemType)), static_cast<ub4>(sizeof(sb2)), 0, 0));
+        }
+    } else if constexpr (is_fixed_string_v<FieldType>) {
+        auto& first = boost::pfr::get<I>(batch[0]);
+        // rlskip = sizeof(T): OCI reports each row's fetched length into that
+        // row's own FixedString::length_, one whole row apart.
+        record_status(status, OCIDefineByPos(stmt, &define_handle, conn.err(), position,
+                      reinterpret_cast<dvoid*>(first.data()), static_cast<sb4>(FieldType::capacity),
+                      oci_type_code_v<FieldType>, indicators.data(),
+                      &first.length_ref(), nullptr, OCI_DEFAULT));
+        record_status(status, OCIDefineArrayOfStruct(define_handle, conn.err(),
+                                static_cast<ub4>(sizeof(T)), static_cast<ub4>(sizeof(sb2)),
+                                static_cast<ub4>(sizeof(T)), 0));
     } else {
-        OCIDefineByPos(stmt, &define_handle, conn.err(), position,
+        record_status(status, OCIDefineByPos(stmt, &define_handle, conn.err(), position,
                       reinterpret_cast<dvoid*>(&boost::pfr::get<I>(batch[0])), static_cast<sb4>(sizeof(FieldType)),
-                      oci_type_code_v<FieldType>, indicators.data(), nullptr, nullptr, OCI_DEFAULT);
-        OCIDefineArrayOfStruct(define_handle, conn.err(),
-                                static_cast<ub4>(sizeof(T)), static_cast<ub4>(sizeof(sb2)), 0, 0);
+                      oci_type_code_v<FieldType>, indicators.data(), nullptr, nullptr, OCI_DEFAULT));
+        record_status(status, OCIDefineArrayOfStruct(define_handle, conn.err(),
+                                static_cast<ub4>(sizeof(T)), static_cast<ub4>(sizeof(sb2)), 0, 0));
     }
 }
 
 template <bindable T, std::size_t... Is>
-void define_fields_array_impl(OCIStmt* stmt, OciConnection& conn, std::vector<T>& batch,
+sword define_fields_array_impl(OCIStmt* stmt, OciConnection& conn, std::vector<T>& batch,
                                std::vector<std::vector<sb2>>& field_indicators,
                                batch_staging_tuple_t<T>& batch_staging, std::index_sequence<Is...>) {
-    (define_one_field_array<Is>(stmt, conn, batch, field_indicators, batch_staging), ...);
+    sword status = OCI_SUCCESS;
+    (define_one_field_array<Is>(status, stmt, conn, batch, field_indicators, batch_staging), ...);
+    return status;
 }
 
 template <bindable T>
-void define_fields_array(OCIStmt* stmt, OciConnection& conn, std::vector<T>& batch,
+sword define_fields_array(OCIStmt* stmt, OciConnection& conn, std::vector<T>& batch,
                           std::vector<std::vector<sb2>>& field_indicators,
                           batch_staging_tuple_t<T>& batch_staging) {
-    define_fields_array_impl(stmt, conn, batch, field_indicators, batch_staging,
+    return define_fields_array_impl(stmt, conn, batch, field_indicators, batch_staging,
                               std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
 }
 
@@ -506,14 +711,22 @@ std::string substitute_container_markers(const std::string& query_text, const T&
 template <bindable OutputT>
 OciOutcome run_select_fetch_loop(OciConnection& conn, OCIStmt* stmt, std::vector<OutputT>& results) {
     ub4 prefetch_rows = static_cast<ub4>(kSelectBatchRows);
-    OCIAttrSet(stmt, OCI_HTYPE_STMT, &prefetch_rows, 0, OCI_ATTR_PREFETCH_ROWS, conn.err());
+    sword status = OCIAttrSet(stmt, OCI_HTYPE_STMT, &prefetch_rows, 0, OCI_ATTR_PREFETCH_ROWS, conn.err());
+    if (status != OCI_SUCCESS) {
+        return {false, status};
+    }
 
     std::vector<OutputT> batch(kSelectBatchRows);
     std::vector<std::vector<sb2>> field_indicators(boost::pfr::tuple_size_v<OutputT>);
     batch_staging_tuple_t<OutputT> batch_staging{};
-    define_fields_array(stmt, conn, batch, field_indicators, batch_staging);
+    // A failed define leaves a column pointing nowhere; fetching into it
+    // afterwards is what turns a recoverable error into a corrupt row.
+    status = define_fields_array(stmt, conn, batch, field_indicators, batch_staging);
+    if (status != OCI_SUCCESS) {
+        return {false, status};
+    }
 
-    sword status = OCIStmtExecute(conn.svc(), stmt, conn.err(), 0, 0, nullptr, nullptr, OCI_DEFAULT);
+    status = OCIStmtExecute(conn.svc(), stmt, conn.err(), 0, 0, nullptr, nullptr, OCI_DEFAULT);
     if (status != OCI_SUCCESS) {
         return {false, status};
     }
@@ -534,7 +747,14 @@ OciOutcome run_select_fetch_loop(OciConnection& conn, OCIStmt* stmt, std::vector
         // final all-zero OCI_NO_DATA call follows a full OCI_SUCCESS batch.
         ub4 rows_fetched = 0;
         ub4 attr_size = sizeof(rows_fetched);
-        OCIAttrGet(stmt, OCI_HTYPE_STMT, &rows_fetched, &attr_size, OCI_ATTR_ROWS_FETCHED, conn.err());
+        const sword attr_status =
+            OCIAttrGet(stmt, OCI_HTYPE_STMT, &rows_fetched, &attr_size, OCI_ATTR_ROWS_FETCHED, conn.err());
+        if (attr_status != OCI_SUCCESS) {
+            // Without a trustworthy count there is no way to know how much of
+            // `batch` OCI actually wrote, so appending any of it would append
+            // stale rows from the previous batch.
+            return {false, attr_status};
+        }
 
         for (ub4 i = 0; i < rows_fetched; ++i) {
             apply_null_semantics_after_fetch_array(batch[i], i, field_indicators, batch_staging,
@@ -591,15 +811,13 @@ bool OciClient::select(OciConnection& conn, const std::string& query_text,
 }
 
 inline OciOutcome OciClient::run_execute_once(OciConnection& conn, const std::string& query_text) {
-    OCIStmt* stmt = nullptr;
-    OCIHandleAlloc(conn.env(), reinterpret_cast<void**>(&stmt), OCI_HTYPE_STMT, 0, nullptr);
-    OCIStmtPrepare(stmt, conn.err(),
-                   reinterpret_cast<const text*>(query_text.c_str()),
-                   static_cast<ub4>(query_text.size()),
-                   OCI_NTV_SYNTAX, OCI_DEFAULT);
+    detail::StmtHandle stmt;
+    const sword prepare_status = detail::prepare_statement(conn, stmt, query_text);
+    if (prepare_status != OCI_SUCCESS) {
+        return {false, prepare_status};
+    }
 
-    const sword status = OCIStmtExecute(conn.svc(), stmt, conn.err(), 1, 0, nullptr, nullptr, OCI_DEFAULT);
-    OCIHandleFree(stmt, OCI_HTYPE_STMT);
+    const sword status = OCIStmtExecute(conn.svc(), stmt.get(), conn.err(), 1, 0, nullptr, nullptr, OCI_DEFAULT);
     return {status == OCI_SUCCESS, status};
 }
 
@@ -611,49 +829,51 @@ OciOutcome OciClient::run_execute_once(OciConnection& conn, const std::string& q
     // (and cheap) to call unconditionally.
     const std::string sql = detail::substitute_container_markers(query_text, bind_struct);
 
-    OCIStmt* stmt = nullptr;
-    OCIHandleAlloc(conn.env(), reinterpret_cast<void**>(&stmt), OCI_HTYPE_STMT, 0, nullptr);
-
-    OCIStmtPrepare(stmt, conn.err(),
-                   reinterpret_cast<const text*>(sql.c_str()),
-                   static_cast<ub4>(sql.size()),
-                   OCI_NTV_SYNTAX, OCI_DEFAULT);
+    detail::StmtHandle stmt;
+    const sword prepare_status = detail::prepare_statement(conn, stmt, sql);
+    if (prepare_status != OCI_SUCCESS) {
+        return {false, prepare_status};
+    }
 
     std::vector<OCILobLocator**> active_locators;
+    detail::LocatorGuard locator_guard(conn, active_locators);
     std::vector<sb2> indicators(boost::pfr::tuple_size_v<T>, OCI_IND_NOTNULL);
     std::vector<std::vector<sb2>> container_indicators(boost::pfr::tuple_size_v<T>);
     detail::staging_tuple_t<T> staging{};
-    detail::bind_fields(stmt, conn, bind_struct, active_locators, indicators, container_indicators, staging);
+    const sword bind_status =
+        detail::bind_fields(stmt.get(), conn, bind_struct, active_locators, indicators, container_indicators, staging);
+    if (bind_status != OCI_SUCCESS) {
+        return {false, bind_status};
+    }
 
-    const sword status = OCIStmtExecute(conn.svc(), stmt, conn.err(), 1, 0, nullptr, nullptr, OCI_DEFAULT);
+    const sword status = OCIStmtExecute(conn.svc(), stmt.get(), conn.err(), 1, 0, nullptr, nullptr, OCI_DEFAULT);
 
     if (status == OCI_SUCCESS) {
-        detail::drain_lobs(conn, bind_struct);
-        OCIHandleFree(stmt, OCI_HTYPE_STMT);
+        detail::drain_lobs(conn, bind_struct); // frees each locator as it reads it back
+        locator_guard.release();
         return {true, status};
     }
 
-    detail::free_locators(active_locators);
-    OCIHandleFree(stmt, OCI_HTYPE_STMT);
     return {false, status};
 }
 
 template <bindable T>
 OciOutcome OciClient::run_insert_array_once(OciConnection& conn, const std::string& query_text,
                                              std::vector<T>& rows) {
-    OCIStmt* stmt = nullptr;
-    OCIHandleAlloc(conn.env(), reinterpret_cast<void**>(&stmt), OCI_HTYPE_STMT, 0, nullptr);
-    OCIStmtPrepare(stmt, conn.err(),
-                   reinterpret_cast<const text*>(query_text.c_str()),
-                   static_cast<ub4>(query_text.size()),
-                   OCI_NTV_SYNTAX, OCI_DEFAULT);
+    detail::StmtHandle stmt;
+    const sword prepare_status = detail::prepare_statement(conn, stmt, query_text);
+    if (prepare_status != OCI_SUCCESS) {
+        return {false, prepare_status};
+    }
 
     std::vector<std::vector<sb2>> field_indicators(boost::pfr::tuple_size_v<T>);
-    detail::bind_fields_array(stmt, conn, rows, field_indicators);
+    const sword bind_status = detail::bind_fields_array(stmt.get(), conn, rows, field_indicators);
+    if (bind_status != OCI_SUCCESS) {
+        return {false, bind_status};
+    }
 
-    const sword status = OCIStmtExecute(conn.svc(), stmt, conn.err(),
+    const sword status = OCIStmtExecute(conn.svc(), stmt.get(), conn.err(),
                                          static_cast<ub4>(rows.size()), 0, nullptr, nullptr, OCI_DEFAULT);
-    OCIHandleFree(stmt, OCI_HTYPE_STMT);
     return {status == OCI_SUCCESS, status};
 }
 
@@ -662,16 +882,13 @@ OciOutcome OciClient::run_select_once(OciConnection& conn, const std::string& qu
                                        std::vector<OutputT>& results) {
     results.clear();
 
-    OCIStmt* stmt = nullptr;
-    OCIHandleAlloc(conn.env(), reinterpret_cast<void**>(&stmt), OCI_HTYPE_STMT, 0, nullptr);
-    OCIStmtPrepare(stmt, conn.err(),
-                   reinterpret_cast<const text*>(query_text.c_str()),
-                   static_cast<ub4>(query_text.size()),
-                   OCI_NTV_SYNTAX, OCI_DEFAULT);
+    detail::StmtHandle stmt;
+    const sword prepare_status = detail::prepare_statement(conn, stmt, query_text);
+    if (prepare_status != OCI_SUCCESS) {
+        return {false, prepare_status};
+    }
 
-    const OciOutcome outcome = detail::run_select_fetch_loop(conn, stmt, results);
-    OCIHandleFree(stmt, OCI_HTYPE_STMT);
-    return outcome;
+    return detail::run_select_fetch_loop(conn, stmt.get(), results);
 }
 
 // Same as the no-input overload above, but also binds `input`'s fields as
@@ -687,24 +904,24 @@ OciOutcome OciClient::run_select_once(OciConnection& conn, const std::string& qu
 
     const std::string sql = detail::substitute_container_markers(query_text, input);
 
-    OCIStmt* stmt = nullptr;
-    OCIHandleAlloc(conn.env(), reinterpret_cast<void**>(&stmt), OCI_HTYPE_STMT, 0, nullptr);
-    OCIStmtPrepare(stmt, conn.err(),
-                   reinterpret_cast<const text*>(sql.c_str()),
-                   static_cast<ub4>(sql.size()),
-                   OCI_NTV_SYNTAX, OCI_DEFAULT);
+    detail::StmtHandle stmt;
+    const sword prepare_status = detail::prepare_statement(conn, stmt, sql);
+    if (prepare_status != OCI_SUCCESS) {
+        return {false, prepare_status};
+    }
 
     std::vector<OCILobLocator**> input_locators;
+    detail::LocatorGuard locator_guard(conn, input_locators);
     std::vector<sb2> input_indicators(boost::pfr::tuple_size_v<InputT>, OCI_IND_NOTNULL);
     std::vector<std::vector<sb2>> input_container_indicators(boost::pfr::tuple_size_v<InputT>);
     detail::staging_tuple_t<InputT> input_staging{};
-    detail::bind_fields(stmt, conn, input, input_locators, input_indicators, input_container_indicators, input_staging);
+    const sword bind_status = detail::bind_fields(stmt.get(), conn, input, input_locators,
+                                                  input_indicators, input_container_indicators, input_staging);
+    if (bind_status != OCI_SUCCESS) {
+        return {false, bind_status};
+    }
 
-    const OciOutcome outcome = detail::run_select_fetch_loop(conn, stmt, results);
-
-    detail::free_locators(input_locators);
-    OCIHandleFree(stmt, OCI_HTYPE_STMT);
-    return outcome;
+    return detail::run_select_fetch_loop(conn, stmt.get(), results);
 }
 
 } // namespace binding
