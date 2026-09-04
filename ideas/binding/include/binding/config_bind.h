@@ -40,14 +40,16 @@ inline std::string to_lower(std::string_view s) {
 
 namespace detail {
 
-// Strict is a compile-time flag (a plain bool, not a runtime parameter)
-// threaded through every level of recursion -- see bind_from_fields_strict
-// (the public opt-in entry point, at the bottom of this file) for why this
-// is off by default rather than always-on, matching how .NET's
-// ConfigurationBinder.Bind() only rejects unrecognized keys when
-// BinderOptions.ErrorOnUnknownConfiguration is explicitly turned on.
-template <bool Strict, config_schema T>
-void bind_from_fields_impl(const FieldList& fields, T& out);
+// `strict` is a runtime bool, deliberately, threaded through every level
+// of recursion -- see bind_from_fields's `strict` parameter (the public
+// entry point, at the bottom of this file) for why this can't be a
+// compile-time flag: that would bake the choice into the compiled
+// binary, so relaxing validation for a config with legitimate leftover
+// keys would need a recompile, not a config or deployment change. This
+// matches how .NET's actual BinderOptions.ErrorOnUnknownConfiguration
+// works too -- a runtime property, not a template parameter.
+template <config_schema T>
+void bind_from_fields_impl(const FieldList& fields, T& out, bool strict);
 
 // Case-insensitive name -> Field* index over one FieldList level, built once
 // per bind_from_fields() call rather than re-scanning `fields` linearly for
@@ -213,8 +215,8 @@ void parse_leaf_value(const LeafValue& raw, T& out, std::string_view field_name)
     }, raw);
 }
 
-template <std::size_t I, bool Strict, typename IndexT, config_schema T>
-void bind_one_field(const IndexT& index, T& out, std::string_view name) {
+template <std::size_t I, typename IndexT, config_schema T>
+void bind_one_field(const IndexT& index, T& out, std::string_view name, bool strict) {
     using FieldType = boost::pfr::tuple_element_t<I, T>;
     auto& field = boost::pfr::get<I>(out);
 
@@ -253,7 +255,7 @@ void bind_one_field(const IndexT& index, T& out, std::string_view name) {
                     throw std::runtime_error("binding: field '" + std::string(name) + "' expected a nested structure");
                 }
                 ElemType elem{};
-                bind_from_fields_impl<Strict>(f->as_struct(), elem);
+                bind_from_fields_impl(f->as_struct(), elem, strict);
                 field.push_back(std::move(elem));
             }
         }
@@ -276,24 +278,24 @@ void bind_one_field(const IndexT& index, T& out, std::string_view name) {
         if (!f->is_struct()) {
             throw std::runtime_error("binding: field '" + std::string(name) + "' expected a nested structure");
         }
-        bind_from_fields_impl<Strict>(f->as_struct(), field);
+        bind_from_fields_impl(f->as_struct(), field, strict);
     }
 }
 
-template <bool Strict, typename IndexT, config_schema T, std::size_t... Is>
-void bind_all_fields(const IndexT& index, T& out, std::index_sequence<Is...>) {
+template <typename IndexT, config_schema T, std::size_t... Is>
+void bind_all_fields(const IndexT& index, T& out, std::index_sequence<Is...>, bool strict) {
     constexpr auto names = boost::pfr::names_as_array<T>();
-    (bind_one_field<Is, Strict>(index, out, names[Is]), ...);
+    (bind_one_field<Is>(index, out, names[Is], strict), ...);
 }
 
 // Checks that every entry in `fields` has a name matching one of T's own
 // declared field names (case-insensitive) -- throws, naming the
 // offending entry, on the first one that doesn't. Only ever called when
-// Strict is set (see bind_from_fields_impl below); doesn't itself
+// `strict` is true (see bind_from_fields_impl below); doesn't itself
 // recurse into nested structs' own contents -- that happens naturally
 // when bind_one_field's nested-struct/vector<T> branches call
-// bind_from_fields_impl<Strict> on each sub-FieldList with Strict
-// propagated, so each level gets checked against its own type's names.
+// bind_from_fields_impl on each sub-FieldList with `strict` propagated,
+// so each level gets checked against its own type's names.
 template <config_schema T>
 void check_no_unknown_fields(const FieldList& fields) {
     constexpr auto names = boost::pfr::names_as_array<T>();
@@ -311,18 +313,21 @@ void check_no_unknown_fields(const FieldList& fields) {
     }
 }
 
-template <bool Strict, config_schema T>
-void bind_from_fields_impl(const FieldList& fields, T& out) {
-    if constexpr (Strict) {
+template <config_schema T>
+void bind_from_fields_impl(const FieldList& fields, T& out, bool strict) {
+    if (strict) {
         check_no_unknown_fields<T>(fields);
     }
-    if constexpr (boost::pfr::tuple_size_v<T> < kLinearScanFieldThreshold) {
-        LinearFieldScanner scanner(fields);
-        bind_all_fields<Strict>(scanner, out, std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
-    } else {
-        FieldIndex index(fields);
-        bind_all_fields<Strict>(index, out, std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
-    }
+    // std::conditional_t picks the lookup strategy TYPE at compile time
+    // (see kLinearScanFieldThreshold's comment for why -- that part IS
+    // still a compile-time choice, since it depends only on T's own
+    // field count, never on `strict`), collapsing what would otherwise
+    // be two branches -- identical except for which strategy type they
+    // construct -- into one.
+    using Scanner = std::conditional_t<(boost::pfr::tuple_size_v<T> < kLinearScanFieldThreshold),
+                                        LinearFieldScanner, FieldIndex>;
+    Scanner scanner(fields);
+    bind_all_fields(scanner, out, std::make_index_sequence<boost::pfr::tuple_size_v<T>>{}, strict);
 }
 
 // Splits "a.b.c" into ("a", "b.c"); splits "a" (no dot) into ("a", "").
@@ -378,24 +383,22 @@ inline const Field* resolve_leaf_path(const FieldList& fields, std::string_view 
 // call of bind_from_fields<T>, including once per element of a
 // vector<T> -- the type's own field count decides it, not how many times
 // or where it's invoked.
+//
+// `strict`, when true, also rejects any entry in `fields` (at every
+// nesting level -- inside a nested struct, and inside each element of a
+// vector<T>, not just the top level) whose name doesn't match one of its
+// containing struct's own declared fields. Catches a typo'd or stale/
+// deprecated config key that would otherwise be silently ignored. This
+// is a runtime bool, not a compile-time flag, deliberately: whether an
+// old config with legitimate leftover keys should still load has to be a
+// deployment/config-time decision (an env var, a CLI flag, a setting in
+// the config itself), not something that requires recompiling the
+// binary to change -- the same way .NET's actual
+// BinderOptions.ErrorOnUnknownConfiguration is a runtime property on the
+// binder, not a template parameter or a separately-compiled function.
 template <config_schema T>
-void bind_from_fields(const FieldList& fields, T& out) {
-    detail::bind_from_fields_impl<false>(fields, out);
-}
-
-// Same as bind_from_fields, but also rejects any entry in `fields` (at
-// every nesting level -- inside a nested struct, and inside each element
-// of a vector<T>, not just the top level) whose name doesn't match one of
-// its containing struct's own declared fields. Catches a typo'd or
-// stale/deprecated config key that bind_from_fields() would otherwise
-// just silently ignore, the same way .NET's ConfigurationBinder.Bind()
-// only rejects an unrecognized key when BinderOptions.
-// ErrorOnUnknownConfiguration is explicitly turned on -- this is that
-// same opt-in, not bind_from_fields()'s default, so existing callers (and
-// a config with legitimate leftover/deprecated keys) are unaffected.
-template <config_schema T>
-void bind_from_fields_strict(const FieldList& fields, T& out) {
-    detail::bind_from_fields_impl<true>(fields, out);
+void bind_from_fields(const FieldList& fields, T& out, bool strict = false) {
+    detail::bind_from_fields_impl(fields, out, strict);
 }
 
 // Same as bind_from_fields, but requires flat_schema<T> instead of the more
@@ -406,15 +409,8 @@ void bind_from_fields_strict(const FieldList& fields, T& out) {
 // general config_schema (flat_schema is a strict subset of it: every
 // flat_schema struct already satisfies config_schema, so this just forwards).
 template <flat_schema T>
-void bind_flat_fields(const FieldList& fields, T& out) {
-    bind_from_fields(fields, out);
-}
-
-// The flat_schema counterpart to bind_from_fields_strict, same relationship
-// bind_flat_fields has to bind_from_fields.
-template <flat_schema T>
-void bind_flat_fields_strict(const FieldList& fields, T& out) {
-    bind_from_fields_strict(fields, out);
+void bind_flat_fields(const FieldList& fields, T& out, bool strict = false) {
+    bind_from_fields(fields, out, strict);
 }
 
 // Reads a single scalar value at a dot-separated path (e.g. "pool.size",
