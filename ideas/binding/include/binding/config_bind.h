@@ -382,75 +382,78 @@ void bind_one_value(FieldPtr f, T& out, std::string_view name, bool strict) {
     }
 }
 
-template <std::size_t I, typename IndexT, config_schema T>
-void bind_one_field(const IndexT& index, T& out, std::string_view name, bool strict) {
-    using FieldType = boost::pfr::tuple_element_t<I, T>;
-    auto& field = boost::pfr::get<I>(out);
-
-    // `auto*`, not `const Field*` -- IndexT may be one of the Mutable*
-    // strategies (see FieldIndexT/LinearFieldScannerT's comment), whose
-    // first()/all() return plain Field*. Forcing that into a const Field*
-    // here would compile fine (Field* converts implicitly) but silently
-    // throw away the mutability that's the entire point of this being
-    // reachable from bind_from_fields' rvalue overload -- f->as_leaf()
-    // would then always pick the const overload regardless.
-    if constexpr (is_optional_v<FieldType>) {
-        using ValueType = optional_value_t<FieldType>;
-
-        if constexpr (is_vector_v<ValueType>) {
-            // optional<vector<U>>: no matches by name at all means the
-            // field is absent (nullopt); one or more means present,
-            // collected exactly like a plain vector<U> field below. The
-            // Field/FieldList model has no way to distinguish "declared
-            // with zero elements" from "never declared" -- both are zero
-            // matches by name -- so both read back the same way, as
-            // nullopt; there's no third state being lost here.
-            using ElemType = vector_value_t<ValueType>;
-            auto matches = index.all(name);
-            if (matches.empty()) {
-                field = std::nullopt;
-                return;
-            }
-            ValueType value;
-            for (auto* f : matches) {
-                ElemType elem{};
-                bind_one_value(f, elem, name, strict);
-                value.push_back(std::move(elem));
-            }
-            field = std::move(value);
-
+// Binds `name`'s value into `out` (of type ValueType) by looking it up
+// through `index` -- the by-name counterpart to bind_one_value's
+// by-resolved-Field* dispatch. Returns whether `name` was present at
+// all, so an optional<T> caller can tell nullopt from a real value
+// without `required` needing two different meanings.
+//
+// The three shapes recurse into each other rather than duplicating one
+// another: an optional<U> field unwraps to U once and delegates back
+// into this same function for it, always with required=false (an
+// optional field's own presence is never mandatory, regardless of what
+// its own caller passed) -- this is what lets optional<vector<T>> and
+// optional<StructT> fall out for free, as exactly "unwrap once, then
+// bind U the normal way," instead of each needing their own hand-written
+// branch the way an earlier version of this function had.
+//
+// `auto*`/`auto` (not `const Field*`) throughout -- IndexT may be one of
+// the Mutable* strategies (see FieldIndexT/LinearFieldScannerT's
+// comment), whose single()/all() return plain Field*. Forcing that into
+// a const Field* here would compile fine (Field* converts implicitly)
+// but silently throw away the mutability that's the entire point of
+// this being reachable from bind_from_fields' rvalue overload.
+template <typename ValueType, typename IndexT>
+bool bind_named_value(const IndexT& index, ValueType& out, std::string_view name, bool strict, bool required) {
+    if constexpr (is_optional_v<ValueType>) {
+        using Inner = optional_value_t<ValueType>;
+        Inner value{};
+        const bool present = bind_named_value(index, value, name, strict, /*required=*/false);
+        if (present) {
+            out = std::move(value);
         } else {
-            auto* f = index.single(name);
-            if (!f) {
-                field = std::nullopt;
-                return;
-            }
-            ValueType value{};
-            bind_one_value(f, value, name, strict);
-            field = std::move(value);
+            out = std::nullopt;
         }
+        return present;
 
-    } else if constexpr (is_vector_v<FieldType>) {
-        using ElemType = vector_value_t<FieldType>;
-        field.clear();
+    } else if constexpr (is_vector_v<ValueType>) {
+        // A vector<T> field's cardinality is always 0..N -- unlike a
+        // scalar leaf/struct field, "required" never applies to it: zero
+        // matches is just an empty vector, never a throw, whether or not
+        // this call itself came from unwrapping an optional<vector<T>>.
         // Every match must actually agree with ElemType's own shape (leaf
         // or struct) -- config_field_predicate only guarantees the
         // *field*'s element type is one of those, not that the parsed
         // data agrees; bind_one_value throws, naming `name`, if it doesn't.
-        for (auto* f : index.all(name)) {
+        using ElemType = vector_value_t<ValueType>;
+        auto matches = index.all(name);
+        out.clear();
+        for (auto* f : matches) {
             ElemType elem{};
             bind_one_value(f, elem, name, strict);
-            field.push_back(std::move(elem));
+            out.push_back(std::move(elem));
         }
+        return !matches.empty();
 
     } else { // plain leaf, or nested config_schema struct -- bind_one_value
-             // picks which via is_bindable_leaf_v<FieldType>
+             // picks which via is_bindable_leaf_v<ValueType>
         auto* f = index.single(name);
         if (!f) {
-            throw std::runtime_error("binding: missing required field '" + std::string(name) + "'");
+            if (required) {
+                throw std::runtime_error("binding: missing required field '" + std::string(name) + "'");
+            }
+            return false;
         }
-        bind_one_value(f, field, name, strict);
+        bind_one_value(f, out, name, strict);
+        return true;
     }
+}
+
+template <std::size_t I, typename IndexT, config_schema T>
+void bind_one_field(const IndexT& index, T& out, std::string_view name, bool strict) {
+    using FieldType = boost::pfr::tuple_element_t<I, T>;
+    auto& field = boost::pfr::get<I>(out);
+    bind_named_value(index, field, name, strict, /*required=*/true);
 }
 
 template <typename IndexT, config_schema T, std::size_t... Is>
