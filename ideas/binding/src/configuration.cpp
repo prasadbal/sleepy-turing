@@ -22,33 +22,34 @@ namespace {
 using ActiveParser = XmlConfigParser;
 static_assert(config_parser<ActiveParser>);
 
-// What sits in Configuration's std::any. The parser is held by value and
-// shares ownership of the parsed document, so `node` stays valid for as
-// long as any Configuration pointing into that document does -- including
-// a section() that outlives the Configuration it came from.
+// What sits in Configuration's std::any: a parser plus one of its node
+// handles. The parser is held by value and shares ownership of the parsed
+// document, so `node` stays valid for as long as any Configuration
+// pointing into that document does -- including a section() that outlives
+// the Configuration it came from.
 struct NodeRef {
     ActiveParser parser;
-    const ActiveParser::Node* node = nullptr;
+    ActiveParser::Node node;
 };
 
 } // namespace
 
 Configuration load_config(const std::filesystem::path& file, bool strict) {
     ActiveParser parser = ActiveParser::load(file);
-    const ActiveParser::Node* root = parser.root();
+    ActiveParser::Node root = parser.root();
     return Configuration(std::any(NodeRef{std::move(parser), root}), strict);
 }
 
 std::any Configuration::resolve(std::string_view path) const {
     const auto& base = std::any_cast<const NodeRef&>(node_);
-    const ActiveParser::Node* found = base.parser.resolve(*base.node, path);
+    std::optional<ActiveParser::Node> found = base.parser.resolve(base.node, path);
     if (!found) return {};
-    return std::any(NodeRef{base.parser, found});
+    return std::any(NodeRef{base.parser, *found});
 }
 
-Field Configuration::to_field(const std::any& node) const {
+FieldValue Configuration::to_value(const std::any& node) const {
     const auto& ref = std::any_cast<const NodeRef&>(node);
-    return ref.parser.to_field(*ref.node);
+    return ref.parser.to_value(ref.node);
 }
 
 } // namespace binding

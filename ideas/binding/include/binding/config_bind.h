@@ -340,6 +340,21 @@ void parse_leaf_value(LeafRef&& raw, T& out, std::string_view field_name) {
     }, std::forward<LeafRef>(raw));
 }
 
+// The three failure messages every binding path shares, in one place so a
+// value reached by struct field and the same value reached by path can't
+// report differently.
+inline std::runtime_error missing_field_error(std::string_view path) {
+    return std::runtime_error("binding: missing field (from path '" + std::string(path) + "')");
+}
+
+inline std::runtime_error expected_leaf_error(std::string_view name) {
+    return std::runtime_error("binding: field '" + std::string(name) + "' expected a plain value");
+}
+
+inline std::runtime_error expected_struct_error(std::string_view name) {
+    return std::runtime_error("binding: field '" + std::string(name) + "' expected a nested structure");
+}
+
 // Parses one already-resolved leaf Field's value into `out` -- the shared
 // tail end for every place a bindable-leaf value gets pulled out of a
 // Field*: a plain leaf field, a vector<leaf> field's own elements, and an
@@ -354,9 +369,7 @@ void parse_leaf_value(LeafRef&& raw, T& out, std::string_view field_name) {
 // genuine, non-const Field*.
 template <typename FieldPtr, typename T>
 void bind_leaf(FieldPtr f, T& out, std::string_view name) {
-    if (!f->is_leaf()) {
-        throw std::runtime_error("binding: field '" + std::string(name) + "' expected a plain value");
-    }
+    if (!f->is_leaf()) throw expected_leaf_error(name);
     parse_leaf_value(std::move(f->as_leaf()), out, name);
 }
 
@@ -375,15 +388,9 @@ void bind_one_value(FieldPtr f, T& out, std::string_view name, bool strict) {
     if constexpr (is_bindable_leaf_v<T>) {
         bind_leaf(f, out, name);
     } else { // nested config_schema struct
-        if (!f->is_struct()) {
-            throw std::runtime_error("binding: field '" + std::string(name) + "' expected a nested structure");
-        }
+        if (!f->is_struct()) throw expected_struct_error(name);
         bind_from_fields_impl(f->as_struct(), out, strict);
     }
-}
-
-inline std::runtime_error missing_field_error(std::string_view path) {
-    return std::runtime_error("binding: missing field (from path '" + std::string(path) + "')");
 }
 
 // Binds an already-resolved node into `out` -- the counterpart to
@@ -399,30 +406,46 @@ inline std::runtime_error missing_field_error(std::string_view path) {
 // scalar: that reads as "no value here" too, rather than as an error,
 // matching what try_get_leaf has always done for the same shape.
 //
-// `node` is taken by value, so bind_one_value gets a genuinely mutable
-// Field* and its leaf values move into `out` instead of being copied out
-// of something the caller is about to drop anyway.
+// `node` is taken by value, so its contents move into `out` rather than
+// being copied out of something the caller is about to drop anyway.
 template <typename T>
-void bind_resolved_node(std::optional<Field> node, T& out, std::string_view path, bool strict) {
-    if constexpr (is_optional_v<T>) {
-        using Inner = optional_value_t<T>;
-        if (!node) {
+void bind_resolved_node(std::optional<FieldValue> node, T& out, std::string_view path, bool strict) {
+    using Value = std::conditional_t<is_optional_v<T>, optional_value_t<T>, T>;
+
+    if (!node) {
+        if constexpr (is_optional_v<T>) {
             out = std::nullopt;
             return;
+        } else {
+            throw missing_field_error(path);
         }
-        if constexpr (is_bindable_leaf_v<Inner>) {
-            if (!node->is_leaf()) {
+    }
+
+    if constexpr (is_bindable_leaf_v<Value>) {
+        if (!std::holds_alternative<LeafValue>(*node)) {
+            // A subtree asked for as a scalar. Absent and wrong-shaped read
+            // the same way to an optional -- "no value here" -- but are an
+            // error for a plain T.
+            if constexpr (is_optional_v<T>) {
                 out = std::nullopt;
                 return;
+            } else {
+                throw expected_leaf_error(path);
             }
         }
-        Inner value{};
-        bind_one_value(&*node, value, path, strict);
+        Value value{};
+        // Parsing still throws on malformed input even for an optional T:
+        // absence is forgiven, bad data is not.
+        parse_leaf_value(std::move(std::get<LeafValue>(*node)), value, path);
         out = std::move(value);
 
-    } else {
-        if (!node) throw missing_field_error(path);
-        bind_one_value(&*node, out, path, strict);
+    } else { // a config_schema struct
+        if (!std::holds_alternative<FieldList>(*node)) {
+            throw expected_struct_error(path);
+        }
+        Value value{};
+        bind_from_fields_impl(std::get<FieldList>(*node), value, strict);
+        out = std::move(value);
     }
 }
 

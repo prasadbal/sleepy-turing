@@ -63,9 +63,19 @@ using LeafValue = std::variant<std::string, std::int64_t, double, bool>;
 // represents repetition (a duplicated key, not an array type). A
 // struct-binder maps that to vector<T> by grouping same-named entries; a
 // plain leaf lookup just takes the first (or only) match.
+// What a node actually holds: a scalar, or one flattened level of
+// children. Named separately from Field because the two are not the same
+// thing -- a Field is a *named* entry in its parent's list, whereas a node
+// reached by a path has no name of its own: nothing names the document
+// root, and a parser navigating its own format natively may have no name
+// to hand over at all. This is what crosses the parser seam
+// (config_parser.h); a name stays a property of an entry within its
+// parent, which is where binding reads it from.
+using FieldValue = std::variant<LeafValue, FieldList>;
+
 struct Field {
     std::string name;
-    std::variant<LeafValue, FieldList> value;
+    FieldValue value;
 
     bool is_leaf() const noexcept { return std::holds_alternative<LeafValue>(value); }
     bool is_struct() const noexcept { return std::holds_alternative<FieldList>(value); }

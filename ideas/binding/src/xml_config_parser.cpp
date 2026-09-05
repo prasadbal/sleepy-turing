@@ -33,12 +33,12 @@ XmlConfigParser XmlConfigParser::load(const std::filesystem::path& file) {
         std::make_shared<const Document>(Document{Field{std::string(), from_ptree(top)}}));
 }
 
-const XmlConfigParser::Node* XmlConfigParser::resolve(const Node& base,
-                                                       std::string_view path) const {
-    const Field* current = &base;
+std::optional<XmlConfigParser::Node> XmlConfigParser::resolve(Node base,
+                                                               std::string_view path) const {
+    const Field* current = base;
 
     while (!path.empty()) {
-        if (!current->is_struct()) return nullptr;
+        if (!current->is_struct()) return std::nullopt;
 
         const auto dot = path.find('.');
         const std::string_view segment = (dot == std::string_view::npos) ? path : path.substr(0, dot);
@@ -50,7 +50,7 @@ const XmlConfigParser::Node* XmlConfigParser::resolve(const Node& base,
                 break;
             }
         }
-        if (!found) return nullptr;
+        if (!found) return std::nullopt;
 
         current = found;
         path = (dot == std::string_view::npos) ? std::string_view{} : path.substr(dot + 1);

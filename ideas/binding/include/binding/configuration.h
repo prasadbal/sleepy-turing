@@ -80,7 +80,7 @@ public:
     void get(std::string_view path, T& out) const {
         std::any node = resolve(path);
         detail::bind_resolved_node(
-            node.has_value() ? std::optional<Field>(to_field(node)) : std::nullopt,
+            node.has_value() ? std::optional<FieldValue>(to_value(node)) : std::nullopt,
             out, path, strict_);
     }
 
@@ -91,13 +91,14 @@ private:
         : node_(std::move(node)), strict_(strict) {}
 
     // The two format-specific operations, both defined in
-    // config_parser.cpp. resolve() walks a dot-separated path from this
+    // configuration.cpp, which is the only place that knows which parser
+    // is in use. resolve() walks a dot-separated path from this
     // Configuration's own node (an empty path being that node itself) and
-    // returns an empty std::any if it doesn't resolve; to_field() hands
-    // back the node's contents -- either its leaf value or its children --
-    // as parser-independent Fields.
+    // returns an empty std::any if it doesn't resolve; to_value() hands
+    // back that node's contents -- its own scalar, or one flattened level
+    // of children -- as parser-independent data.
     std::any resolve(std::string_view path) const;
-    Field to_field(const std::any& node) const;
+    FieldValue to_value(const std::any& node) const;
 
     std::any node_;
     bool strict_ = false;
