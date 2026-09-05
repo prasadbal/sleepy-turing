@@ -600,43 +600,6 @@ void bind_from_fields_impl(FieldList& fields, T& out, bool strict) {
     bind_all_fields(scanner, out, std::make_index_sequence<boost::pfr::tuple_size_v<T>>{}, strict);
 }
 
-// Splits "a.b.c" into ("a", "b.c"); splits "a" (no dot) into ("a", "").
-inline std::pair<std::string_view, std::string_view> split_first_path_segment(std::string_view path) {
-    const auto dot = path.find('.');
-    if (dot == std::string_view::npos) return {path, {}};
-    return {path.substr(0, dot), path.substr(dot + 1)};
-}
-
-// Finds the Field named `name` in `fields` -- a plain linear scan, since a
-// one-off path lookup (get_leaf/try_get_leaf below) doesn't warrant
-// building any index over `fields` just to find a single entry.
-inline const Field* find_field(const FieldList& fields, std::string_view name) {
-    for (const Field& f : fields) {
-        if (iequals(f.name, name)) return &f;
-    }
-    return nullptr;
-}
-
-// Walks `path`'s dot-separated segments through nested structs, returning
-// the terminal Field* -- or nullptr if any segment is missing, or an
-// intermediate (non-terminal) segment isn't itself a nested struct to
-// descend into. Doesn't distinguish which of those two happened, or which
-// segment failed; get_leaf/try_get_leaf don't need that distinction, and
-// resolve_leaf_path stays a single, simple pass either way.
-inline const Field* resolve_leaf_path(const FieldList& fields, std::string_view path) {
-    const FieldList* current = &fields;
-    std::string_view remaining = path;
-    for (;;) {
-        auto [segment, rest] = split_first_path_segment(remaining);
-        const Field* found = find_field(*current, segment);
-        if (!found) return nullptr;
-        if (rest.empty()) return found;
-        if (!found->is_struct()) return nullptr;
-        current = &found->as_struct();
-        remaining = rest;
-    }
-}
-
 } // namespace detail
 
 // Everything a resolved node can be bound into -- the constraint on
@@ -719,50 +682,19 @@ void bind_flat_fields(FieldList&& fields, T& out, bool strict = false) {
     bind_from_fields(std::move(fields), out, strict);
 }
 
-// Reads a single scalar value at a dot-separated path (e.g. "pool.size",
-// or just "port" for a top-level field), parsed as T -- the escape hatch
-// for reading one ad hoc setting where defining a whole config_schema
-// struct and calling bind_from_fields() just to read one field would be
-// overkill. Each path segment matches case-insensitively, same as
-// bind_from_fields(). A plain linear scan per segment, not a FieldIndex --
-// a one-off lookup has nothing to amortize an index's construction cost
-// against.
+// Reading one value by path lives in ConfigParser::resolve()
+// (config_parser.h), reached through Configuration::get() -- not here.
+// This header used to carry its own FieldList-walking version, from when a
+// FieldList was the persistent representation of a document; now that one
+// exists only for the duration of a bind, walking it to answer a path
+// meant materializing a whole subtree to look at one value in it. Two more
+// path walks lived in the bridges, over ptree and toml::table directly.
 //
-// Throws std::runtime_error, naming the path, if any segment is missing,
-// a non-terminal segment isn't a nested struct, the terminal isn't a leaf
-// value, or its text doesn't parse as T -- the same failure modes
-// bind_from_fields() has for a required (non-optional) field, for the
-// same reason: a missing or malformed ad hoc value is a real config
-// problem to fail loudly on, not something to paper over with a default.
-template <is_bindable_leaf T>
-T get_leaf(const FieldList& fields, std::string_view path) {
-    const Field* f = detail::resolve_leaf_path(fields, path);
-    if (!f) {
-        throw std::runtime_error("binding: missing field (from path '" + std::string(path) + "')");
-    }
-    if (!f->is_leaf()) {
-        throw std::runtime_error("binding: field '" + std::string(path) + "' expected a plain value");
-    }
-    T value{};
-    detail::parse_leaf_value(f->as_leaf(), value, path);
-    return value;
-}
-
-// Same as get_leaf, but returns std::nullopt instead of throwing when
-// `path` itself doesn't resolve to an existing leaf -- for a setting
-// that's genuinely allowed to be absent, read ad hoc (the std::optional<T>
-// struct-field equivalent of get_leaf, for callers not binding a whole
-// struct). A value that IS present but fails to parse as T still throws:
-// that's a real data error, not absence, exactly as a std::optional<T>
-// field in bind_from_fields() only tolerates the field being missing, not
-// being present with garbage in it.
-template <is_bindable_leaf T>
-std::optional<T> try_get_leaf(const FieldList& fields, std::string_view path) {
-    const Field* f = detail::resolve_leaf_path(fields, path);
-    if (!f || !f->is_leaf()) return std::nullopt;
-    T value{};
-    detail::parse_leaf_value(f->as_leaf(), value, path);
-    return value;
-}
+// All three are gone. Four implementations of "resolve a path" is three
+// too many for rules this fiddly, and they had already drifted: the
+// ptree one used get_child_optional() and so could not see an XML
+// attribute or match a name case-insensitively, meaning
+// get_leaf(pt, "pool.size") threw "missing field" on a document
+// Configuration reads without complaint.
 
 } // namespace binding

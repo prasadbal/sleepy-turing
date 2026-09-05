@@ -7,16 +7,19 @@
 #include "binding/config_field.h"
 
 // ============================================================================
-// The one place boost::property_tree is allowed to be named: converts a
-// parsed ptree (from read_xml, but nothing here is XML-specific) into the
-// parser-independent binding::FieldList (see config_field.h). Everything past
-// this header deals in Field/FieldList only -- with one exception: get_leaf/
-// try_get_leaf below, which read a single ad hoc value straight off a live
-// ptree without first materializing a whole FieldList to throw away. They
-// still finish through the exact same detail::parse_leaf_value() the
-// FieldList-based get_leaf() (config_bind.h) uses -- only the "walk the path
-// down to one node" step is ptree-specific, leveraging get_child_optional()
-// (ptree's own dotted-path support) instead of reimplementing it.
+// Where boost::property_tree is named: converts a parsed ptree (from
+// read_xml or read_json -- nothing here is specific to either) into the
+// parser-independent binding::FieldList (see config_field.h), and answers
+// what a level contains so a path can be walked over the live document.
+// Everything past this header deals in Field/FieldList only.
+//
+// Two things are exported, and they are deliberately built on one
+// definition of "what fields exist at this level" (for_each_ptree_child,
+// which folds <xmlattr> in and expands JSON's array shape): from_ptree()
+// materializes a subtree for binding, and find_ptree_child() matches one
+// name for ConfigParser::resolve()'s path walk. Sharing that visitor is
+// what stops a path from resolving differently than binding reads the
+// same document.
 // ============================================================================
 
 namespace binding {
@@ -145,55 +148,18 @@ inline FieldList from_ptree(const boost::property_tree::ptree& pt) {
     return fields;
 }
 
-namespace detail {
-
-// Converts one already-resolved ptree node into a LeafValue -- the
-// single-node equivalent of from_ptree()'s leaf branch above, reused here
-// so get_leaf/try_get_leaf never have to duplicate that trimming rule.
-inline LeafValue leaf_value_from_ptree_node(const boost::property_tree::ptree& node) {
-    return LeafValue(std::string(trim(node.data())));
-}
-
-} // namespace detail
-
-// Reads a single scalar value at a dot-separated path straight off a live
-// ptree, parsed as T -- path -> node -> LeafValue -> parse_leaf_value(),
-// the same last step get_leaf() (config_bind.h) uses once it has a
-// FieldList's Field in hand. Never materializes a FieldList for the parts
-// of the document outside `path`: get_child_optional() is ptree's own
-// dotted-path navigation (the same '.' convention config_bind.h's
-// FieldList-based get_leaf uses), so resolving the path costs nothing
-// beyond what ptree already does internally.
+// This header used to also carry get_leaf/try_get_leaf, reading one value
+// by path straight off a ptree via get_child_optional(). They are gone,
+// and were quietly wrong while they lasted: get_child_optional() cannot
+// see an XML attribute (those live under a synthetic <xmlattr> child, so
+// "pool.size" for <pool size="10"/> is really "pool.<xmlattr>.size") and
+// compares keys exactly, while config matching is case-insensitive. So
+// get_leaf(pt, "pool.size") threw "missing field" on a document that
+// Configuration reads without complaint.
 //
-// Throws std::runtime_error, naming the path, if the path doesn't
-// resolve, the target node isn't a leaf (has children), or its text
-// doesn't parse as T -- same failure modes as the FieldList-based
-// get_leaf(), for the same reason.
-template <is_bindable_leaf T>
-T get_leaf(const boost::property_tree::ptree& root, std::string_view path) {
-    auto found = root.get_child_optional(std::string(path));
-    if (!found) {
-        throw std::runtime_error("binding: missing field (from path '" + std::string(path) + "')");
-    }
-    if (!found->empty()) {
-        throw std::runtime_error("binding: field '" + std::string(path) + "' expected a plain value");
-    }
-    T value{};
-    detail::parse_leaf_value(detail::leaf_value_from_ptree_node(*found), value, path);
-    return value;
-}
-
-// Same as get_leaf above, but returns std::nullopt instead of throwing
-// when `path` itself doesn't resolve -- the ptree-source equivalent of
-// config_bind.h's FieldList-based try_get_leaf(). A value that IS present
-// but fails to parse as T still throws: a real data error, not absence.
-template <is_bindable_leaf T>
-std::optional<T> try_get_leaf(const boost::property_tree::ptree& root, std::string_view path) {
-    auto found = root.get_child_optional(std::string(path));
-    if (!found || !found->empty()) return std::nullopt;
-    T value{};
-    detail::parse_leaf_value(detail::leaf_value_from_ptree_node(*found), value, path);
-    return value;
-}
+// Reading by path belongs to ConfigParser::resolve() (config_parser.h),
+// which walks a level at a time through find_ptree_child() above -- the
+// same for_each_ptree_child() rules from_ptree() applies, so a path
+// resolves to exactly what binding sees.
 
 } // namespace binding
