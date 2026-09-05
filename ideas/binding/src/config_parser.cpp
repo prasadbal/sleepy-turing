@@ -54,6 +54,38 @@ const toml::node* as_toml(ConfigParser::Node node) noexcept {
 }
 #endif
 
+// One path segment's child, in whichever native tree `node` points into --
+// the single place the two formats are told apart, so resolve() below reads
+// as the plain segment walk it is.
+//
+// This deliberately isn't the parser's own path lookup. ptree's
+// get_child_optional() is ruled out by two things: an XML attribute lives
+// under a synthetic <xmlattr> child, so "pool.size" for <pool size="10"/>
+// is really "pool.<xmlattr>.size" and nothing says per segment which form
+// it will take; and ptree compares keys exactly, while config matching is
+// case-insensitive (HOST binds to host). find_ptree_child/find_toml_child
+// apply the same rules the conversion does, because both are built on the
+// same for_each_*_child visitor -- which is what stops a path from
+// resolving differently than binding reads the document.
+std::optional<ConfigParser::Node> find_child(ConfigParser::Node node, std::string_view segment) {
+    if (const PtreeDoc* pt = as_ptree(node)) {
+        if (const PtreeDoc* child = find_ptree_child(*pt, segment)) {
+            return ConfigParser::Node{child, kPtreeNode};
+        }
+        return std::nullopt;
+    }
+#if BINDING_HAS_TOML
+    if (const toml::node* tn = as_toml(node)) {
+        if (const toml::table* table = tn->as_table()) {
+            if (const toml::node* child = find_toml_child(*table, segment)) {
+                return ConfigParser::Node{child, kTomlNode};
+            }
+        }
+    }
+#endif
+    return std::nullopt;
+}
+
 } // namespace
 
 // A document in whichever form its parser produced, plus any documents
@@ -102,35 +134,20 @@ std::optional<ConfigParser::Node> ConfigParser::resolve(Node base,
         const auto dot = path.find('.');
         const std::string_view segment = (dot == std::string_view::npos) ? path : path.substr(0, dot);
 
-        std::optional<Node> next;
+        std::optional<Node> next = find_child(current, segment);
 
-        // An attached document answers for its own name, but only at the
-        // top -- it was attached to the document, not to some node inside
-        // it, so this is the one level where the two trees meet.
-        if (current.impl == doc_->root_node().impl) {
+        // A document attached by load_into() answers for its own name, but
+        // only at the top: it was attached to the document, not to a node
+        // inside it, so this is the one level where the two trees meet.
+        // Checked only as a fallback, so an attachment can never shadow a
+        // key the primary document actually has.
+        if (!next && current.impl == doc_->root_node().impl) {
             for (const auto& [attached_name, attached_doc] : doc_->attached) {
                 if (iequals(attached_name, segment)) {
                     next = attached_doc->root_node();
                     break;
                 }
             }
-        }
-
-        if (!next) {
-            if (const PtreeDoc* pt = as_ptree(current)) {
-                if (const PtreeDoc* child = find_ptree_child(*pt, segment)) {
-                    next = Node{child, kPtreeNode};
-                }
-            }
-#if BINDING_HAS_TOML
-            else if (const toml::node* tn = as_toml(current)) {
-                if (const toml::table* table = tn->as_table()) {
-                    if (const toml::node* child = find_toml_child(*table, segment)) {
-                        next = Node{child, kTomlNode};
-                    }
-                }
-            }
-#endif
         }
 
         if (!next) return std::nullopt;
