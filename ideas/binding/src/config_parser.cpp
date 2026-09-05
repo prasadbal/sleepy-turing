@@ -1,7 +1,8 @@
-#include "binding/config_parser.h"
+#include "binding/configuration.h"
 
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/xml_parser.hpp>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -11,48 +12,44 @@
 
 // ============================================================================
 // The parser impl, and the only translation unit in the project that names
-// boost::property_tree.
+// boost::property_tree. Everything else -- configuration.h and every caller
+// of it -- sees only a std::any, so replacing this file is the whole cost
+// of swapping the parser.
 //
-// The whole document is converted to parser-independent Fields once, at
-// load, and paths are resolved against that rather than against the ptree.
-// That isn't laziness about "leveraging the parser's own lookup" -- ptree's
-// get_child_optional() genuinely cannot answer the questions asked here:
-// it matches case-sensitively, and an XML attribute (<pool size="10"/>)
-// lives under a synthetic <xmlattr> child, so "pool.size" doesn't resolve
-// to it at all. from_ptree() already normalizes both -- flattening
-// attributes alongside child elements, and trimming -- so resolving against
-// its output is what makes a path mean the same thing as a struct field
-// name, which is the whole point.
+// The document is converted to parser-independent Fields once, at load, and
+// paths resolve against that rather than against the ptree. That isn't
+// laziness about "leveraging the parser's own lookup": ptree's
+// get_child_optional() genuinely cannot answer the question being asked
+// here. It matches case-sensitively, and an XML attribute (<pool
+// size="10"/>) lives under a synthetic <xmlattr> child, so "pool.size"
+// doesn't resolve to it at all. from_ptree() already normalizes both --
+// flattening attributes alongside child elements, and trimming -- which is
+// what makes a config path mean the same thing as a struct field name.
 //
-// A different backend is free to make a different call here: toml++ has no
-// <xmlattr> equivalent, so a TOML impl of this same interface could resolve
-// natively against toml::table and convert only the subtree it lands on.
-// The interface doesn't care -- that's what makes it the seam.
+// A different backend can make a different call behind this same seam:
+// toml++ has no <xmlattr> equivalent, so a TOML impl could resolve natively
+// against toml::table and convert only the subtree it lands on.
 // ============================================================================
 
 namespace binding {
+namespace {
 
-// ConfigNode is only ever handled through a pointer, and both the cast out
-// and the cast back happen right here, in this file -- a round trip through
-// an incomplete type's pointer yields back the original pointer, and the
-// Field is only ever dereferenced as a Field.
-struct ConfigParser::Impl {
+// The parsed document, kept alive by every Configuration viewing into it.
+struct Document {
     Field root;
 };
 
-namespace {
-
-const Field* as_field(const ConfigNode* node) noexcept {
-    return reinterpret_cast<const Field*>(node);
-}
-
-const ConfigNode* as_node(const Field* field) noexcept {
-    return reinterpret_cast<const ConfigNode*>(field);
-}
+// What actually sits in Configuration's std::any: a node, plus shared
+// ownership of the document it points into -- so a section() outliving the
+// Configuration it came from still has a valid tree underneath it.
+struct NodeRef {
+    std::shared_ptr<const Document> doc;
+    const Field* node = nullptr;
+};
 
 } // namespace
 
-ConfigParser ConfigParser::load(const std::filesystem::path& file) {
+Configuration load_config(const std::filesystem::path& file, bool strict) {
     boost::property_tree::ptree document;
     try {
         boost::property_tree::read_xml(file.string(), document);
@@ -68,16 +65,17 @@ ConfigParser ConfigParser::load(const std::filesystem::path& file) {
     const boost::property_tree::ptree& top =
         document.size() == 1 ? document.begin()->second : document;
 
-    auto impl = std::make_shared<Impl>();
-    impl->root = Field{std::string(), from_ptree(top)};
-    return ConfigParser(std::move(impl));
+    auto doc = std::make_shared<Document>(Document{Field{std::string(), from_ptree(top)}});
+    const Field* root = &doc->root;
+    return Configuration(std::any(NodeRef{std::move(doc), root}), strict);
 }
 
-const ConfigNode* ConfigParser::resolve(std::string_view path) const {
-    const Field* current = &impl_->root;
+std::any Configuration::resolve(std::string_view path) const {
+    const auto& base = std::any_cast<const NodeRef&>(node_);
+    const Field* current = base.node;
 
     while (!path.empty()) {
-        if (!current->is_struct()) return nullptr;
+        if (!current->is_struct()) return {};
 
         const auto dot = path.find('.');
         const std::string_view segment = (dot == std::string_view::npos) ? path : path.substr(0, dot);
@@ -89,24 +87,17 @@ const ConfigNode* ConfigParser::resolve(std::string_view path) const {
                 break;
             }
         }
-        if (!found) return nullptr;
+        if (!found) return {};
 
         current = found;
         path = (dot == std::string_view::npos) ? std::string_view{} : path.substr(dot + 1);
     }
 
-    return as_node(current);
+    return std::any(NodeRef{base.doc, current});
 }
 
-FieldList ConfigParser::fields(const ConfigNode& node) const {
-    const Field* field = as_field(&node);
-    return field->is_struct() ? field->as_struct() : FieldList{};
-}
-
-std::optional<LeafValue> ConfigParser::leaf(const ConfigNode& node) const {
-    const Field* field = as_field(&node);
-    if (!field->is_leaf()) return std::nullopt;
-    return field->as_leaf();
+Field Configuration::to_field(const std::any& node) const {
+    return *std::any_cast<const NodeRef&>(node).node;
 }
 
 } // namespace binding
