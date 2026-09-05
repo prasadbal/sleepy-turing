@@ -21,6 +21,20 @@
 
 namespace binding {
 
+// True for the shape json_parser uses to represent an array: a node with
+// children, every one of which has an empty key. XML cannot produce this
+// (an element always has a tag name, and <xmlattr> is handled separately),
+// so testing for it costs XML nothing and needs no format flag threaded
+// through -- the tree itself says which case this is.
+inline bool is_ptree_array(const boost::property_tree::ptree& node) {
+    if (node.empty()) return false; // a scalar, or an empty array -- see below
+    for (const auto& [key, child] : node) {
+        (void)child;
+        if (!key.empty()) return false;
+    }
+    return true;
+}
+
 inline FieldList from_ptree(const boost::property_tree::ptree& pt) {
     FieldList fields;
 
@@ -33,6 +47,32 @@ inline FieldList from_ptree(const boost::property_tree::ptree& pt) {
             // detail rather than part of the config's own shape.
             for (const auto& [attr_name, attr_value] : child) {
                 fields.push_back(Field{attr_name, attr_value.data()});
+            }
+            continue;
+        }
+
+        if (is_ptree_array(child)) {
+            // json_parser represents an array as a child whose own children
+            // all have empty keys: "ports": [8080, 8443] parses to
+            // ports -> { ""->8080, ""->8443 }. Left alone, that would bind
+            // as a nested struct named "ports" holding two nameless
+            // entries, which no vector<T> field can collect.
+            //
+            // Emit one same-named entry per element instead, which is
+            // exactly how repetition is already represented everywhere else
+            // (see config_field.h): a repeated XML element and a TOML array
+            // both arrive as several Fields sharing a name in the enclosing
+            // list, and bind_one_field's vector<T> branch groups them. So a
+            // JSON array of scalars becomes vector<leaf> and an array of
+            // objects becomes vector<Struct>, matching what the other two
+            // formats already do for the same config shape.
+            for (const auto& [element_key, element] : child) {
+                (void)element_key; // empty by construction -- that's the marker
+                if (element.empty()) {
+                    fields.push_back(Field{key, std::string(trim(element.data()))});
+                } else {
+                    fields.push_back(Field{key, from_ptree(element)});
+                }
             }
             continue;
         }
