@@ -51,16 +51,20 @@ FieldList read_document(const std::filesystem::path& file) {
 
         // An XML document always has exactly one root element, and making
         // every path spell it out ("config.pool.size") would be noise in
-        // every call -- so paths are written relative to the document
-        // element. JSON has no such wrapper (its root object *is* the
-        // top level), and read_json leaves it as a multi-child root, so
-        // the same test distinguishes them without needing to know which
-        // format produced the tree.
-        const boost::property_tree::ptree& top =
-            document.size() == 1 && document.begin()->second.size() > 0
-                ? document.begin()->second
-                : document;
-        return from_ptree(top);
+        // every call -- so for XML, paths are written relative to the
+        // document element and we descend into it once here.
+        //
+        // JSON gets no such treatment: its root object *is* the top level.
+        // An earlier version tried to tell the two apart by inspecting the
+        // tree -- descend if there's exactly one child and it has children
+        // of its own -- which silently ate the outer key of any JSON
+        // document with a single top-level object ({"middle":{...}} bound
+        // as if "middle" didn't exist). The extension already says which
+        // format this is, so there is nothing to infer.
+        if (ext == ".xml") {
+            return from_ptree(document.size() == 1 ? document.begin()->second : document);
+        }
+        return from_ptree(document);
     }
 
     if (ext == ".toml") {
