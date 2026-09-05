@@ -414,7 +414,8 @@ void bind_resolved_node(std::optional<FieldValue> node, T& out, std::string_view
 
     if (!node) {
         if constexpr (is_optional_v<T>) {
-            out = std::nullopt;
+            // Left exactly as the caller had it -- see the "absent leaves
+            // `out` alone" note above.
             return;
         } else {
             throw missing_field_error(path);
@@ -427,7 +428,6 @@ void bind_resolved_node(std::optional<FieldValue> node, T& out, std::string_view
             // the same way to an optional -- "no value here" -- but are an
             // error for a plain T.
             if constexpr (is_optional_v<T>) {
-                out = std::nullopt;
                 return;
             } else {
                 throw expected_leaf_error(path);
@@ -476,10 +476,19 @@ bool bind_named_value(const IndexT& index, ValueType& out, std::string_view name
         using Inner = optional_value_t<ValueType>;
         Inner value{};
         const bool present = bind_named_value(index, value, name, strict, /*required=*/false);
+        // Only written when a value was actually read. An absent field
+        // leaves `out` exactly as the caller had it, which is what makes a
+        // default member initializer work:
+        //
+        //     struct S { std::optional<int> timeout = 30; };
+        //
+        // binds to 30 when the config omits "timeout", instead of having
+        // that 30 overwritten with nullopt. For a value-initialized struct
+        // the two are indistinguishable (the field is already nullopt), so
+        // this only ever differs where the old behavior silently destroyed
+        // something the caller had deliberately set.
         if (present) {
             out = std::move(value);
-        } else {
-            out = std::nullopt;
         }
         return present;
 
