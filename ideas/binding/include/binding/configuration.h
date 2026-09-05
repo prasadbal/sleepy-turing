@@ -51,14 +51,6 @@
 
 namespace binding {
 
-// Everything get() can produce. is_bindable_leaf already covers a leaf and
-// an optional-wrapped leaf (see reflect.h); the third clause is what adds
-// an optional-wrapped *struct*, so an absent section can be asked for the
-// same way an absent scalar is.
-template <typename T>
-concept gettable = is_bindable_leaf<T> || config_schema<T> ||
-                   (is_optional_v<T> && config_schema<optional_value_t<T>>);
-
 class Configuration {
 public:
     // A view of the node at `path`, with its own paths then relative to it.
@@ -66,7 +58,7 @@ public:
     // plain (non-optional) read of something absent is an error.
     Configuration section(std::string_view path) const {
         std::any node = resolve(path);
-        if (!node.has_value()) throw missing(path);
+        if (!node.has_value()) throw detail::missing_field_error(path);
         return Configuration(std::move(node), strict_);
     }
 
@@ -79,46 +71,17 @@ public:
 
     // Same semantics, deduced T, filled in place -- for reading straight
     // into something you already have, without naming the type twice.
+    //
+    // This layer's whole job is path -> node; what a node then means for a
+    // given T -- leaf or struct, required or absent -- is binding's, so it
+    // stays in config_bind.h with the rest of that logic rather than being
+    // spelled out a second time here.
     template <gettable T>
     void get(std::string_view path, T& out) const {
         std::any node = resolve(path);
-        std::optional<Field> field =
-            node.has_value() ? std::optional<Field>(to_field(node)) : std::nullopt;
-
-        if constexpr (is_optional_v<T> && config_schema<optional_value_t<T>>) {
-            if (!field) {
-                out = std::nullopt;
-                return;
-            }
-            optional_value_t<T> value{};
-            bind_struct(std::move(*field), value, path);
-            out = std::move(value);
-
-        } else if constexpr (config_schema<T>) {
-            if (!field) throw missing(path);
-            bind_struct(std::move(*field), out, path);
-
-        } else { // a leaf, or an optional-wrapped leaf
-            if (!field || !field->is_leaf()) {
-                if constexpr (is_optional_v<T>) {
-                    // Absent, or present but a subtree rather than a scalar
-                    // -- an optional read treats both as "no value here".
-                    out = std::nullopt;
-                    return;
-                } else if (!field) {
-                    throw missing(path);
-                } else {
-                    throw std::runtime_error("binding: field '" + std::string(path) +
-                                             "' expected a plain value");
-                }
-            }
-            // Parsing still throws on malformed input even for an optional
-            // T: absence is forgiven, bad data is not.
-            using Value = std::conditional_t<is_optional_v<T>, optional_value_t<T>, T>;
-            Value parsed{};
-            detail::parse_leaf_value(std::move(field->as_leaf()), parsed, path);
-            out = std::move(parsed);
-        }
+        detail::bind_resolved_node(
+            node.has_value() ? std::optional<Field>(to_field(node)) : std::nullopt,
+            out, path, strict_);
     }
 
 private:
@@ -135,23 +98,6 @@ private:
     // as parser-independent Fields.
     std::any resolve(std::string_view path) const;
     Field to_field(const std::any& node) const;
-
-    template <config_schema T>
-    void bind_struct(Field field, T& out, std::string_view path) const {
-        if (!field.is_struct()) {
-            throw std::runtime_error("binding: field '" + std::string(path) +
-                                     "' expected a nested structure");
-        }
-        // `field` is ours by value, so its FieldList is a temporary and
-        // takes bind_from_fields' moving overload: leaf values move into
-        // the target struct rather than being copied out of something
-        // about to be discarded.
-        bind_from_fields(std::move(field.as_struct()), out, strict_);
-    }
-
-    static std::runtime_error missing(std::string_view path) {
-        return std::runtime_error("binding: missing field (from path '" + std::string(path) + "')");
-    }
 
     std::any node_;
     bool strict_ = false;

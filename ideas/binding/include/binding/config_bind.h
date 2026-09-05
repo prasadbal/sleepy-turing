@@ -382,6 +382,50 @@ void bind_one_value(FieldPtr f, T& out, std::string_view name, bool strict) {
     }
 }
 
+inline std::runtime_error missing_field_error(std::string_view path) {
+    return std::runtime_error("binding: missing field (from path '" + std::string(path) + "')");
+}
+
+// Binds an already-resolved node into `out` -- the counterpart to
+// bind_named_value for a caller that has done its own path resolution and
+// so signals absence with an empty `node` rather than with a lookup miss
+// (Configuration, in configuration.h, whose parser resolves paths).
+//
+// Same rule as everywhere else: T alone decides whether absence is legal.
+// A plain T throws; std::optional<T> yields nullopt -- for a leaf and a
+// struct alike, since unwrapping once and handing the inner type to
+// bind_one_value works the same either way. The one asymmetry is an
+// optional *leaf* whose node turns out to be a subtree rather than a
+// scalar: that reads as "no value here" too, rather than as an error,
+// matching what try_get_leaf has always done for the same shape.
+//
+// `node` is taken by value, so bind_one_value gets a genuinely mutable
+// Field* and its leaf values move into `out` instead of being copied out
+// of something the caller is about to drop anyway.
+template <typename T>
+void bind_resolved_node(std::optional<Field> node, T& out, std::string_view path, bool strict) {
+    if constexpr (is_optional_v<T>) {
+        using Inner = optional_value_t<T>;
+        if (!node) {
+            out = std::nullopt;
+            return;
+        }
+        if constexpr (is_bindable_leaf_v<Inner>) {
+            if (!node->is_leaf()) {
+                out = std::nullopt;
+                return;
+            }
+        }
+        Inner value{};
+        bind_one_value(&*node, value, path, strict);
+        out = std::move(value);
+
+    } else {
+        if (!node) throw missing_field_error(path);
+        bind_one_value(&*node, out, path, strict);
+    }
+}
+
 // Binds `name`'s value into `out` (of type ValueType) by looking it up
 // through `index` -- the by-name counterpart to bind_one_value's
 // by-resolved-Field* dispatch. Returns whether `name` was present at
@@ -562,6 +606,18 @@ inline const Field* resolve_leaf_path(const FieldList& fields, std::string_view 
 }
 
 } // namespace detail
+
+// Everything a resolved node can be bound into -- the constraint on
+// Configuration::get<T>() (configuration.h) and on
+// detail::bind_resolved_node above. is_bindable_leaf already covers a leaf
+// and an optional-wrapped leaf (see reflect.h); the third clause is what
+// adds an optional-wrapped *struct*, so an absent section can be asked for
+// the same way an absent scalar is. A vector<T> is deliberately not here:
+// repetition is a property of a field within a struct (several same-named
+// entries at one level), not of a single node reached by path.
+template <typename T>
+concept gettable = is_bindable_leaf<T> || config_schema<T> ||
+                   (is_optional_v<T> && config_schema<optional_value_t<T>>);
 
 // Binds `fields` onto `out` field-by-field, matching each field's own
 // (compiler-derived) name against a Field of the same name, case-insensitive.
