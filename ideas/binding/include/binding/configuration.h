@@ -1,113 +1,148 @@
 #pragma once
+#include <filesystem>
 #include <optional>
+#include <stdexcept>
+#include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 #include "binding/config_bind.h"
 #include "binding/config_field.h"
+#include "binding/config_parser.h"
 
 // ============================================================================
-// A facade over FieldList (config_field.h): once a source has been parsed
-// into one (via from_ptree()/from_toml(), or any future from_X() a new
-// backend adds), nothing past this point needs to see Field/FieldList
-// itself. A Configuration is built once from that FieldList and answers
-// exactly the two things a caller actually wants -- read one ad hoc value
-// by path, or bind the whole thing onto a config_schema struct -- both
-// already implemented by get_leaf/try_get_leaf/bind_from_fields in
-// config_bind.h; this only hides the FieldList parameter they'd otherwise
-// all take directly.
+// The config-reading interface: one get(), reached by path, for either a
+// single scalar or a whole struct.
 //
-// Deliberately backend-agnostic: this header names neither ptree nor
-// toml::table, so which parser produced the FieldList a Configuration
-// wraps is invisible here -- construct one with binding::from_ptree(pt) or
-// binding::from_toml(tbl) (or both, e.g. layering an override file's
-// FieldList on top isn't supported today, but nothing here would need to
-// change to add it: it's still just a FieldList going into the same
-// constructor).
+// Everything is path -> node -> value, and the first step belongs to the
+// parser (config_parser.h) -- this layer only decides what to do with the
+// node it gets back, which depends entirely on T:
+//
+//   - a scalar target -> parse the node's own leaf value.
+//   - a struct target -> bind the node's children.
+//
+// Required vs absent is decided by T too, never by an extra argument: a
+// plain T throws if it isn't there, std::optional<T> yields nullopt -- for
+// a scalar and a struct alike. There's deliberately no defaulting overload:
+// std::optional's own value_or() already is one, and composes without
+// adding a second way to spell the same thing.
+//
+//   cfg.get<int>("port")                          // throws if absent
+//   cfg.get<std::optional<int>>("port")           // nullopt if absent
+//   cfg.get<std::optional<int>>("port").value_or(9000)
+//   cfg.get<AppConfig>()                          // whole document
+//   cfg.get<Pool>("pool")                         // one section
+//   cfg.get<std::optional<Pool>>("pool")          // nullopt if absent
+//   cfg.get("pool", existing_pool)                // deduced, filled in place
+//
+// Note value_or() defaults only an *absent* value: one that is present but
+// malformed ("port = abc") still throws, rather than silently reading as
+// 9000.
 // ============================================================================
 
 namespace binding {
 
+// Everything get() can produce. is_bindable_leaf already covers a leaf and
+// an optional-wrapped leaf (see reflect.h); the third clause is what adds
+// an optional-wrapped *struct*, so an absent section can be asked for the
+// same way an absent scalar is.
+template <typename T>
+concept gettable = is_bindable_leaf<T> || config_schema<T> ||
+                   (is_optional_v<T> && config_schema<optional_value_t<T>>);
+
 class Configuration {
 public:
-    explicit Configuration(FieldList fields) : fields_(std::move(fields)) {}
+    // `strict`, when true, additionally rejects any config key that doesn't
+    // match one of the target struct's own fields, at every nesting level.
+    // It's a property of the document, set once here rather than repeated
+    // on every call (see bind_from_fields' own comment for why it's a
+    // runtime value and not a compile-time flag).
+    static Configuration load(const std::filesystem::path& file, bool strict = false) {
+        return Configuration(ConfigParser::load(file), strict);
+    }
 
-    // Reads one ad hoc scalar at a dot-separated path (e.g. "pool.size").
-    // One method, not a get/try_get pair: T itself says whether `path` is
-    // allowed to be absent, exactly the same rule bind_from_fields already
-    // uses for a struct field (see config_bind.h's is_optional_v branch in
-    // bind_one_field) -- so the config_schema struct case and this ad hoc
-    // case stay consistent rather than needing two different absence
-    // conventions to remember.
-    //   - get<int>("port")                 -> throws if "port" is absent
-    //   - get<std::optional<int>>("port")  -> nullopt if "port" is absent
-    // Either way, a value that IS present but fails to parse as the
-    // underlying leaf type still throws -- that's a real data error, not
-    // absence, so wrapping T in std::optional never papers over malformed
-    // data, only a missing path.
-    template <is_bindable_leaf T>
-    T get(std::string_view path) const {
-        if constexpr (is_optional_v<T>) {
-            return try_get_leaf<optional_value_t<T>>(fields_, path);
-        } else {
-            return get_leaf<T>(fields_, path);
+    template <gettable T>
+    T get(std::string_view path = "") const {
+        T out{};
+        get(path, out);
+        return out;
+    }
+
+    // Same semantics, deduced T, filled in place -- for reading straight
+    // into something you already have, without naming the type twice.
+    template <gettable T>
+    void get(std::string_view path, T& out) const {
+        const ConfigNode* node = parser_.resolve(path);
+
+        if constexpr (is_optional_v<T> && config_schema<optional_value_t<T>>) {
+            if (!node) {
+                out = std::nullopt;
+                return;
+            }
+            optional_value_t<T> value{};
+            bind_struct(*node, value, path);
+            out = std::move(value);
+
+        } else if constexpr (config_schema<T>) {
+            if (!node) throw missing(path);
+            bind_struct(*node, out, path);
+
+        } else { // a leaf, or an optional-wrapped leaf
+            std::optional<LeafValue> value = node ? parser_.leaf(*node) : std::nullopt;
+            if (!value) {
+                if constexpr (is_optional_v<T>) {
+                    // Absent, or present but a subtree rather than a scalar
+                    // -- an optional read treats both as "no value here".
+                    out = std::nullopt;
+                    return;
+                } else if (!node) {
+                    throw missing(path);
+                } else {
+                    throw std::runtime_error("binding: field '" + std::string(path) +
+                                             "' expected a plain value");
+                }
+            }
+            // Parsing still throws on malformed input even for an optional
+            // T: absence is forgiven, bad data is not.
+            using Value = std::conditional_t<is_optional_v<T>, optional_value_t<T>, T>;
+            Value parsed{};
+            detail::parse_leaf_value(std::move(*value), parsed, path);
+            out = std::move(parsed);
         }
     }
 
-    // Binds the whole document onto a config_schema struct, matching each
-    // field by name (case-insensitive), same rules as bind_from_fields.
-    // Callable on a const Configuration you intend to keep using
-    // afterward (e.g. bind() once, then get() a few more ad hoc values) --
-    // this overload only reads fields_, never touches it.
-    template <config_schema T>
-    T bind(bool strict = false) const& {
-        T out{};
-        bind_from_fields(fields_, out, strict);
-        return out;
-    }
-
-    template <config_schema T>
-    void bind_into(T& out, bool strict = false) const& {
-        bind_from_fields(fields_, out, strict);
-    }
-
-    // Rvalue-qualified counterparts -- for a Configuration this caller is
-    // done with right after (binding it into the one struct it exists
-    // for, e.g. Configuration(from_toml(parsed)).bind<AppConfig>()), these
-    // route through bind_from_fields' FieldList&& overload instead, so a
-    // std::string leaf value moves into the target struct field rather
-    // than copying, all the way down (see config_bind.h). Calling get()/
-    // try_get() on a Configuration after moving from it this way is legal
-    // but reads back whatever bind_from_fields' moves left behind (empty
-    // strings for any leaf that was actually moved) -- fine for a
-    // Configuration about to be discarded anyway, same caveat any
-    // moved-from object carries.
-    template <config_schema T>
-    T bind(bool strict = false) && {
-        T out{};
-        bind_from_fields(std::move(fields_), out, strict);
-        return out;
-    }
-
-    template <config_schema T>
-    void bind_into(T& out, bool strict = false) && {
-        bind_from_fields(std::move(fields_), out, strict);
-    }
-
 private:
-    FieldList fields_;
+    Configuration(ConfigParser parser, bool strict) noexcept
+        : parser_(std::move(parser)), strict_(strict) {}
+
+    template <config_schema T>
+    void bind_struct(const ConfigNode& node, T& out, std::string_view path) const {
+        // fields() hands back a FieldList by value, built for this call --
+        // so it's always a temporary and always takes bind_from_fields'
+        // moving overload: leaf values move into the target struct rather
+        // than being copied out of something about to be discarded.
+        FieldList fields = parser_.fields(node);
+        if (fields.empty() && parser_.leaf(node)) {
+            throw std::runtime_error("binding: field '" + std::string(path) +
+                                     "' expected a nested structure");
+        }
+        bind_from_fields(std::move(fields), out, strict_);
+    }
+
+    static std::runtime_error missing(std::string_view path) {
+        return std::runtime_error("binding: missing field (from path '" + std::string(path) + "')");
+    }
+
+    ConfigParser parser_;
+    bool strict_ = false;
 };
 
-// get/try_get are constrained to is_bindable_leaf, bind/bind_into to
-// config_schema -- FieldList (and Field) satisfy neither, so there is no
-// instantiation of any public method here that could hand one back out,
-// and the constructor is the only way one gets in. Asserted directly,
-// not just left as an implied consequence of those constraints, so a
-// future change that widens either concept enough to admit FieldList/
-// Field fails to compile right here instead of silently reopening this.
-static_assert(!is_bindable_leaf_v<FieldList>);
-static_assert(!config_schema<FieldList>);
-static_assert(!is_bindable_leaf_v<Field>);
-static_assert(!config_schema<Field>);
+// FieldList and Field satisfy neither is_bindable_leaf nor config_schema,
+// so no instantiation of get() can hand one back out -- asserted directly
+// rather than left implied, so a future widening of either concept fails
+// here instead of silently reopening what this facade exists to hide.
+static_assert(!gettable<FieldList>);
+static_assert(!gettable<Field>);
 
 } // namespace binding
