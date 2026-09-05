@@ -1,4 +1,4 @@
-#include "binding/field_tree_parser.h"
+#include "binding/config_parser.h"
 
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
@@ -44,12 +44,12 @@ std::string lower_extension(const std::filesystem::path& file) {
     return ext;
 }
 
-const PtreeDoc* as_ptree(FieldTreeParser::Node node) noexcept {
+const PtreeDoc* as_ptree(ConfigParser::Node node) noexcept {
     return node.kind == kPtreeNode ? static_cast<const PtreeDoc*>(node.impl) : nullptr;
 }
 
 #if BINDING_HAS_TOML
-const toml::node* as_toml(FieldTreeParser::Node node) noexcept {
+const toml::node* as_toml(ConfigParser::Node node) noexcept {
     return node.kind == kTomlNode ? static_cast<const toml::node*>(node.impl) : nullptr;
 }
 #endif
@@ -61,7 +61,7 @@ const toml::node* as_toml(FieldTreeParser::Node node) noexcept {
 // rather than behind a common base: the two libraries have nothing to
 // abstract over, and switching on two alternatives in three short functions
 // is less machinery than a virtual interface would be.
-struct FieldTreeParser::Document {
+struct ConfigParser::Document {
 #if BINDING_HAS_TOML
     std::variant<PtreeDoc, toml::table> native;
 #else
@@ -81,20 +81,20 @@ struct FieldTreeParser::Document {
     }
 };
 
-FieldTreeParser FieldTreeParser::load(const std::filesystem::path& file) {
-    return FieldTreeParser(read(file));
+ConfigParser ConfigParser::load(const std::filesystem::path& file) {
+    return ConfigParser(read(file));
 }
 
-FieldTreeParser FieldTreeParser::load_into(std::string_view name,
+ConfigParser ConfigParser::load_into(std::string_view name,
                                             const std::filesystem::path& file) const {
     auto merged = std::make_shared<Document>(*doc_);
     merged->attached.emplace_back(std::string(name), read(file));
-    return FieldTreeParser(std::move(merged));
+    return ConfigParser(std::move(merged));
 }
 
-FieldTreeParser::Node FieldTreeParser::root() const { return doc_->root_node(); }
+ConfigParser::Node ConfigParser::root() const { return doc_->root_node(); }
 
-std::optional<FieldTreeParser::Node> FieldTreeParser::resolve(Node base,
+std::optional<ConfigParser::Node> ConfigParser::resolve(Node base,
                                                               std::string_view path) const {
     Node current = base;
 
@@ -142,7 +142,7 @@ std::optional<FieldTreeParser::Node> FieldTreeParser::resolve(Node base,
     return current;
 }
 
-FieldValue FieldTreeParser::to_value(Node node) const {
+FieldValue ConfigParser::to_value(Node node) const {
     if (const PtreeDoc* pt = as_ptree(node)) {
         // Childless -> the node's own text is its whole value, trimmed for
         // the reason from_ptree trims: an XML document's indentation around
@@ -162,9 +162,9 @@ FieldValue FieldTreeParser::to_value(Node node) const {
     return FieldList{};
 }
 
-std::shared_ptr<FieldTreeParser::Document> FieldTreeParser::read(const std::filesystem::path& file) {
+std::shared_ptr<ConfigParser::Document> ConfigParser::read(const std::filesystem::path& file) {
     const std::string ext = lower_extension(file);
-    auto doc = std::make_shared<FieldTreeParser::Document>();
+    auto doc = std::make_shared<ConfigParser::Document>();
 
     if (ext == ".xml" || ext == ".json") {
         PtreeDoc parsed;

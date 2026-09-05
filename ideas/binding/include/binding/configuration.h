@@ -51,6 +51,58 @@
 
 namespace binding {
 
+// What Configuration requires of a parser -- stated as a concept rather
+// than an abstract base class: a compile-time contract, so there's no
+// vtable, no allocation, and no indirection at the call site, and a
+// backend that doesn't satisfy it fails at the static_assert in
+// configuration.cpp naming the missing operation, rather than at a link
+// error later. ConfigParser (config_parser.h) is the implementation
+// shipped; this is what a replacement would have to provide.
+//
+//   P::load(file) -> P            parse a document; the parser owns it
+//   parser.root() -> Node         the document's own node
+//   parser.resolve(node, path)    walk a dot-separated path from a node;
+//        -> optional<Node>        nullopt if it doesn't resolve, and an
+//                                 empty path is that same node
+//   parser.to_value(node)         that node's contents as parser-
+//        -> FieldValue            independent data: its own scalar, or
+//                                 one flattened level of children
+//
+// Node is a *handle*, copied by value, not a node body: whatever is
+// cheapest for that backend to carry around -- a pointer, a view, an
+// index. That matters because a real parser's node can be substantial
+// (boost::property_tree's runs to dozens of bytes), and nothing here
+// should copy one; a backend whose nodes are heavy makes Node a pointer
+// into storage its parser already owns. Returning by value rather than by
+// pointer is also what lets a backend resolve lazily, or hand back a view
+// it materializes on the spot.
+//
+// LIFETIME, which a concept cannot express and an implementation
+// therefore has to be told:
+//
+//   A Node must stay valid for as long as any copy of the parser that
+//   produced it is alive, and must not be invalidated by any later call
+//   on that parser.
+//
+// Configuration depends on exactly this. It stores a parser *by value*
+// alongside each Node it holds, so owning a Configuration owns a share of
+// the document, and every get() is safe however long after the load it
+// happens -- including from a section() whose parent Configuration is long
+// gone. Copying the parser is what keeps the document alive, so a parser
+// must be cheap to copy and must share its document rather than own it
+// outright. A backend returning a handle into storage it might reallocate,
+// or one invalidated by the next resolve(), would satisfy every
+// requirement below and still break Configuration silently.
+template <typename P>
+concept config_parser =
+    std::copyable<typename P::Node> &&
+    requires(const P& parser, typename P::Node node, std::string_view path) {
+        { P::load(std::declval<const std::filesystem::path&>()) } -> std::same_as<P>;
+        { parser.root() } -> std::same_as<typename P::Node>;
+        { parser.resolve(node, path) } -> std::same_as<std::optional<typename P::Node>>;
+        { parser.to_value(node) } -> std::same_as<FieldValue>;
+    };
+
 class Configuration {
 public:
     // A view of the node at `path`, with its own paths then relative to it.

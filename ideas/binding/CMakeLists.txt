@@ -68,7 +68,7 @@ if(BINDING_BOOST_INCLUDE_DIR)
     target_link_libraries(config_demo PRIVATE binding)
 
     # The only compiled pieces of this otherwise header-only library.
-    # field_tree_parser.cpp is the sole translation unit that names a
+    # config_parser.cpp is the sole translation unit that names a
     # parser library (boost::property_tree for .xml/.json, and toml++ for
     # .toml when it's available -- detected with __has_include, so this
     # builds either way); configuration.cpp is the only one that names
@@ -77,7 +77,7 @@ if(BINDING_BOOST_INCLUDE_DIR)
     # plus its parser's own .cpp -- callers don't recompile for it.
     add_library(binding_config STATIC
         src/configuration.cpp
-        src/field_tree_parser.cpp
+        src/config_parser.cpp
     )
     target_link_libraries(binding_config PUBLIC binding)
 else()

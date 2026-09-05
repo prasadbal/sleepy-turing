@@ -3,7 +3,6 @@
 #include <utility>
 
 #include "binding/config_parser.h"
-#include "binding/field_tree_parser.h"
 
 // ============================================================================
 // Configuration's two private hooks, plus load_config -- the only places
@@ -19,7 +18,7 @@
 namespace binding {
 namespace {
 
-using ActiveParser = FieldTreeParser;
+using ActiveParser = ConfigParser;
 static_assert(config_parser<ActiveParser>);
 
 // What sits in Configuration's std::any: a parser plus one of its node

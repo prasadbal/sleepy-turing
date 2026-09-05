@@ -1,82 +1,94 @@
 #pragma once
-#include <concepts>
 #include <filesystem>
+#include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
-#include <utility>
 
 #include "binding/config_field.h"
 
 // ============================================================================
-// What a config parser has to provide -- the replaceable seam Configuration
-// (configuration.h) reads through, stated as a concept rather than an
-// abstract base class: it's a compile-time contract, so there's no vtable,
-// no allocation, and no indirection at the call site, and a backend that
-// doesn't satisfy it fails at the static_assert in configuration.cpp,
-// naming the missing operation, rather than at a link error later.
+// The config parser: loads a document, resolves a path to a node, and hands
+// back that node's contents as parser-independent Fields. Everything
+// format-specific lives here and in config_parser.cpp -- which is the only
+// translation unit in the project that names a parser library
+// (boost::property_tree for .xml and .json, toml++ for .toml, chosen by
+// extension at load).
 //
-//   P::load(file) -> P            parse a document; the parser owns it
-//   parser.root() -> Node         the document's own node
-//   parser.resolve(node, path)    walk a dot-separated path from a node;
-//        -> optional<Node>        nullopt if it doesn't resolve, and an
-//                                 empty path is that same node
-//   parser.to_value(node)         that node's contents as parser-
-//        -> FieldValue            independent data: its own scalar, or
-//                                 one flattened level of children
+// The document is kept in its *native* form and navigated natively. A
+// FieldList is materialized only for the subtree actually being bound, by
+// to_value(), and dies when that bind finishes -- nothing here holds one.
+// That suits what a FieldList is for: bind_from_fields takes it by rvalue
+// and moves its leaf values into the target struct.
 //
-// Node is a *handle*, copied by value, not a node body: whatever is
-// cheapest for that backend to carry around -- a pointer, a view, an
-// index. That matters because a real parser's node can be substantial
-// (boost::property_tree's is dozens of bytes), and nothing here should
-// copy one; a backend whose nodes are heavy simply makes Node a pointer
-// into storage its parser already owns. Returning by value rather than by
-// pointer is also what lets a backend resolve lazily, or hand back a
-// view type it materializes on the spot, instead of being forced to keep
-// addressable storage for everything it might be asked about.
+// What keeps native navigation from becoming a second, subtly different
+// reading of the same document is that "what fields exist at this level" is
+// defined once per format, as a visitor (for_each_ptree_child /
+// for_each_toml_child in the bridges), with both the path walk and the
+// conversion built on it. They cannot disagree about attribute flattening,
+// array shapes, or case-insensitive matching. Walking paths with ptree's
+// own get_child_optional() instead was tried and does not work: it cannot
+// see XML attributes and matches case-sensitively, so "pool.size" resolved
+// to nothing while binding found it fine.
 //
-// Nothing outside the impl ever names Node -- Configuration holds it
-// type-erased -- so it can be a ptree pointer, a toml::node_view, or a
-// Field pointer, without any of that reaching a caller.
-//
-// LIFETIME, which a concept cannot express and which an implementation
-// therefore has to be told:
-//
-//   A Node must stay valid for as long as any copy of the parser that
-//   produced it is alive, and must not be invalidated by any later call
-//   on that parser.
-//
-// Configuration depends on exactly this. It stores a parser *by value*
-// alongside each Node it holds, so owning a Configuration owns a share of
-// the document, and every get() is safe however long after the load it
-// happens -- including from a section() whose parent Configuration is long
-// gone. Copying the parser is what keeps the document alive, so the parser
-// must be cheap to copy and must share its document rather than own it
-// outright (XmlConfigParser holds a shared_ptr to an immutable, heap-
-// allocated tree, and hands out pointers into it).
-//
-// A backend that returned a handle into storage it might reallocate, or
-// one invalidated by the next resolve(), would satisfy every requirement
-// below and still break Configuration -- silently, and not at the call
-// that broke it. Hence writing it down here.
-//
-// Resolution is deliberately the parser's job rather than something
-// Configuration does for it. It's format knowledge: in XML an attribute and
-// a child element are both just "a field" to whoever writes the config,
-// even though boost::property_tree files attributes away under a synthetic
-// <xmlattr> child. Only the backend knows things like that, and it should
-// only have to know them once.
+// This is one implementation of what Configuration requires of a parser --
+// see the config_parser concept in configuration.h, which states that
+// contract and is checked against this class in configuration.cpp.
 // ============================================================================
 
 namespace binding {
 
-template <typename P>
-concept config_parser =
-    std::copyable<typename P::Node> &&
-    requires(const P& parser, typename P::Node node, std::string_view path) {
-        { P::load(std::declval<const std::filesystem::path&>()) } -> std::same_as<P>;
-        { parser.root() } -> std::same_as<typename P::Node>;
-        { parser.resolve(node, path) } -> std::same_as<std::optional<typename P::Node>>;
-        { parser.to_value(node) } -> std::same_as<FieldValue>;
+class ConfigParser {
+public:
+    // An opaque handle into the parsed document -- copyable, cheap, and
+    // deliberately not naming any parser type, so this header carries no
+    // parser dependency. What's inside is config_parser.cpp's business.
+    // Valid for as long as any copy of the parser that produced it lives,
+    // as the concept's lifetime rule requires: the document is immutable
+    // and shared, so a handle cannot outlive it.
+    struct Node {
+        const void* impl = nullptr;
+        int kind = 0;
     };
+
+    // Throws std::runtime_error if the file is missing, has an unknown
+    // extension, or fails to parse.
+    static ConfigParser load(const std::filesystem::path& file);
+
+    // Loads `file` and attaches it under `name`, so both documents answer
+    // to one set of paths -- the unified-lookup case where one config
+    // (JSON, say) carries the path of another (XML) to pull in. The two
+    // need not share a format: each keeps its own native tree, and `name`
+    // resolves into the attached one. Returns a new parser; this one is
+    // untouched.
+    [[nodiscard]] ConfigParser load_into(std::string_view name,
+                                          const std::filesystem::path& file) const;
+
+    Node root() const;
+
+    // Walks a dot-separated path from `base`, matching each segment
+    // case-insensitively -- the same rule struct binding uses, so a path
+    // and a struct field name mean the same thing. nullopt if any segment
+    // is missing or a non-terminal one isn't a subtree; an empty path is
+    // `base` itself.
+    std::optional<Node> resolve(Node base, std::string_view path) const;
+
+    // That node's contents, for the caller to consume: its own scalar, or
+    // one flattened level of children. This is the only place a FieldList
+    // comes into existence, and the caller owns the one it gets.
+    FieldValue to_value(Node node) const;
+
+private:
+    struct Document;
+
+    // Parses one file into a document, shared by load() and load_into() so
+    // an attached document is read exactly the way a primary one is.
+    static std::shared_ptr<Document> read(const std::filesystem::path& file);
+
+    explicit ConfigParser(std::shared_ptr<const Document> doc) noexcept
+        : doc_(std::move(doc)) {}
+
+    std::shared_ptr<const Document> doc_;
+};
 
 } // namespace binding
