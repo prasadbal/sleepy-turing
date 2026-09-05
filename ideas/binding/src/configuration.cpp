@@ -23,10 +23,18 @@ using ActiveParser = XmlConfigParser;
 static_assert(config_parser<ActiveParser>);
 
 // What sits in Configuration's std::any: a parser plus one of its node
-// handles. The parser is held by value and shares ownership of the parsed
-// document, so `node` stays valid for as long as any Configuration
-// pointing into that document does -- including a section() that outlives
-// the Configuration it came from.
+// handles, deliberately stored together.
+//
+// The parser is held *by value*, not referred to, and that is the whole
+// mechanism keeping this safe: a parser copy shares ownership of the
+// parsed document (see config_parser.h's lifetime rule), so holding a
+// Configuration holds the document up, and `node` cannot outlive what it
+// points into. That makes a get() valid however long after the load it
+// happens, and makes a section() independent of the Configuration it came
+// from -- the parent can be destroyed and the child still reads.
+//
+// Storing the parser by reference, or hoisting one copy into a global,
+// would both reintroduce exactly the dangling case this avoids.
 struct NodeRef {
     ActiveParser parser;
     ActiveParser::Node node;

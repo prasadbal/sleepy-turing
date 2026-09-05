@@ -38,6 +38,27 @@
 // type-erased -- so it can be a ptree pointer, a toml::node_view, or a
 // Field pointer, without any of that reaching a caller.
 //
+// LIFETIME, which a concept cannot express and which an implementation
+// therefore has to be told:
+//
+//   A Node must stay valid for as long as any copy of the parser that
+//   produced it is alive, and must not be invalidated by any later call
+//   on that parser.
+//
+// Configuration depends on exactly this. It stores a parser *by value*
+// alongside each Node it holds, so owning a Configuration owns a share of
+// the document, and every get() is safe however long after the load it
+// happens -- including from a section() whose parent Configuration is long
+// gone. Copying the parser is what keeps the document alive, so the parser
+// must be cheap to copy and must share its document rather than own it
+// outright (XmlConfigParser holds a shared_ptr to an immutable, heap-
+// allocated tree, and hands out pointers into it).
+//
+// A backend that returned a handle into storage it might reallocate, or
+// one invalidated by the next resolve(), would satisfy every requirement
+// below and still break Configuration -- silently, and not at the call
+// that broke it. Hence writing it down here.
+//
 // Resolution is deliberately the parser's job rather than something
 // Configuration does for it. It's format knowledge: in XML an attribute and
 // a child element are both just "a field" to whoever writes the config,
