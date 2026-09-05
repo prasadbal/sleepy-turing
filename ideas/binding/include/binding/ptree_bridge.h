@@ -35,9 +35,20 @@ inline bool is_ptree_array(const boost::property_tree::ptree& node) {
     return true;
 }
 
-inline FieldList from_ptree(const boost::property_tree::ptree& pt) {
-    FieldList fields;
-
+// Visits one level of `pt` as the config sees it, calling
+// fn(name, const ptree& child) for each entry -- the single definition of
+// "what fields exist here", which both from_ptree() (converting a subtree)
+// and find_ptree_child() (walking a path) are built on. Keeping it in one
+// place is what stops a path from resolving differently than binding sees
+// the same document: two implementations of these rules would eventually
+// disagree, and every rule here is a case where the raw tree and the
+// config's own shape differ.
+//
+// Note a name can be yielded more than once -- that is how repetition is
+// represented (see config_field.h), and it is why this is a visitor rather
+// than a map.
+template <typename F>
+void for_each_ptree_child(const boost::property_tree::ptree& pt, F&& fn) {
     for (const auto& [key, child] : pt) {
         if (key == "<xmlattr>") {
             // xml_parser nests attributes one level down under a synthetic
@@ -46,7 +57,7 @@ inline FieldList from_ptree(const boost::property_tree::ptree& pt) {
             // to know that's a property_tree/xml_parser implementation
             // detail rather than part of the config's own shape.
             for (const auto& [attr_name, attr_value] : child) {
-                fields.push_back(Field{attr_name, attr_value.data()});
+                fn(attr_name, attr_value);
             }
             continue;
         }
@@ -58,7 +69,7 @@ inline FieldList from_ptree(const boost::property_tree::ptree& pt) {
             // as a nested struct named "ports" holding two nameless
             // entries, which no vector<T> field can collect.
             //
-            // Emit one same-named entry per element instead, which is
+            // Yield one same-named entry per element instead, which is
             // exactly how repetition is already represented everywhere else
             // (see config_field.h): a repeated XML element and a TOML array
             // both arrive as several Fields sharing a name in the enclosing
@@ -68,15 +79,36 @@ inline FieldList from_ptree(const boost::property_tree::ptree& pt) {
             // formats already do for the same config shape.
             for (const auto& [element_key, element] : child) {
                 (void)element_key; // empty by construction -- that's the marker
-                if (element.empty()) {
-                    fields.push_back(Field{key, std::string(trim(element.data()))});
-                } else {
-                    fields.push_back(Field{key, from_ptree(element)});
-                }
+                fn(key, element);
             }
             continue;
         }
 
+        fn(key, child);
+    }
+}
+
+// The child named `name` at this level, or nullptr. Shares
+// for_each_ptree_child's rules, so a path segment matches exactly the
+// names binding would see. Case-insensitive, like every other name match
+// here. A repeated name yields the first, which is all a path can mean.
+inline const boost::property_tree::ptree* find_ptree_child(
+    const boost::property_tree::ptree& pt, std::string_view name) {
+    const boost::property_tree::ptree* found = nullptr;
+    for_each_ptree_child(pt, [&](const std::string& key, const boost::property_tree::ptree& child) {
+        if (!found && iequals(key, name)) found = &child;
+    });
+    return found;
+}
+
+// Converts one ptree node's children into Fields. Recursive, so this
+// materializes the whole subtree -- which is the point: it is called on
+// exactly the node being bound, and the FieldList it returns lives only
+// until that bind finishes.
+inline FieldList from_ptree(const boost::property_tree::ptree& pt) {
+    FieldList fields;
+
+    for_each_ptree_child(pt, [&](const std::string& key, const boost::property_tree::ptree& child) {
         if (child.empty()) {
             // No children -> this node's own text is its whole value. Trimmed
             // because an XML document's indentation and line breaks around a
@@ -108,7 +140,7 @@ inline FieldList from_ptree(const boost::property_tree::ptree& pt) {
 
             fields.push_back(Field{key, std::move(nested)});
         }
-    }
+    });
 
     return fields;
 }

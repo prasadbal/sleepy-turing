@@ -2,59 +2,63 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
 
 #include "binding/config_field.h"
 
 // ============================================================================
-// A config_parser (config_parser.h) that converts a whole document to
-// parser-independent Fields once, at load, and navigates that.
+// A config_parser (config_parser.h) over boost::property_tree (.xml, .json)
+// and toml++ (.toml), chosen by extension at load.
 //
-// One class rather than one per format, because the format only matters
-// for the few lines that read the file: XML and JSON both come from
-// boost::property_tree, TOML from toml++, and all three land in the same
-// Field tree afterward. load() picks by extension:
+// The parsed document is kept in its *native* form and navigated natively.
+// A FieldList is materialized only for the subtree actually being bound, by
+// to_value(), and dies when that bind finishes -- nothing here holds one.
+// So the persistent representation is the parser's own tree, and Fields are
+// transient, which is what binding wants anyway: bind_from_fields takes the
+// resulting FieldList by rvalue and moves its leaf values into the target
+// struct.
 //
-//     .xml           -> boost::property_tree::read_xml
-//     .json          -> boost::property_tree::read_json
-//     .toml          -> toml::parse_file          (when toml++ is available)
-//
-// Converting up front rather than navigating the parser's own tree is a
-// deliberate choice for this parser, not something the seam imposes.
-// ptree's get_child_optional() cannot answer the questions asked here: it
-// matches case-sensitively, and an XML attribute (<pool size="10"/>) lives
-// under a synthetic <xmlattr> child, so "pool.size" doesn't resolve to it
-// at all. from_ptree()/from_toml() normalize both -- flattening each level
-// into one uniform FieldList -- which is what makes a config path mean the
-// same thing as a struct field name, and what lets one document's tree be
-// spliced into another's (see load_into) regardless of which format each
-// came from.
-//
-// Node is `const Field*` -- an 8-byte handle into the tree this parser
-// owns, satisfying config_parser.h's lifetime rule: the tree is immutable
-// and heap-allocated, shared by every copy of the parser, so a handle stays
-// valid for as long as any copy lives.
+// What keeps that from becoming a second, subtly different reading of the
+// same document is that "what fields exist at this level" is defined once
+// per format, as a visitor (for_each_ptree_child / for_each_toml_child),
+// with both the path walk and the conversion built on it. They cannot
+// disagree about attribute flattening, array shapes, or case-insensitive
+// matching. Walking paths with ptree's own get_child_optional() instead was
+// tried and does not work: it cannot see XML attributes and matches
+// case-sensitively, so "pool.size" resolved to nothing while binding found
+// it fine.
 // ============================================================================
 
 namespace binding {
 
 class FieldTreeParser {
 public:
-    using Node = const Field*;
+    // An opaque handle into the parsed document -- copyable, cheap, and
+    // deliberately not naming any parser type, so this header carries no
+    // parser dependency. What's inside is field_tree_parser.cpp's business.
+    // Valid for as long as any copy of the parser that produced it lives,
+    // as config_parser.h's lifetime rule requires: the document is
+    // immutable and shared, so a handle can't outlive it.
+    struct Node {
+        const void* impl = nullptr;
+        int kind = 0;
+    };
 
     // Throws std::runtime_error if the file is missing, has an unknown
     // extension, or fails to parse.
     static FieldTreeParser load(const std::filesystem::path& file);
 
-    // Loads `file` and splices it into this parser's tree under `name`, so
-    // both documents answer to one set of paths -- the unified-lookup case
-    // where one config (JSON, say) names another (XML) to pull in.
-    // Formats need not match: both become Fields either way. Returns a new
-    // parser; this one is untouched.
+    // Loads `file` and attaches it under `name`, so both documents answer
+    // to one set of paths -- the unified-lookup case where one config
+    // (JSON, say) carries the path of another (XML) to pull in. The two
+    // need not share a format: each keeps its own native tree, and `name`
+    // resolves into the attached one. Returns a new parser; this one is
+    // untouched.
     [[nodiscard]] FieldTreeParser load_into(std::string_view name,
                                              const std::filesystem::path& file) const;
 
-    Node root() const noexcept { return &doc_->root; }
+    Node root() const;
 
     // Walks a dot-separated path from `base`, matching each segment
     // case-insensitively -- the same rule struct binding uses, so a path
@@ -63,21 +67,21 @@ public:
     // `base` itself.
     std::optional<Node> resolve(Node base, std::string_view path) const;
 
-    // The node's contents, for the caller to consume: its own scalar, or
-    // one flattened level of children.
-    FieldValue to_value(Node node) const { return node->value; }
+    // That node's contents, for the caller to consume: its own scalar, or
+    // one flattened level of children. This is the only place a FieldList
+    // comes into existence, and the caller owns the one it gets.
+    FieldValue to_value(Node node) const;
 
 private:
-    struct Document {
-        Field root;
-    };
+    struct Document;
+
+    // Parses one file into a document, shared by load() and load_into() so
+    // an attached document is read exactly the way a primary one is.
+    static std::shared_ptr<Document> read(const std::filesystem::path& file);
 
     explicit FieldTreeParser(std::shared_ptr<const Document> doc) noexcept
         : doc_(std::move(doc)) {}
 
-    // Shared, so copying a parser -- which every Configuration and
-    // section() of one does -- keeps the document alive without
-    // duplicating it, and every Node handed out stays valid.
     std::shared_ptr<const Document> doc_;
 };
 

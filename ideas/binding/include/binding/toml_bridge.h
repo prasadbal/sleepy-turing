@@ -29,6 +29,53 @@
 
 namespace binding {
 
+// Visits one level of `t` as the config sees it, calling
+// fn(name, const toml::node&) for each entry -- the single definition of
+// "what fields exist here" on the TOML side, which both from_toml()
+// (converting a subtree) and find_toml_child() (walking a path) are built
+// on, so a path can't resolve differently than binding sees the same
+// document. The ptree bridge has the same split for the same reason.
+//
+// An array yields one entry per element, all under the same name: that is
+// how repetition is represented (see config_field.h), and it makes a TOML
+// array of tables ([[replicas]]) and a repeated XML element arrive in the
+// identical shape.
+template <typename F>
+void for_each_toml_child(const toml::table& t, F&& fn) {
+    for (const auto& [key, node] : t) {
+        const std::string name(key.str());
+        if (node.is_array()) {
+            for (const auto& elem : *node.as_array()) {
+                fn(name, elem);
+            }
+        } else {
+            fn(name, node);
+        }
+    }
+}
+
+// The child named `name` at this level, or nullptr. Case-insensitive, and
+// sharing for_each_toml_child's rules. A repeated name (an array) yields
+// the first element, which is all a path can mean.
+inline const toml::node* find_toml_child(const toml::table& t, std::string_view name) {
+    const toml::node* found = nullptr;
+    for_each_toml_child(t, [&](const std::string& key, const toml::node& node) {
+        if (!found && iequals(key, name)) found = &node;
+    });
+    return found;
+}
+
+// Converts one already-resolved toml::node into a LeafValue, or nullopt if
+// it isn't a scalar this library can represent (a table, or a date/time --
+// see the note at the bottom of from_toml).
+inline std::optional<LeafValue> toml_leaf(const toml::node& node) {
+    if (node.is_string()) return LeafValue(std::string(**node.as_string()));
+    if (node.is_integer()) return LeafValue(**node.as_integer());
+    if (node.is_floating_point()) return LeafValue(**node.as_floating_point());
+    if (node.is_boolean()) return LeafValue(**node.as_boolean());
+    return std::nullopt;
+}
+
 inline FieldList from_toml(const toml::table& t) {
     FieldList fields;
 
