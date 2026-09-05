@@ -67,12 +67,16 @@ if(BINDING_BOOST_INCLUDE_DIR)
     add_executable(config_demo examples/config_demo.cpp)
     target_link_libraries(config_demo PRIVATE binding)
 
-    # The one compiled piece of this otherwise header-only library:
-    # config_parser.cpp is the only translation unit that names
-    # boost::property_tree, so configuration.h -- and everything that
-    # includes it -- carries no parser dependency at all. Swapping the
-    # parser means replacing this one source file, not recompiling callers.
-    add_library(binding_config STATIC src/config_parser.cpp)
+    # The only compiled pieces of this otherwise header-only library.
+    # xml_config_parser.cpp is the sole translation unit that names
+    # boost::property_tree; configuration.cpp is the only one that names
+    # which parser is in use at all. No header a caller includes mentions
+    # either, so swapping the backend is one alias in configuration.cpp
+    # plus its parser's own .cpp -- callers don't recompile for it.
+    add_library(binding_config STATIC
+        src/configuration.cpp
+        src/xml_config_parser.cpp
+    )
     target_link_libraries(binding_config PUBLIC binding)
 else()
     message(STATUS "binding: no local Boost install found, skipping config_demo and binding_config (both need boost::property_tree)")
