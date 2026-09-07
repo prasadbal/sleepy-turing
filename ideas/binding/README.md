@@ -49,6 +49,27 @@ that's worth doing, not a committed dependency.
   has no meaningful time-of-day); reach for `OciTimestamp` only when
   sub-day precision genuinely matters. Neither models fractional seconds
   or timezones yet.
+
+  Both types also have `from_text(conn, value, format = {}, language = {})`
+  and `to_text(conn, format = {}, language = {})`, parsing/rendering against
+  an *arbitrary* Oracle format model (`"YYYYMMDD"`, `"DD/MM/YYYY HH24:MI:SS"`,
+  ...) via `OCIDateFromText`/`OCIDateToText` (`OciDate`) or
+  `OCIDateTimeFromText`/`OCIDateTimeToText` (`OciTimestamp`) -- Oracle's own
+  client-side format-model interpreter, not the fixed `"DD-MON-RR"` the
+  string constructor and `to_string()` above hand-roll. `format` left empty
+  falls back to `set_default_format()`'s value (each type has its own,
+  independent default -- a call before either is configured throws, rather
+  than silently guessing a shape); `OciTimestamp::from_text` builds a
+  throwaway `OCIDateTime` descriptor to parse into and reads the fields back
+  out via `OCIDateTimeGetDate`/`GetTime`, since `OciTimestamp` itself stores
+  plain fields, not a live descriptor, same as its other constructors. **Does
+  not need a live connection/session** in the network sense -- these OCI
+  calls take only `OCIError*` (`OCIEnv*` too, for the `DateTime` pair), never
+  `OCISvcCtx*`, so nothing round-trips to the server; `conn` just has to be
+  `connect()`ed already, since that is the only place this codebase
+  allocates those handles. Does *not* change `OciTimestamp`'s bulk-insert
+  restriction below -- a format-string-parsed value is exactly as
+  locator-based as any other `OciTimestamp`.
 - `include/binding/oci_connection.h` -- `OciConnection`: owns the OCI
   handles and the reconnect policy (see below).
 - `include/binding/oci_client.h` -- `OciClient`: `execute()`, `insert()`,
@@ -566,8 +587,20 @@ whose definition you control.
   `OCINumber`/`SQLT_VNU` (or be fetched as text) rather than a `double`.
   `float`/`SQLT_BFLOAT` is kept only for compatibility; ~7 significant
   digits is not enough for anything money-shaped.
-- Date/timestamp columns. There is no `SQLT_DAT`/`SQLT_TIMESTAMP` mapping
-  and no date type here at all.
+- Fractional seconds and timezones on `OciTimestamp` (see
+  `include/binding/oci_datetime.h` above for what DATE/TIMESTAMP support
+  exists).
+- Bulk `insert(vector<T>&)` for `OciTimestamp` -- its `OCIDateTime*` is a
+  per-value descriptor with no fixed-stride array-bind representation, the
+  same restriction a LOB field has; `OciDate` (a plain 7-byte value) has no
+  such limit.
+- Oracle format-model elements beyond the numeric ones and AM/PM in
+  `from_text()`/`to_text()`'s *mock* -- spelled month/day names (MON,
+  MONTH, DY, DAY), week/Julian-day elements, fill mode, and quoted literals
+  are all real Oracle format-model elements the real `OCIDateFromText`/
+  `OCIDateTimeFromText` handle correctly (it's Oracle's own interpreter);
+  the mock's small hand-rolled tokenizer (`oci_mock.h`) only covers what a
+  batch/reporting date string actually uses in practice.
 - Nullable LOBs (`std::optional<OciClob>`) -- LOB fields always bind/define
   as not-null for now.
 - Non-`std::string` string-like leaf types in `config_bind.h`'s

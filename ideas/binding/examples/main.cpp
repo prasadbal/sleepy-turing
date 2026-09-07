@@ -26,6 +26,12 @@
 //   7. A row with string columns and a 64-bit id: FixedString<N> fetched as
 //      a select() output column and bulk-inserted through a real array
 //      bind, neither of which a std::string field can do.
+//   8. OciDate/OciTimestamp parsed from an arbitrary caller-supplied Oracle
+//      format string (via OCIDateFromText/OCIDateTimeFromText) rather than
+//      the fixed "DD-MON-RR" default, then bound and inserted through the
+//      same bind/insert machinery as every other field -- the first time
+//      this demo exercises OciDate/OciTimestamp through an actual
+//      execute()/insert() call at all.
 //
 // Builds against the mock OCI backend (binding/oci_mock.h) since there's no
 // real Oracle client in this environment -- see oci_compat.h.
@@ -107,6 +113,19 @@ struct ReportRow {
     std::optional<double>            vega; // sparse: absent for non-optionable risk
 };
 static_assert(binding::bindable<ReportRow>);
+
+// ---- a COB-dated position row and an audit row with a captured time ------
+struct PositionRow {
+    std::int64_t     position_id;
+    binding::OciDate cob_date; // OciDate is a plain 7-byte value -- bulk-bindable
+};
+static_assert(binding::bindable<PositionRow>);
+
+struct AuditRow {
+    std::int64_t          run_id;
+    binding::OciTimestamp captured_at; // locator-based -- NOT bulk-bindable, see Demo 8 below
+};
+static_assert(binding::bindable<AuditRow>);
 
 int main() {
     binding::OciConnection conn("orcl", "app_user", "secret",
@@ -237,6 +256,39 @@ int main() {
     }
     std::cout << "  inserted " << to_write.size() << " rows one at a time (vega is std::optional,\n"
               << "   which the array-bind overload rejects at compile time)\n";
+    std::cout << "\n";
+
+    std::cout << "--- Demo 8: OciDate/OciTimestamp from an arbitrary Oracle format string ---\n";
+    // A site-wide default, set once -- most call sites below never repeat
+    // the format string, matching how a reporting shop's extract files
+    // typically fix one date shape (here, bare YYYYMMDD) for every field.
+    binding::OciDate::set_default_format("YYYYMMDD");
+    binding::OciTimestamp::set_default_format("YYYYMMDD HH24:MI:SS");
+
+    std::vector<PositionRow> positions{
+        {7001, binding::OciDate::from_text(conn, "20260907")},                  // default format
+        {7002, binding::OciDate::from_text(conn, "07/09/2026", "DD/MM/YYYY")},  // explicit override
+    };
+    // OciDate is a plain fixed-size value, so this is the same real array
+    // bind (one OCIStmtExecute, iters=2) as Demo 4.5's insert(vector<T>&).
+    const bool positions_ok =
+        client.insert(conn, "INSERT INTO positions VALUES(:position_id,:cob_date)", positions);
+    std::cout << "  bulk-inserted " << positions.size() << " OciDate rows in one array bind, ok="
+              << positions_ok << "\n";
+    std::cout << "  cob_date[0] rendered back as " << positions[0].cob_date.to_text(conn)
+              << " (default format) and " << positions[0].cob_date.to_text(conn, "YYYY/MM/DD")
+              << " (explicit override -- MON/MONTH-style names aren't in the mock's small\n"
+              << "   token set, see oci_mock.h's tokenize_date_format comment)\n";
+
+    AuditRow audit{9001, binding::OciTimestamp::from_text(conn, "20260907 15:30:45")};
+    // OciTimestamp's OCIDateTime* is a per-value descriptor (like a LOB
+    // locator), so -- unchanged by this feature -- it still goes through
+    // insert(conn, query_text, T&) one row at a time, not the vector<T>&
+    // array-bind overload (that overload static_asserts against any
+    // OciTimestamp field; see bind_one_field_array's comment).
+    const bool audit_ok = client.insert(conn, "INSERT INTO audit_log VALUES(:run_id,:captured_at)", audit);
+    std::cout << "  inserted 1 OciTimestamp row (row-at-a-time, by design), ok=" << audit_ok
+              << ", captured_at=" << audit.captured_at.to_text(conn, "MM/DD/YYYY HH:MI:SS AM") << "\n";
 
     conn.disconnect();
     return 0;

@@ -9,6 +9,7 @@
 #include <type_traits>
 
 #include "binding/oci_compat.h"
+#include "binding/oci_connection.h"
 
 namespace binding {
 namespace detail {
@@ -270,6 +271,64 @@ public:
                detail::zero_pad(year() % 100, 2);
     }
 
+    // Sets the format used by the no-explicit-format overloads of
+    // from_text()/to_text() below -- e.g. a site that always represents
+    // dates as "YYYYMMDD" calls this once at startup instead of repeating
+    // the format string at every call site. Independent of OciTimestamp's
+    // own default_format() below; the two are set separately. Not
+    // thread-safe against a concurrent writer -- set it once during startup,
+    // before any OciDate parsing/rendering runs on another thread.
+    static void set_default_format(std::string_view format) { default_format_storage() = std::string(format); }
+    static const std::string& default_format() { return default_format_storage(); }
+
+    // Parses `text` against an explicit Oracle format model (e.g.
+    // "YYYYMMDD", "DD/MM/YYYY") via OCIDateFromText -- Oracle's own
+    // client-side format-model interpreter, unlike the hand-rolled
+    // default-format ("DD-MON-RR") parser the single-argument constructor
+    // above uses. `format` empty (the default) uses whatever
+    // set_default_format() last configured; throws if neither was given.
+    //
+    // Needs conn.err() to be valid, so `conn` must already be connect()ed --
+    // but no live session/round-trip happens here. OCIDateFromText takes
+    // only an OCIError*, never an OCISvcCtx*, and never talks to the server:
+    // the format-model interpreter runs in the OCI client library, in
+    // process, the same way TO_DATE's parsing logic does, just evaluated
+    // client-side instead of on the server.
+    static OciDate from_text(OciConnection& conn, std::string_view value,
+                              std::string_view format = {}, std::string_view language = {}) {
+        const std::string_view fmt = resolve_format(format);
+        OciDate result;
+        const sword status = OCIDateFromText(conn.err(),
+            reinterpret_cast<const ::text*>(value.data()), static_cast<ub4>(value.size()),
+            reinterpret_cast<const ::text*>(fmt.data()), static_cast<ub1>(fmt.size()),
+            language.empty() ? nullptr : reinterpret_cast<const ::text*>(language.data()),
+            static_cast<ub4>(language.size()), &result.raw_);
+        if (status != OCI_SUCCESS) {
+            throw std::runtime_error("binding: OCIDateFromText failed parsing '" + std::string(value) +
+                                     "' against format '" + std::string(fmt) + "'");
+        }
+        return result;
+    }
+
+    // The inverse of from_text() above: renders this value using an
+    // explicit Oracle format model via OCIDateToText, rather than
+    // to_string()'s fixed "DD-MON-RR" rendering. Same default-format and
+    // connection-but-not-session rules as from_text().
+    std::string to_text(OciConnection& conn, std::string_view format = {}, std::string_view language = {}) const {
+        const std::string_view fmt = resolve_format(format);
+        std::array<unsigned char, 128> buf{};
+        ub4 buf_size = static_cast<ub4>(buf.size());
+        const sword status = OCIDateToText(conn.err(), &raw_,
+            reinterpret_cast<const ::text*>(fmt.data()), static_cast<ub1>(fmt.size()),
+            language.empty() ? nullptr : reinterpret_cast<const ::text*>(language.data()),
+            static_cast<ub4>(language.size()), &buf_size, buf.data());
+        if (status != OCI_SUCCESS) {
+            throw std::runtime_error("binding: OCIDateToText failed rendering against format '" +
+                                     std::string(fmt) + "'");
+        }
+        return std::string(reinterpret_cast<const char*>(buf.data()), buf_size);
+    }
+
     friend bool operator==(const OciDate& a, const OciDate& b) noexcept {
         return a.year() == b.year() && a.month() == b.month() && a.day() == b.day() &&
                a.hour() == b.hour() && a.minute() == b.minute() && a.second() == b.second();
@@ -279,6 +338,20 @@ private:
     static OciDate from_text(std::string_view text) {
         const auto parsed = detail::parse_oracle_date(text);
         return OciDate(parsed.year, parsed.month, parsed.day);
+    }
+
+    static std::string_view resolve_format(std::string_view format) {
+        if (!format.empty()) return format;
+        if (default_format_storage().empty()) {
+            throw std::runtime_error(
+                "binding: OciDate::from_text/to_text needs a format -- pass one explicitly, "
+                "or call OciDate::set_default_format(...) once at startup");
+        }
+        return default_format_storage();
+    }
+    static std::string& default_format_storage() {
+        static std::string fmt; // empty until set_default_format() is called
+        return fmt;
     }
 
     ::OCIDate raw_{};
@@ -345,7 +418,108 @@ public:
                detail::zero_pad(minute(), 2) + "." + detail::zero_pad(second(), 2) + " " + meridiem;
     }
 
+    // Sets the format used by the no-explicit-format overloads of
+    // from_text()/to_text() below -- see OciDate::set_default_format's
+    // comment above; this is OciTimestamp's own, independent default (a
+    // site's TIMESTAMP format, e.g. "YYYYMMDD HH24:MI:SS", is rarely the
+    // same string as its DATE-only format).
+    static void set_default_format(std::string_view format) { default_format_storage() = std::string(format); }
+    static const std::string& default_format() { return default_format_storage(); }
+
+    // Parses `text` against an explicit Oracle format model via
+    // OCIDateTimeFromText -- see OciDate::from_text's comment above for why
+    // this needs `conn` (an OCIEnv*/OCIError*) but not a live session/round
+    // trip. Builds a temporary OCIDateTime descriptor to parse into, reads
+    // the fields back out via OCIDateTimeGetDate/GetTime, then frees the
+    // descriptor -- OciTimestamp stores plain year/month/day/hour/minute/
+    // second fields here, not a live descriptor, same as every other
+    // constructor on this class; bind_one_field (details/oci_client.h)
+    // builds its own descriptor from those fields again at bind time via
+    // OCIDateTimeConstruct. `format` empty uses set_default_format()'s
+    // value; throws if neither was given.
+    //
+    // Note this does not change OciTimestamp's existing bulk-insert
+    // restriction: insert(conn, query_text, std::vector<T>&) still
+    // static_asserts against any OciTimestamp field regardless of how its
+    // value was constructed, since that limit is about the OCIDateTime
+    // descriptor having no fixed-stride array-bind representation, not
+    // about how the text got parsed. A row type with a bulk-inserted
+    // TIMESTAMP still needs insert(conn, query_text, T&) in a loop.
+    static OciTimestamp from_text(OciConnection& conn, std::string_view value,
+                                  std::string_view format = {}, std::string_view language = {}) {
+        const std::string_view fmt = resolve_format(format);
+
+        OCIDateTime* temp = nullptr;
+        if (OCIDescriptorAlloc(conn.env(), reinterpret_cast<void**>(&temp), OCI_DTYPE_TIMESTAMP, 0, nullptr) != OCI_SUCCESS) {
+            throw std::runtime_error("binding: OCIDescriptorAlloc(OCI_DTYPE_TIMESTAMP) failed");
+        }
+
+        sword status = OCIDateTimeFromText(conn.env(), conn.err(),
+            reinterpret_cast<const ::text*>(value.data()), static_cast<std::size_t>(value.size()),
+            reinterpret_cast<const ::text*>(fmt.data()), static_cast<ub1>(fmt.size()),
+            language.empty() ? nullptr : reinterpret_cast<const ::text*>(language.data()),
+            static_cast<std::size_t>(language.size()), temp);
+
+        sb2 year = 0; unsigned char month = 0, day = 0, hour = 0, minute = 0, second = 0; ub4 fsec = 0;
+        if (status == OCI_SUCCESS) status = OCIDateTimeGetDate(conn.env(), conn.err(), temp, &year, &month, &day);
+        if (status == OCI_SUCCESS) status = OCIDateTimeGetTime(conn.env(), conn.err(), temp, &hour, &minute, &second, &fsec);
+
+        OCIDescriptorFree(reinterpret_cast<void*>(temp), OCI_DTYPE_TIMESTAMP);
+
+        if (status != OCI_SUCCESS) {
+            throw std::runtime_error("binding: OCIDateTimeFromText failed parsing '" + std::string(value) +
+                                     "' against format '" + std::string(fmt) + "'");
+        }
+        return OciTimestamp(year, month, day, hour, minute, second);
+    }
+
+    // The inverse of from_text() above: builds a temporary descriptor from
+    // this value's own fields (the same OCIDateTimeConstruct call
+    // bind_one_field makes at bind time), renders it via OCIDateTimeToText,
+    // then frees the descriptor.
+    std::string to_text(OciConnection& conn, std::string_view format = {}, std::string_view language = {}) const {
+        const std::string_view fmt = resolve_format(format);
+
+        OCIDateTime* temp = nullptr;
+        if (OCIDescriptorAlloc(conn.env(), reinterpret_cast<void**>(&temp), OCI_DTYPE_TIMESTAMP, 0, nullptr) != OCI_SUCCESS) {
+            throw std::runtime_error("binding: OCIDescriptorAlloc(OCI_DTYPE_TIMESTAMP) failed");
+        }
+
+        sword status = OCIDateTimeConstruct(conn.env(), conn.err(), temp,
+                                            year_, month_, day_, hour_, minute_, second_, 0, nullptr, 0);
+        std::array<unsigned char, 128> buf{};
+        ub4 buf_size = static_cast<ub4>(buf.size());
+        if (status == OCI_SUCCESS) {
+            status = OCIDateTimeToText(conn.env(), conn.err(), temp,
+                reinterpret_cast<const ::text*>(fmt.data()), static_cast<ub1>(fmt.size()), 0,
+                language.empty() ? nullptr : reinterpret_cast<const ::text*>(language.data()),
+                static_cast<std::size_t>(language.size()), &buf_size, buf.data());
+        }
+
+        OCIDescriptorFree(reinterpret_cast<void*>(temp), OCI_DTYPE_TIMESTAMP);
+
+        if (status != OCI_SUCCESS) {
+            throw std::runtime_error("binding: OCIDateTimeToText failed rendering against format '" +
+                                     std::string(fmt) + "'");
+        }
+        return std::string(reinterpret_cast<const char*>(buf.data()), buf_size);
+    }
+
 private:
+    static std::string_view resolve_format(std::string_view format) {
+        if (!format.empty()) return format;
+        if (default_format_storage().empty()) {
+            throw std::runtime_error(
+                "binding: OciTimestamp::from_text/to_text needs a format -- pass one explicitly, "
+                "or call OciTimestamp::set_default_format(...) once at startup");
+        }
+        return default_format_storage();
+    }
+    static std::string& default_format_storage() {
+        static std::string fmt; // empty until set_default_format() is called
+        return fmt;
+    }
+
     static OciTimestamp from_text(std::string_view text) {
         const auto space = text.find(' ');
         if (space == std::string_view::npos) {

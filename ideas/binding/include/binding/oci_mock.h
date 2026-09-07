@@ -12,9 +12,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -136,6 +138,178 @@ inline std::vector<sb2> g_last_bind_indicators;
 // query whose row type actually has an std::optional field in that position.
 inline std::atomic<bool> g_simulate_null_last_column{false};
 inline void set_simulate_null_last_column(bool enabled) { g_simulate_null_last_column = enabled; }
+
+// ----------------------------------------------------------------------------
+// Real, addressable backing storage for a mock OCIDateTime descriptor.
+// Every other descriptor type (a LOB locator, via OCI_DTYPE_LOB) only ever
+// needs to be a non-null, never-dereferenced sentinel, since nothing in this
+// mock reads a LOB locator's own bytes. OCIDateTimeGetDate/GetTime (added
+// below for OciTimestamp::from_text/to_text's OCI-format-model conversion)
+// break that: they need to read back whatever OCIDateTimeConstruct or
+// OCIDateTimeFromText last wrote, so OCI_DTYPE_TIMESTAMP gets real memory
+// instead of the `1` sentinel every other descriptor type still uses.
+// ----------------------------------------------------------------------------
+struct MockDateTimeDescriptor {
+    sb2 year = 1970;
+    unsigned char month = 1, day = 1, hour = 0, minute = 0, second = 0;
+    ub4 fsec = 0;
+};
+
+// ----------------------------------------------------------------------------
+// A deliberately small subset of Oracle's format-model elements -- just
+// enough to exercise "an arbitrary caller-supplied format string" end to end
+// without a real Oracle client. The real OCIDateFromText/OCIDateTimeFromText
+// (and their ToText counterparts) implement Oracle's full format-model
+// surface -- spelled month/day names, week/Julian-day elements, fill mode,
+// quoted literals, and more -- via the client library's own interpreter.
+// This mock does not attempt that: only the numeric elements and AM/PM a
+// batch/reporting date string actually uses in practice (YYYY, YY, RR, MM,
+// DD, HH24, HH12/HH, MI, SS, AM/PM), plus verbatim literal characters
+// (separators like '-', '/', ':', ' ').
+// ----------------------------------------------------------------------------
+enum class DateFormatToken { Year4, Year2, RRYear, Month, Day, Hour24, Hour12, Minute, Second, Meridiem, Literal };
+struct FormatElement { DateFormatToken kind; char literal = 0; };
+
+inline std::vector<FormatElement> tokenize_date_format(std::string_view fmt) {
+    auto upper_at = [&](std::size_t pos) {
+        return static_cast<char>(std::toupper(static_cast<unsigned char>(fmt[pos])));
+    };
+    auto matches = [&](std::size_t pos, std::string_view keyword) {
+        if (pos + keyword.size() > fmt.size()) return false;
+        for (std::size_t k = 0; k < keyword.size(); ++k) {
+            if (upper_at(pos + k) != keyword[k]) return false;
+        }
+        return true;
+    };
+
+    std::vector<FormatElement> tokens;
+    std::size_t i = 0;
+    while (i < fmt.size()) {
+        // Longest match first: "HH24"/"HH12" before "HH", "YYYY" before "YY".
+        if (matches(i, "YYYY"))      { tokens.push_back({DateFormatToken::Year4});  i += 4; }
+        else if (matches(i, "HH24")) { tokens.push_back({DateFormatToken::Hour24}); i += 4; }
+        else if (matches(i, "HH12")) { tokens.push_back({DateFormatToken::Hour12}); i += 4; }
+        else if (matches(i, "RR"))   { tokens.push_back({DateFormatToken::RRYear}); i += 2; }
+        else if (matches(i, "YY"))   { tokens.push_back({DateFormatToken::Year2});  i += 2; }
+        else if (matches(i, "MM"))   { tokens.push_back({DateFormatToken::Month});  i += 2; }
+        else if (matches(i, "DD"))   { tokens.push_back({DateFormatToken::Day});    i += 2; }
+        else if (matches(i, "HH"))   { tokens.push_back({DateFormatToken::Hour12}); i += 2; }
+        else if (matches(i, "MI"))   { tokens.push_back({DateFormatToken::Minute}); i += 2; }
+        else if (matches(i, "SS"))   { tokens.push_back({DateFormatToken::Second}); i += 2; }
+        else if (matches(i, "AM") || matches(i, "PM")) { tokens.push_back({DateFormatToken::Meridiem}); i += 2; }
+        else { tokens.push_back({DateFormatToken::Literal, fmt[i]}); i += 1; }
+    }
+    return tokens;
+}
+
+// Oracle's RR century-rollover rule -- deliberately duplicated from
+// oci_datetime.h's detail::oracle_rr_year rather than shared: this file is
+// what oci_datetime.h's real client-facing OciDate/OciTimestamp types build
+// on top of (via oci_compat.h's mock fallback), not the other way around, so
+// it cannot include that header back without a cycle.
+inline int mock_current_year() {
+    const std::time_t t = std::time(nullptr);
+    const std::tm* lt = std::localtime(&t);
+    return lt ? (1900 + lt->tm_year) : 2000;
+}
+inline int mock_rr_year(int rr, int current_yr) {
+    const int cur_century = current_yr / 100;
+    const int cur_yy = current_yr % 100;
+    const int century = (rr <= 49) ? (cur_yy <= 49 ? cur_century : cur_century + 1)
+                                   : (cur_yy <= 49 ? cur_century - 1 : cur_century);
+    return century * 100 + rr;
+}
+
+struct ParsedMockDateTime {
+    int year = 1970, month = 1, day = 1, hour = 0, minute = 0, second = 0;
+    bool is_pm = false, has_meridiem = false;
+};
+
+// Parses `text` against `fmt`'s tokens, left to right -- every numeric
+// element consumes a fixed width (2 digits, 4 for YYYY), every Literal
+// element must match the input character exactly. Returns false (an OCI
+// status code, not a C++ exception, is what the caller of this mock
+// function actually gets) on any mismatch, short input, or leftover input.
+inline bool parse_with_mock_format(std::string_view text, std::string_view fmt, ParsedMockDateTime& out) {
+    const auto tokens = tokenize_date_format(fmt);
+    std::size_t pos = 0;
+    auto read_digits = [&](int width, int& value) {
+        if (pos + static_cast<std::size_t>(width) > text.size()) return false;
+        int v = 0;
+        for (int k = 0; k < width; ++k) {
+            const char c = text[pos + static_cast<std::size_t>(k)];
+            if (c < '0' || c > '9') return false;
+            v = v * 10 + (c - '0');
+        }
+        value = v;
+        pos += static_cast<std::size_t>(width);
+        return true;
+    };
+
+    for (const auto& tok : tokens) {
+        switch (tok.kind) {
+            case DateFormatToken::Year4:  if (!read_digits(4, out.year)) return false; break;
+            case DateFormatToken::Year2:  { int yy = 0; if (!read_digits(2, yy)) return false; out.year = 2000 + yy; break; }
+            case DateFormatToken::RRYear: { int rr = 0; if (!read_digits(2, rr)) return false;
+                                            out.year = mock_rr_year(rr, mock_current_year()); break; }
+            case DateFormatToken::Month:  if (!read_digits(2, out.month)) return false; break;
+            case DateFormatToken::Day:    if (!read_digits(2, out.day)) return false; break;
+            case DateFormatToken::Hour24: if (!read_digits(2, out.hour)) return false; break;
+            case DateFormatToken::Hour12: if (!read_digits(2, out.hour)) return false; out.has_meridiem = true; break;
+            case DateFormatToken::Minute: if (!read_digits(2, out.minute)) return false; break;
+            case DateFormatToken::Second: if (!read_digits(2, out.second)) return false; break;
+            case DateFormatToken::Meridiem: {
+                if (pos + 2 > text.size()) return false;
+                const char c0 = static_cast<char>(std::toupper(static_cast<unsigned char>(text[pos])));
+                const char c1 = static_cast<char>(std::toupper(static_cast<unsigned char>(text[pos + 1])));
+                if (c1 != 'M' || (c0 != 'A' && c0 != 'P')) return false;
+                out.is_pm = (c0 == 'P');
+                out.has_meridiem = true;
+                pos += 2;
+                break;
+            }
+            case DateFormatToken::Literal:
+                if (pos >= text.size() || text[pos] != tok.literal) return false;
+                pos += 1;
+                break;
+        }
+    }
+    if (out.has_meridiem) {
+        // 12-hour value read into out.hour above (1-12) -> 24-hour.
+        const int h12 = out.hour;
+        out.hour = out.is_pm ? (h12 == 12 ? 12 : h12 + 12) : (h12 == 12 ? 0 : h12);
+    }
+    return pos == text.size();
+}
+
+inline std::string zero_pad_mock(int value, int width) {
+    std::string s = std::to_string(value);
+    while (static_cast<int>(s.size()) < width) s.insert(s.begin(), '0');
+    return s;
+}
+
+// The inverse of parse_with_mock_format: renders year/month/day/hour/
+// minute/second against fmt's tokens.
+inline std::string render_with_mock_format(std::string_view fmt, int year, int month, int day,
+                                            int hour, int minute, int second) {
+    std::string out;
+    for (const auto& tok : tokenize_date_format(fmt)) {
+        switch (tok.kind) {
+            case DateFormatToken::Year4:  out += zero_pad_mock(year, 4); break;
+            case DateFormatToken::Year2:
+            case DateFormatToken::RRYear: out += zero_pad_mock(year % 100, 2); break;
+            case DateFormatToken::Month:  out += zero_pad_mock(month, 2); break;
+            case DateFormatToken::Day:    out += zero_pad_mock(day, 2); break;
+            case DateFormatToken::Hour24: out += zero_pad_mock(hour, 2); break;
+            case DateFormatToken::Hour12: { const int h = hour % 12; out += zero_pad_mock(h == 0 ? 12 : h, 2); break; }
+            case DateFormatToken::Minute: out += zero_pad_mock(minute, 2); break;
+            case DateFormatToken::Second: out += zero_pad_mock(second, 2); break;
+            case DateFormatToken::Meridiem: out += (hour < 12 ? "AM" : "PM"); break;
+            case DateFormatToken::Literal: out += tok.literal; break;
+        }
+    }
+    return out;
+}
 
 } // namespace binding::mock
 
@@ -341,14 +515,123 @@ inline sword OCIErrorGet(dvoid*, ub4, text*, sb4* errcodep, text* bufp, ub4 bufs
     return OCI_SUCCESS;
 }
 
-inline sword OCIDescriptorAlloc(const dvoid*, dvoid** descpp, ub4, size_t, dvoid**) {
-    *descpp = reinterpret_cast<dvoid*>(1);
+inline sword OCIDescriptorAlloc(const dvoid*, dvoid** descpp, ub4 type, size_t, dvoid**) {
+    using namespace binding::mock;
+    *descpp = (type == OCI_DTYPE_TIMESTAMP)
+        ? reinterpret_cast<dvoid*>(new MockDateTimeDescriptor{})
+        : reinterpret_cast<dvoid*>(1); // LOB locator and anything else: never dereferenced
     return OCI_SUCCESS;
 }
-inline sword OCIDescriptorFree(dvoid*, ub4) { return OCI_SUCCESS; }
+inline sword OCIDescriptorFree(dvoid* descp, ub4 type) {
+    if (type == OCI_DTYPE_TIMESTAMP) {
+        delete reinterpret_cast<binding::mock::MockDateTimeDescriptor*>(descp);
+    }
+    return OCI_SUCCESS;
+}
 
-inline sword OCIDateTimeConstruct(void*, OCIError*, OCIDateTime*, sb2, unsigned char, unsigned char,
-                                   unsigned char, unsigned char, unsigned char, ub4, text*, size_t) {
+inline sword OCIDateTimeConstruct(void*, OCIError*, OCIDateTime* datetime, sb2 year, unsigned char month,
+                                   unsigned char day, unsigned char hour, unsigned char minute,
+                                   unsigned char second, ub4 fsec, text*, size_t) {
+    using namespace binding::mock;
+    *reinterpret_cast<MockDateTimeDescriptor*>(datetime) =
+        MockDateTimeDescriptor{year, month, day, hour, minute, second, fsec};
+    return OCI_SUCCESS;
+}
+
+// Parses date_str against fmt via the mock's small format-model interpreter
+// (see binding::mock::parse_with_mock_format above) and writes the result
+// directly into *date -- the real OCIDateFromText does the equivalent using
+// Oracle's own interpreter, needing only err (never a live session/round
+// trip: this is a pure client-side text<->value conversion).
+inline sword OCIDateFromText(OCIError*, const text* date_str, ub4 d_str_length,
+                              const text* fmt, ub1 fmt_length,
+                              const text*, ub4,
+                              OCIDate* date) {
+    using namespace binding::mock;
+    ParsedMockDateTime parsed;
+    const std::string_view text_sv(reinterpret_cast<const char*>(date_str), d_str_length);
+    const std::string_view fmt_sv(reinterpret_cast<const char*>(fmt), fmt_length);
+    if (!parse_with_mock_format(text_sv, fmt_sv, parsed)) return OCI_ERROR;
+    date->OCIDateYYYY = static_cast<sb2>(parsed.year);
+    date->OCIDateMM = static_cast<unsigned char>(parsed.month);
+    date->OCIDateDD = static_cast<unsigned char>(parsed.day);
+    date->OCIDateTime.OCITimeHH = static_cast<unsigned char>(parsed.hour);
+    date->OCIDateTime.OCITimeMI = static_cast<unsigned char>(parsed.minute);
+    date->OCIDateTime.OCITimeSS = static_cast<unsigned char>(parsed.second);
+    return OCI_SUCCESS;
+}
+
+// The inverse of OCIDateFromText: renders *date against fmt into buf,
+// failing (rather than truncating) if it doesn't fit in the caller's buffer
+// -- *buf_size is the buffer's capacity on entry, the rendered length on a
+// successful return, matching the real function's in/out convention.
+inline sword OCIDateToText(OCIError*, const OCIDate* date,
+                            const text* fmt, ub1 fmt_length,
+                            const text*, ub4,
+                            ub4* buf_size, text* buf) {
+    using namespace binding::mock;
+    const std::string_view fmt_sv(reinterpret_cast<const char*>(fmt), fmt_length);
+    const std::string rendered = render_with_mock_format(fmt_sv,
+        date->OCIDateYYYY, date->OCIDateMM, date->OCIDateDD,
+        date->OCIDateTime.OCITimeHH, date->OCIDateTime.OCITimeMI, date->OCIDateTime.OCITimeSS);
+    if (rendered.size() > *buf_size) return OCI_ERROR;
+    std::memcpy(buf, rendered.data(), rendered.size());
+    *buf_size = static_cast<ub4>(rendered.size());
+    return OCI_SUCCESS;
+}
+
+// TIMESTAMP counterparts of OCIDateFromText/OCIDateToText above, operating
+// on the OCIDateTime descriptor (see MockDateTimeDescriptor) instead of a
+// flat ::OCIDate. `hndl` is an OCIEnv* in this codebase's usage (see
+// OciTimestamp::from_text/to_text in oci_datetime.h) -- still never an
+// OCISvcCtx*/live session, same reason as the OciDate pair above.
+inline sword OCIDateTimeFromText(void*, OCIError*,
+                                  const text* date_str, size_t dstr_length,
+                                  const text* fmt, ub1 fmt_length,
+                                  const text*, size_t,
+                                  OCIDateTime* datetime) {
+    using namespace binding::mock;
+    ParsedMockDateTime parsed;
+    const std::string_view text_sv(reinterpret_cast<const char*>(date_str), dstr_length);
+    const std::string_view fmt_sv(reinterpret_cast<const char*>(fmt), fmt_length);
+    if (!parse_with_mock_format(text_sv, fmt_sv, parsed)) return OCI_ERROR;
+    *reinterpret_cast<MockDateTimeDescriptor*>(datetime) = MockDateTimeDescriptor{
+        static_cast<sb2>(parsed.year), static_cast<unsigned char>(parsed.month),
+        static_cast<unsigned char>(parsed.day), static_cast<unsigned char>(parsed.hour),
+        static_cast<unsigned char>(parsed.minute), static_cast<unsigned char>(parsed.second), 0};
+    return OCI_SUCCESS;
+}
+
+inline sword OCIDateTimeToText(void*, OCIError*, const OCIDateTime* datetime,
+                                const text* fmt, ub1 fmt_length, ub1,
+                                const text*, size_t,
+                                ub4* buf_size, text* buf) {
+    using namespace binding::mock;
+    const auto* d = reinterpret_cast<const MockDateTimeDescriptor*>(datetime);
+    const std::string_view fmt_sv(reinterpret_cast<const char*>(fmt), fmt_length);
+    const std::string rendered = render_with_mock_format(fmt_sv, d->year, d->month, d->day, d->hour, d->minute, d->second);
+    if (rendered.size() > *buf_size) return OCI_ERROR;
+    std::memcpy(buf, rendered.data(), rendered.size());
+    *buf_size = static_cast<ub4>(rendered.size());
+    return OCI_SUCCESS;
+}
+
+// Reads the fields OCIDateTimeConstruct/OCIDateTimeFromText last wrote back
+// out of the descriptor -- what lets OciTimestamp::from_text (oci_datetime.h)
+// stay a plain value type (year/month/day/hour/minute/second fields, no live
+// descriptor held between calls) even when it's built via the OCI text
+// conversion instead of the hand-rolled default-format parser.
+inline sword OCIDateTimeGetDate(void*, OCIError*, const OCIDateTime* datetime,
+                                 sb2* year, unsigned char* month, unsigned char* day) {
+    const auto* d = reinterpret_cast<const binding::mock::MockDateTimeDescriptor*>(datetime);
+    *year = d->year; *month = d->month; *day = d->day;
+    return OCI_SUCCESS;
+}
+inline sword OCIDateTimeGetTime(void*, OCIError*, OCIDateTime* datetime,
+                                 unsigned char* hour, unsigned char* minute, unsigned char* second, ub4* fsec) {
+    const auto* d = reinterpret_cast<const binding::mock::MockDateTimeDescriptor*>(datetime);
+    *hour = d->hour; *minute = d->minute; *second = d->second;
+    if (fsec) *fsec = d->fsec;
     return OCI_SUCCESS;
 }
 
