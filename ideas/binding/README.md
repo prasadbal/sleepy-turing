@@ -50,26 +50,41 @@ that's worth doing, not a committed dependency.
   sub-day precision genuinely matters. Neither models fractional seconds
   or timezones yet.
 
-  Both types also have `from_text(conn, value, format = {}, language = {})`
-  and `to_text(conn, format = {}, language = {})`, parsing/rendering against
-  an *arbitrary* Oracle format model (`"YYYYMMDD"`, `"DD/MM/YYYY HH24:MI:SS"`,
-  ...) via `OCIDateFromText`/`OCIDateToText` (`OciDate`) or
-  `OCIDateTimeFromText`/`OCIDateTimeToText` (`OciTimestamp`) -- Oracle's own
-  client-side format-model interpreter, not the fixed `"DD-MON-RR"` the
-  string constructor and `to_string()` above hand-roll. `format` left empty
-  falls back to `set_default_format()`'s value (each type has its own,
-  independent default -- a call before either is configured throws, rather
-  than silently guessing a shape); `OciTimestamp::from_text` builds a
-  throwaway `OCIDateTime` descriptor to parse into and reads the fields back
-  out via `OCIDateTimeGetDate`/`GetTime`, since `OciTimestamp` itself stores
-  plain fields, not a live descriptor, same as its other constructors. **Does
-  not need a live connection/session** in the network sense -- these OCI
-  calls take only `OCIError*` (`OCIEnv*` too, for the `DateTime` pair), never
-  `OCISvcCtx*`, so nothing round-trips to the server; `conn` just has to be
-  `connect()`ed already, since that is the only place this codebase
-  allocates those handles. Does *not* change `OciTimestamp`'s bulk-insert
-  restriction below -- a format-string-parsed value is exactly as
-  locator-based as any other `OciTimestamp`.
+  Getting a value from/to text goes through `from_text(conn, value,
+  format = {}, language = {})` and `to_text(conn, format = {}, language = {})`
+  on both types, against an *arbitrary* Oracle format model (`"YYYYMMDD"`,
+  `"DD/MM/YYYY HH24:MI:SS"`, ...) via `OCIDateFromText`/`OCIDateToText`
+  (`OciDate`) or `OCIDateTimeFromText`/`OCIDateTimeToText`/
+  `OCIDateTimeGetDate`/`GetTime` (`OciTimestamp`) -- Oracle's own
+  client-side format-model interpreter. `format` left empty falls back to
+  `set_default_format()`'s value; each type has its own, independent
+  default, seeded with Oracle's real out-of-the-box format (`"DD-MON-RR"`
+  for `OciDate`, `"DD-MON-RR HH.MI.SS AM"` for `OciTimestamp`) so an
+  unconfigured call behaves the same as a bare `TO_DATE(text)`/
+  `TO_CHAR(date_col)` would against a fresh session -- a call after
+  `set_default_format("")` (or any other empty override) throws rather than
+  silently guessing a shape. `OciTimestamp::from_text`/`to_text` build a
+  throwaway `OCIDateTime` descriptor to parse into or render from, since
+  `OciTimestamp` itself stores plain fields, not a live descriptor, same as
+  its numeric constructor. **Does not need a live connection/session** in
+  the network sense -- these OCI calls take only `OCIError*` (`OCIEnv*` too,
+  for the `DateTime` pair), never `OCISvcCtx*`, so nothing round-trips to
+  the server; `conn` just has to be `connect()`ed already, since that is
+  the only place this codebase allocates those handles. Does *not* change
+  `OciTimestamp`'s bulk-insert restriction below -- a format-string-parsed
+  value is exactly as locator-based as any other `OciTimestamp`.
+
+  There used to be a second, parallel way to do this: a hand-rolled
+  constructor (`OciDate(std::string_view)`/`OciTimestamp(std::string_view)`)
+  and `to_string()`, parsing/rendering Oracle's default formats in plain
+  C++ with no connection involved at all. It has been removed -- it
+  duplicated logic the real OCI client already implements correctly
+  (including the RR century-rollover rule) and diverged from it the moment
+  a site's actual `NLS_DATE_FORMAT` wasn't the out-of-the-box default. One
+  path now handles every format, default or explicit, correct or not:
+  `from_text()`/`to_text()` above. A caller that needs a hardcoded literal
+  value with no text involved at all still has the numeric constructor
+  (`OciDate(year, month, day, ...)`), unaffected by any of this.
 - `include/binding/oci_connection.h` -- `OciConnection`: owns the OCI
   handles and the reconnect policy (see below).
 - `include/binding/oci_client.h` -- `OciClient`: `execute()`, `insert()`,

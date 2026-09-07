@@ -11,6 +11,7 @@
 // directory without an Oracle client install.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cstddef>
@@ -167,7 +168,7 @@ struct MockDateTimeDescriptor {
 // DD, HH24, HH12/HH, MI, SS, AM/PM), plus verbatim literal characters
 // (separators like '-', '/', ':', ' ').
 // ----------------------------------------------------------------------------
-enum class DateFormatToken { Year4, Year2, RRYear, Month, Day, Hour24, Hour12, Minute, Second, Meridiem, Literal };
+enum class DateFormatToken { Year4, Year2, RRYear, Month, MonthAbbrev, Day, Hour24, Hour12, Minute, Second, Meridiem, Literal };
 struct FormatElement { DateFormatToken kind; char literal = 0; };
 
 inline std::vector<FormatElement> tokenize_date_format(std::string_view fmt) {
@@ -191,6 +192,7 @@ inline std::vector<FormatElement> tokenize_date_format(std::string_view fmt) {
         else if (matches(i, "HH12")) { tokens.push_back({DateFormatToken::Hour12}); i += 4; }
         else if (matches(i, "RR"))   { tokens.push_back({DateFormatToken::RRYear}); i += 2; }
         else if (matches(i, "YY"))   { tokens.push_back({DateFormatToken::Year2});  i += 2; }
+        else if (matches(i, "MON"))  { tokens.push_back({DateFormatToken::MonthAbbrev}); i += 3; }
         else if (matches(i, "MM"))   { tokens.push_back({DateFormatToken::Month});  i += 2; }
         else if (matches(i, "DD"))   { tokens.push_back({DateFormatToken::Day});    i += 2; }
         else if (matches(i, "HH"))   { tokens.push_back({DateFormatToken::Hour12}); i += 2; }
@@ -253,6 +255,34 @@ inline bool parse_with_mock_format(std::string_view text, std::string_view fmt, 
             case DateFormatToken::RRYear: { int rr = 0; if (!read_digits(2, rr)) return false;
                                             out.year = mock_rr_year(rr, mock_current_year()); break; }
             case DateFormatToken::Month:  if (!read_digits(2, out.month)) return false; break;
+            case DateFormatToken::MonthAbbrev: {
+                // "MON" -- Oracle's real default DATE format uses this, not
+                // MM, so from_text()/to_text() being unconfigured (i.e.
+                // resolving to OciDate/OciTimestamp's seeded "DD-MON-RR"
+                // default) needs this token to actually round-trip. Only
+                // the 3-letter English abbreviation, matched
+                // case-insensitively -- real Oracle also accepts full month
+                // names (MONTH) and honors the format mask's own
+                // capitalization when rendering (Mon/MON/mon); this mock
+                // does neither, see the class comment on tokenize_date_format.
+                if (pos + 3 > text.size()) return false;
+                char upper[3];
+                for (int k = 0; k < 3; ++k) {
+                    upper[k] = static_cast<char>(std::toupper(static_cast<unsigned char>(text[pos + static_cast<std::size_t>(k)])));
+                }
+                static constexpr std::array<std::string_view, 12> kNames = {
+                    "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+                };
+                const std::string_view found(upper, 3);
+                int month_num = 0;
+                for (std::size_t m = 0; m < kNames.size(); ++m) {
+                    if (kNames[m] == found) { month_num = static_cast<int>(m) + 1; break; }
+                }
+                if (month_num == 0) return false;
+                out.month = month_num;
+                pos += 3;
+                break;
+            }
             case DateFormatToken::Day:    if (!read_digits(2, out.day)) return false; break;
             case DateFormatToken::Hour24: if (!read_digits(2, out.hour)) return false; break;
             case DateFormatToken::Hour12: if (!read_digits(2, out.hour)) return false; out.has_meridiem = true; break;
@@ -299,6 +329,13 @@ inline std::string render_with_mock_format(std::string_view fmt, int year, int m
             case DateFormatToken::Year2:
             case DateFormatToken::RRYear: out += zero_pad_mock(year % 100, 2); break;
             case DateFormatToken::Month:  out += zero_pad_mock(month, 2); break;
+            case DateFormatToken::MonthAbbrev: {
+                static constexpr std::array<const char*, 12> kNames = {
+                    "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+                };
+                out += (month >= 1 && month <= 12) ? kNames[month - 1] : "???";
+                break;
+            }
             case DateFormatToken::Day:    out += zero_pad_mock(day, 2); break;
             case DateFormatToken::Hour24: out += zero_pad_mock(hour, 2); break;
             case DateFormatToken::Hour12: { const int h = hour % 12; out += zero_pad_mock(h == 0 ? 12 : h, 2); break; }
