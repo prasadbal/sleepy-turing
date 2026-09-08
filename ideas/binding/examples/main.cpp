@@ -27,6 +27,10 @@
 //      error is returned immediately; a connection-lost error is also
 //      returned immediately, and the caller reconnects and calls the same
 //      function again itself.
+//   8. FixedString<N> and OciDate as bindable fields -- both directions,
+//      plain and std::optional (a nullable VARCHAR2/DATE column), through
+//      the same bind/select_rows() surface as every scalar above; no
+//      special-casing needed at the call site.
 //
 // Builds against the mock OCI backend (binding/oci_mock.h) since there's no
 // real Oracle client in this environment -- see oci_compat.h.
@@ -37,6 +41,8 @@
 
 #include "binding/oci_client.h"
 #include "binding/oci_connection.h"
+#include "binding/oci_datetime.h"
+#include "binding/oci_fixed_string.h"
 
 namespace {
 
@@ -63,6 +69,22 @@ struct TradeFilter {
 struct TradeRow {
     int trade_id;
     std::optional<double> notional;
+};
+
+struct PositionInsert {
+    int position_id;
+    binding::FixedString<16> desk;
+    binding::OciDate cob_date;
+    std::optional<binding::FixedString<8>> risk_class;
+    std::optional<binding::OciDate> maturity_date;
+};
+
+struct PositionRow {
+    int position_id;
+    binding::FixedString<16> desk;
+    binding::OciDate cob_date;
+    std::optional<binding::FixedString<8>> risk_class;
+    std::optional<binding::OciDate> maturity_date;
 };
 
 int main() {
@@ -168,6 +190,35 @@ int main() {
         conn.connect();
         auto r3 = binding::execute(conn, "UPDATE employees SET bonus_pct = :bonus_pct WHERE id = :id", u);
         std::cout << "  retried by hand after reconnect -> " << status_name(r3.status) << "\n";
+    }
+    std::cout << "\n";
+
+    std::cout << "--- Demo 8: FixedString<N> and OciDate, plain and std::optional ---\n";
+    {
+        PositionInsert with_both{7001, binding::FixedString<16>("RATES_LDN"), binding::OciDate(2026, 9, 7),
+                                  binding::FixedString<8>("IR_1"), binding::OciDate(2030, 1, 1)};
+        PositionInsert no_optionals{7002, binding::FixedString<16>("FX_NY"), binding::OciDate(2026, 9, 7),
+                                     std::nullopt, std::nullopt};
+        binding::execute(conn, "INSERT INTO positions VALUES(:position_id,:desk,:cob_date,:risk_class,:maturity_date)", with_both);
+        binding::execute(conn, "INSERT INTO positions VALUES(:position_id,:desk,:cob_date,:risk_class,:maturity_date)", no_optionals);
+
+        std::vector<PositionRow> rows;
+        std::function<void(const PositionRow*, std::size_t)> on_batch =
+            [&](const PositionRow* batch, std::size_t count) {
+                for (std::size_t i = 0; i < count; ++i) rows.push_back(batch[i]);
+            };
+        binding::select_rows<PositionRow>(
+            conn, "SELECT position_id, desk, cob_date, risk_class, maturity_date FROM positions",
+            100, 100, on_batch);
+        for (auto& row : rows) {
+            std::cout << "  position_id=" << row.position_id << " desk=[" << row.desk.str() << "]"
+                      << " cob_date=" << row.cob_date.year() << "-" << (int)row.cob_date.month()
+                      << "-" << (int)row.cob_date.day()
+                      << " risk_class=" << (row.risk_class ? row.risk_class->str() : std::string("NULL"))
+                      << " maturity_date="
+                      << (row.maturity_date ? std::to_string(row.maturity_date->year()) : std::string("NULL"))
+                      << "\n";
+        }
     }
 
     conn.disconnect();

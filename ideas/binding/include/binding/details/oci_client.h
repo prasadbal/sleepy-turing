@@ -38,13 +38,31 @@ void bind_one_param(OCIStmt* stmt, OciConnection& conn, T& params, std::string_v
     OCIBind* bind_handle = nullptr;
 
     if constexpr (is_optional_v<FieldT>) {
+        using ElemT = optional_value_t<FieldT>;
         auto& stage = std::get<I>(staging);
         if (field) { stage = *field; indicators[I] = OCI_IND_NOTNULL; }
         else       { stage = {};     indicators[I] = OCI_IND_NULL; }
+        if constexpr (is_fixed_string_v<ElemT>) {
+            // stage.length_ref() as alenp: the *content* length within the
+            // Capacity-sized buffer, since bind_size below is the buffer's
+            // full capacity (what OCI is told it may read from), not how
+            // much of it is meaningful for this particular value.
+            OCIBindByName(stmt, &bind_handle, conn.err(),
+                          reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
+                          stage.data(), static_cast<sb4>(ElemT::capacity), oci_type_code_v<FieldT>,
+                          &indicators[I], &stage.length_ref(), nullptr, 0, nullptr, OCI_DEFAULT);
+        } else {
+            OCIBindByName(stmt, &bind_handle, conn.err(),
+                          reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
+                          &stage, sizeof(stage), oci_type_code_v<FieldT>, &indicators[I],
+                          nullptr, nullptr, 0, nullptr, OCI_DEFAULT);
+        }
+    } else if constexpr (is_fixed_string_v<FieldT>) {
+        indicators[I] = OCI_IND_NOTNULL;
         OCIBindByName(stmt, &bind_handle, conn.err(),
                       reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
-                      &stage, sizeof(stage), oci_type_code_v<FieldT>, &indicators[I],
-                      nullptr, nullptr, 0, nullptr, OCI_DEFAULT);
+                      field.data(), static_cast<sb4>(FieldT::capacity), oci_type_code_v<FieldT>, nullptr,
+                      &field.length_ref(), nullptr, 0, nullptr, OCI_DEFAULT);
     } else {
         indicators[I] = OCI_IND_NOTNULL;
         OCIBindByName(stmt, &bind_handle, conn.err(),
@@ -109,10 +127,33 @@ void define_one_column(OCIStmt* stmt, OciConnection& conn, std::vector<T>& batch
         ind.assign(batch.size(), OCI_IND_NOTNULL);
         auto& stage = std::get<I>(staging);
         stage.assign(batch.size(), ElemT{});
+        if constexpr (is_fixed_string_v<ElemT>) {
+            // rlskip = sizeof(ElemT): stage is a tightly-packed
+            // vector<FixedString<N>>, so each row's fetched length lands in
+            // that row's own length_ field, one whole FixedString<N> apart.
+            OCIDefineByPos(stmt, &define_handle, conn.err(), position,
+                           stage[0].data(), static_cast<sb4>(ElemT::capacity), oci_type_code_v<FieldT>,
+                           ind.data(), &stage[0].length_ref(), nullptr, OCI_DEFAULT);
+            OCIDefineArrayOfStruct(define_handle, conn.err(),
+                                   static_cast<ub4>(sizeof(ElemT)), static_cast<ub4>(sizeof(sb2)),
+                                   static_cast<ub4>(sizeof(ElemT)), 0);
+        } else {
+            OCIDefineByPos(stmt, &define_handle, conn.err(), position,
+                           stage.data(), sizeof(ElemT), oci_type_code_v<FieldT>,
+                           ind.data(), nullptr, nullptr, OCI_DEFAULT);
+            OCIDefineArrayOfStruct(define_handle, conn.err(), sizeof(ElemT), sizeof(sb2), 0, 0);
+        }
+    } else if constexpr (is_fixed_string_v<FieldT>) {
+        // rlskip = sizeof(T): OCI reports each row's fetched length into
+        // that row's own FixedString::length_, one whole row apart -- same
+        // stride pvskip already uses for the value itself.
+        auto& first = boost::pfr::get<I>(batch[0]);
         OCIDefineByPos(stmt, &define_handle, conn.err(), position,
-                       stage.data(), sizeof(ElemT), oci_type_code_v<FieldT>,
-                       ind.data(), nullptr, nullptr, OCI_DEFAULT);
-        OCIDefineArrayOfStruct(define_handle, conn.err(), sizeof(ElemT), sizeof(sb2), 0, 0);
+                       first.data(), static_cast<sb4>(FieldT::capacity), oci_type_code_v<FieldT>,
+                       nullptr, &first.length_ref(), nullptr, OCI_DEFAULT);
+        OCIDefineArrayOfStruct(define_handle, conn.err(),
+                               static_cast<ub4>(sizeof(T)), static_cast<ub4>(sizeof(sb2)),
+                               static_cast<ub4>(sizeof(T)), 0);
     } else {
         OCIDefineByPos(stmt, &define_handle, conn.err(), position,
                        &boost::pfr::get<I>(batch[0]), sizeof(FieldT), oci_type_code_v<FieldT>,

@@ -520,6 +520,16 @@ inline sword OCIStmtFetch2(OCIStmt*, OCIError*, ub4 nrows, ub2, sb4, ub4) {
                         reinterpret_cast<unsigned char*>(d.rlenp) + static_cast<std::size_t>(fetched) * d.rlskip);
                     *rlen_ptr = static_cast<ub2>(n);
                 }
+            } else if (d.dty == SQLT_ODT && d.size == sizeof(::OCIDate)) {
+                // Writes the real 7-byte ::OCIDate layout directly -- OciDate
+                // (oci_datetime.h) wraps that struct with no descriptor and
+                // no indirection, so a plain memcpy here is the mock's exact
+                // equivalent of what OCIDefineByPos would actually fill in.
+                ::OCIDate v{};
+                v.OCIDateYYYY = static_cast<sb2>(2020 + g_fetch_row);
+                v.OCIDateMM = static_cast<unsigned char>(1 + (g_fetch_row % 12));
+                v.OCIDateDD = static_cast<unsigned char>(1 + static_cast<int>(i));
+                std::memcpy(row_ptr, &v, sizeof(v));
             }
         }
     }

@@ -11,13 +11,15 @@ that's worth doing, not a committed dependency.
 
 **The OCI client (`oci_client.h`/`oci_connection.h`) was rewritten from a
 considerably larger version of itself** -- collections, dynamic IN-lists,
-LOB, `FixedString<N>`, and an automatic reconnect-and-retry wrapper have all
-been removed in favor of a small, scalar-only core plus one classified
-result instead of automatic retry. All of the removed code is still in git
-history. `oci_datetime.h`/`oci_fixed_string.h`/`oci_lob.h` still exist as
-standalone value types -- they compile and work on their own -- but none of
-them currently plug into `oci_client.h`'s bind/select machinery; wiring one
-back in is a deliberate, separate decision, not an oversight.
+LOB, and an automatic reconnect-and-retry wrapper have all been removed in
+favor of a small core plus one classified result instead of automatic
+retry. All of the removed code is still in git history. `FixedString<N>`
+and `OciDate` have since been added back on top of the rewrite, live-verified
+against a real database (see "Testing against a real database" below);
+`OciTimestamp`, LOB, and `std::string` output columns have not, and
+`oci_lob.h`/the `OciTimestamp` half of `oci_datetime.h` exist only as
+standalone types today -- wiring one in is a deliberate, separate decision
+for each, not an oversight.
 
 ## Layout
 
@@ -43,21 +45,20 @@ back in is a deliberate, separate decision, not an oversight.
   characters sit inline in the row struct at a fixed stride, which is what
   both `OCIDefineArrayOfStruct` and `OCIBindArrayOfStruct` need. `std::string`
   can satisfy neither, which is why it stays an input-only bind type.
-  Standalone today -- `oci_client.h`'s `scalar_bindable<T>` doesn't
-  recognize `FixedString<N>` as a bindable field (see "What's deliberately
-  not here"), so this description is of the type itself, not of anything
-  currently reachable through `execute()`/`select_rows()`.
+  `oci_client.h`'s `scalar_bindable<T>` recognizes `FixedString<N>` (plain
+  or `std::optional<FixedString<N>>`) as a bindable field, both directions --
+  live-verified against a real database, see "Testing against a real
+  database" below.
 - `include/binding/oci_datetime.h` -- `OciDate` (a DATE column, `SQLT_ODT`)
   and `OciTimestamp` (a TIMESTAMP column, `SQLT_TIMESTAMP`). `OciDate` wraps
   the real 7-byte `::OCIDate` struct directly, with no descriptor or
   allocation, so (like an arithmetic field or `FixedString<N>`) it needs no
-  special-casing anywhere -- in the earlier, larger version of this file
-  it worked in every OCI bind/select path that existed then, live-verified
-  including 500 rows through the bulk/batch paths. Standalone today, same
-  reason as `FixedString<N>` above: not currently reachable through
-  `oci_client.h`'s `execute()`/`select_rows()`.
-  `OciTimestamp` is different: its `OCIDateTime*` is a per-value
-  descriptor (allocated via `OCIDescriptorAlloc`, populated via
+  special-casing at all in `details/oci_client.h` beyond its `OciTypeBinder`
+  entry -- `scalar_bindable<T>` recognizes it (plain or
+  `std::optional<OciDate>`), live-verified against a real database the same
+  way `FixedString<N>` was.
+  `OciTimestamp` is different, and is **not** wired in: its `OCIDateTime*`
+  is a per-value descriptor (allocated via `OCIDescriptorAlloc`, populated via
   `OCIDateTimeConstruct`), the same shape as `OciClob`/`OciXml`'s locator
   -- so it's bind-side only (`execute()`/`insert()`, single-row), not
   select()-able and not bulk-bindable, exactly like a LOB field. Use
@@ -110,12 +111,14 @@ back in is a deliberate, separate decision, not an oversight.
 - `include/binding/oci_client.h` -- free functions, not a class: `execute()`
   (no bind, or a bind-parameter struct) and `select_rows()` (with or without
   an input struct), all built on `scalar_bindable<T>` -- every field
-  arithmetic, or `std::optional<arithmetic>` to mark it nullable. Nothing
-  else: no strings, no LOB, no collections, no IN-lists.
+  arithmetic, `FixedString<N>`, or `OciDate`, each optionally wrapped in
+  `std::optional<U>` to mark it nullable. Still no `std::string`, LOB,
+  `OciTimestamp`, collections, or IN-lists.
 - `examples/main.cpp` -- execute() with no bind struct, execute() with a
   bind struct (one field `std::optional`), select_rows() with and without
   an input struct, a NULL output column coming back as `nullopt`,
-  `prefetch_rows` and `fetch_batch_size` as independent numbers, and the two
+  `prefetch_rows` and `fetch_batch_size` as independent numbers, `FixedString<N>`/
+  `OciDate` bind and select (plain and `std::optional`), and the two
   failure classifications -- including the caller reconnecting and calling
   execute() again by hand after a `ConnectionLost` result, since nothing
   here does that automatically.
@@ -458,17 +461,21 @@ of this file it came from (still in git history):
   bind (`oci_collection_bind.h`, deleted). IN-clause support is a later,
   separate feature built on query-text rewriting, not something woven into
   the scalar bind/fetch path.
-- `std::string`, `FixedString<N>`, LOB (`OciClob`/`OciXml`), and
-  `OciDate`/`OciTimestamp` as bindable fields -- `oci_client.h`'s
-  `scalar_bindable<T>` only accepts arithmetic (or `optional<arithmetic>`).
-  The type definitions for all of these still exist
-  (`oci_fixed_string.h`/`oci_lob.h`/`oci_datetime.h`) and work standalone;
-  none of them currently register an `OciTypeBinder` in the new
-  `oci_client.h`, so a struct using one won't satisfy `scalar_bindable` at
-  all. Wiring one back in means adding its `OciTypeBinder` specialization
-  and its bind/define special-casing to `details/oci_client.h` -- the same
-  shape of change each one was originally, just re-added one at a time
-  instead of all at once.
+- `std::string`, LOB (`OciClob`/`OciXml`), and `OciTimestamp` as bindable
+  fields -- `FixedString<N>` and `OciDate` *are* wired in now (see the
+  Layout bullets above and "Testing against a real database" below);
+  these three still aren't. The type definitions all exist
+  (`oci_lob.h`/`oci_datetime.h`) and work standalone; none of them
+  currently register an `OciTypeBinder` in `oci_client.h`, so a struct
+  using one won't satisfy `scalar_bindable` at all. Wiring one back in
+  means adding its `OciTypeBinder` specialization and its bind/define
+  special-casing to `details/oci_client.h` -- the same shape of change
+  `FixedString<N>`/`OciDate` just went through, one type at a time rather
+  than all at once. `OciTimestamp` specifically needs more than that: its
+  `OCIDateTime*` descriptor has no fixed-stride representation, so it can
+  never join the array bind/fetch path `FixedString<N>`/`OciDate` use --
+  it would need its own single-row-only bind path, the way the earlier,
+  larger version of this file had one.
 - Bulk array-bind (`insert(vector<T>&)`) and its read-side counterpart
   (batch-fetch straight into a `vector<T>`). Both existed and were
   live-verified in the earlier version -- see "Running a statement" above.
@@ -488,10 +495,12 @@ of this file it came from (still in git history):
   why there's no retry loop" above; this is the central decision of this
   rewrite, not an omission.
 - Making `oci_datetime.h`'s `from_text()`/`to_text()` reachable from a bind
-  struct at all, now that `oci_client.h` doesn't recognize `OciDate`/
-  `OciTimestamp` as bindable fields -- they still work as standalone value
-  types (parse/render against a connection), just not through
-  `execute()`/`select_rows()` today.
+  struct directly -- `OciDate` fields bind/select fine (see above), but
+  getting one from/to an arbitrary format string is still a separate step
+  (`OciDate::from_text(conn, text)`) before/after it touches a bind
+  struct, not something `execute()`/`select_rows()` does for you inline.
+  `OciTimestamp` still isn't a bindable field at all (see above), so this
+  applies doubly there.
 - Non-`std::string` string-like leaf types in `config_bind.h`'s
   `parse_leaf_value` (only `std::string` and arithmetic types are handled;
   a custom string-view-convertible type would satisfy `is_bindable_leaf`
@@ -516,14 +525,54 @@ additionally needs `boost::property_tree`, which the FetchContent fallback
 (standalone `pfr` only) doesn't provide -- it only builds when
 `BINDING_BOOST_INCLUDE_DIR` resolves to a real local Boost install.
 
-This rewrite (the scalar-only `oci_client.h`/`oci_connection.h`) has only
-been exercised against the mock (`oci_mock.h`) so far, not against a real
-Oracle database -- unlike some of the removed features (array-bind,
-batch-fetch, the collection-bind number-precision fix), which were
-live-verified before being removed. Worth a real-database pass before
-relying on it, particularly the `prefetch_rows`/`fetch_batch_size`
-decoupling's actual round-trip behavior, which the mock has no concept of
-cost for and so cannot confirm either way.
+This rewrite (the scalar-only `oci_client.h`/`oci_connection.h`, plus
+`FixedString<N>`/`OciDate` support added on top of it) has since been
+live-verified against a real Oracle database -- see "Testing against a
+real database" below for exactly what was checked and how to reproduce it.
+
+## Testing against a real database
+
+`examples/live_oracle_demo.cpp` and `examples/live_oracle_disconnect_demo.cpp`
+run against a real Oracle instance rather than the mock -- neither is part
+of the normal CMake build (there's no Oracle client in the default build
+environment), so each has its own compile command in its header comment.
+
+Verified end to end against `gvenzl/oracle-free:23` (docker container
+`oracle-free`, `ORACLE_PASSWORD=BindingTest123`, port 1521, service
+`FREEPDB1`) using Oracle Instant Client 19.32 (basic + SDK):
+
+- `live_oracle_demo.cpp`: creates its own table, inserts 37 rows one at a
+  time (scalars, `std::optional<double>`, `FixedString<16>`,
+  `std::optional<FixedString<8>>`, `OciDate`, `std::optional<OciDate>`, with
+  NULLs on some rows for each optional field), then fetches them back with
+  `fetch_batch_size=10` against a real server -- confirmed the fetch loop
+  ran exactly 4 real `OCIStmtFetch2` round trips (10+10+10+7), row count
+  matched, and every field of every row matched what was inserted,
+  including every NULL landing in the right place. Also confirmed a
+  malformed statement classifies as `QueryError`.
+- `live_oracle_disconnect_demo.cpp`: a second connection reads the first
+  connection's own SID/SERIAL# from `V$SESSION` and runs
+  `ALTER SYSTEM KILL SESSION ... IMMEDIATE` against it -- a real killed
+  session, not a simulated one. The first connection's next `execute()`
+  correctly came back `ExecStatus::ConnectionLost` (`ORA-03113`
+  underneath), confirming `is_disconnect_error()`'s classification against
+  an actual dropped session, not just the mock's `FailureMode::DisconnectThenRecover`.
+
+Two things worth knowing if you try to reproduce this on a different
+machine, both hit and resolved during this session:
+
+- A second Instant Client install present on the same machine, labeled
+  23.1, failed `OCIEnvCreate` outright until `ORACLE_HOME` was set to
+  point at it (its directory layout resembles a partial database install --
+  it ships `oracore`/`rdbms`/`network` subdirectories a standard Instant
+  Client extraction doesn't), and even with that fixed, `OCILogon2` failed
+  with `ORA-28041` ("authentication protocol internal error") against this
+  server version. Instant Client 19 needed neither workaround.
+- Linking against `libclntsh.so` needs `-Wl,-rpath-link,<dir>` in addition
+  to `-L<dir>` -- without it, the link step fails with undefined references
+  to internal Oracle symbols that actually live in `libclntsh.so`'s own
+  shared-library dependencies (`libclntshcore.so`, `libnnz.so`,
+  `libaio.so.1`), which plain `-L` does not make the linker load.
 
 Not yet verified against MSVC in this session -- but `boost::pfr::names_as_array()`
 being available there at all (see "Binding: by name for parameters..."

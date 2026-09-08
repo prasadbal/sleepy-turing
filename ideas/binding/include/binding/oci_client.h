@@ -2,13 +2,16 @@
 // Bind IN parameters by name, run a statement against a connection, and (for
 // a SELECT) fetch rows in batches, handing each batch to a callback.
 //
-// Deliberately narrow: arithmetic fields only, optionally wrapped in
-// std::optional<U> to mark a value/column nullable. No strings, no LOB, no
-// dynamic-width anything, no IN-list/collection support -- those are
-// separate concerns for later, not half-built in here. Reworked from an
-// earlier, considerably larger version of this file that also handled all
-// of those; that version is still in git history if any of it is worth
-// resurrecting.
+// Deliberately narrow: arithmetic fields, FixedString<N> (a fixed-capacity
+// character buffer -- see oci_fixed_string.h), and OciDate (see
+// oci_datetime.h), each optionally wrapped in std::optional<U> to mark a
+// value/column nullable. No LOB, no OciTimestamp (its OCIDateTime* is a
+// per-value descriptor, not a fixed-stride value -- a different shape of
+// problem from everything else here), no dynamic-width anything, no
+// IN-list/collection support -- those are separate concerns for later, not
+// half-built in here. Reworked from an earlier, considerably larger version
+// of this file that also handled all of those; that version is still in
+// git history if any of it is worth resurrecting.
 //
 // No retry: every entry point here runs once and returns an ExecResult
 // (OciConnection::execute's classification, or QueryError from a bind/fetch
@@ -18,6 +21,8 @@
 //
 // Implementation in details/oci_client.h.
 #include "binding/oci_connection.h"
+#include "binding/oci_datetime.h"
+#include "binding/oci_fixed_string.h"
 #include "binding/reflect.h"
 
 #include <cstddef>
@@ -48,6 +53,19 @@ template <> struct OciTypeBinder<unsigned long long> { static constexpr ub2 type
 template <> struct OciTypeBinder<float>              { static constexpr ub2 type_code = SQLT_BFLOAT; };
 template <> struct OciTypeBinder<double>             { static constexpr ub2 type_code = SQLT_BDOUBLE; };
 
+// FixedString<N>: SQLT_CHR, an explicit-length VARCHAR2 with no null
+// terminator needed -- N is the buffer size OCI defines into (what makes it
+// usable as a select() output column, unlike std::string), and the field's
+// own length_ref() carries the actual content length on both bind and
+// define (alenp/rlenp below).
+template <std::size_t N> struct OciTypeBinder<FixedString<N>> { static constexpr ub2 type_code = SQLT_CHR; };
+
+// OciDate: SQLT_ODT, directly through the real ::OCIDate struct it wraps.
+// No descriptor, no allocation, a fixed 7-byte value -- exactly like an
+// arithmetic field for bind/define purposes, so (unlike FixedString<N>) it
+// needs no special-casing anywhere below beyond this type-code entry.
+template <> struct OciTypeBinder<OciDate> { static constexpr ub2 type_code = SQLT_ODT; };
+
 template <typename T> struct oci_type_code_of { static constexpr ub2 value = OciTypeBinder<T>::type_code; };
 template <typename U> struct oci_type_code_of<std::optional<U>> { static constexpr ub2 value = OciTypeBinder<U>::type_code; };
 template <typename T> inline constexpr ub2 oci_type_code_v = oci_type_code_of<std::remove_cv_t<T>>::value;
@@ -62,7 +80,12 @@ template <typename T> inline constexpr ub2 oci_type_code_v = oci_type_code_of<st
 // ----------------------------------------------------------------------------
 struct scalar_field_predicate {
     template <typename U>
-    static constexpr bool check() { return std::is_arithmetic_v<optional_value_t<U>> || std::is_arithmetic_v<U>; }
+    static constexpr bool check() {
+        using V = optional_value_t<U>; // void if U isn't std::optional<something>
+        return std::is_arithmetic_v<V> || std::is_arithmetic_v<U> ||
+               is_fixed_string_v<V> || is_fixed_string_v<U> ||
+               is_oci_date_v<V> || is_oci_date_v<U>;
+    }
 };
 template <typename T>
 concept scalar_bindable = struct_field_auditor<T, scalar_field_predicate>::value;
