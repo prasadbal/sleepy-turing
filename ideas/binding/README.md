@@ -557,6 +557,62 @@ Verified end to end against `gvenzl/oracle-free:23` (docker container
   correctly came back `ExecStatus::ConnectionLost` (`ORA-03113`
   underneath), confirming `is_disconnect_error()`'s classification against
   an actual dropped session, not just the mock's `FailureMode::DisconnectThenRecover`.
+- `live_oracle_fetch_benchmark.cpp`: fetches 500,000 rows (generated
+  server-side via a Cartesian-join row source, not through this library's
+  own insert path -- see the file's header comment for why) under varying
+  `prefetch_rows`/`fetch_batch_size`, reading actual round-trip counts back
+  from the server's own `V$SESSTAT` ("SQL*Net roundtrips to/from client")
+  rather than inferring them. Three sweeps, one run each, on this machine
+  (numbers are machine/network-dependent -- the *shape* of each result is
+  the point, not the exact milliseconds):
+
+  | prefetch | fetch_batch_size | elapsed_ms | rows/sec | roundtrips |
+  |---:|---:|---:|---:|---:|
+  | 20000 | 1 | 226.9 | 2,203,498 | 26 |
+  | 20000 | 100 | 176.5 | 2,833,241 | 26 |
+  | 20000 | 1000 | 169.0 | 2,959,435 | 25 |
+  | 20000 | 5000 | 156.1 | 3,203,271 | 22 |
+  | 20000 | 20000 | 151.7 | 3,296,294 | 15 |
+
+  Sweep A (`fetch_batch_size` varies, `prefetch_rows` fixed at 20000):
+  `fetch_batch_size=1` -- 500,000 individual `OCIStmtFetch2` calls -- still
+  only cost 26 round trips, about the same as `fetch_batch_size=20000`'s 15.
+  There's a real ~50% throughput gap between the extremes (pure client-side
+  per-call overhead, no round-trip difference to speak of), confirming
+  `fetch_batch_size` genuinely doesn't control round trips at this scale.
+
+  | prefetch | fetch_batch_size | elapsed_ms | rows/sec | roundtrips |
+  |---:|---:|---:|---:|---:|
+  | 50 | 1000 | 308.2 | 1,622,379 | 502 |
+  | 500 | 1000 | 367.6 | 1,360,312 | 502 |
+  | 5000 | 1000 | 196.9 | 2,539,519 | 85 |
+  | 50000 | 1000 | 170.6 | 2,930,444 | 11 |
+
+  Sweep B (`prefetch_rows` varies, `fetch_batch_size` fixed at 1000) is the
+  headline result: round trips drop 502 -> 11 (a 45x reduction) as
+  `prefetch_rows` goes from 50 to 50000, `fetch_batch_size` never changing.
+  This is the same "prefetch controls round trips" claim the pre-rewrite
+  version of this file measured at 500 rows; here it holds at 500,000 --
+  1000x the row count, independently re-verified via server-side
+  accounting rather than the client's own guess.
+
+  | container | fetch_batch_size | elapsed_ms | rows/sec |
+  |---|---:|---:|---:|
+  | vector | 10 | 201.7 | 2,479,284 |
+  | map | 10 | 269.1 | 1,858,264 |
+  | vector | 1000 | 172.7 | 2,894,454 |
+  | map | 1000 | 224.2 | 2,229,913 |
+
+  Sweep C (vector vs. `std::map<int, BenchRow>` as the fetch destination,
+  `prefetch_rows` fixed at 20000) is more nuanced than "map means batch
+  size doesn't matter": `std::map` costs a fairly consistent ~30%
+  throughput penalty versus `vector` at *both* batch sizes tested, not a
+  bigger penalty specifically at large batch. What the numbers do support:
+  the gap between a small and a large `fetch_batch_size` shrinks once
+  `std::map`'s own O(log n)-per-element insertion dominates the total
+  (vector: 201.7ms vs 172.7ms, ~15% apart; map: 269.1ms vs 224.2ms, ~20%
+  apart) -- so a small batch costs relatively less when you were paying for
+  per-element insertion overhead either way, not that it costs nothing.
 
 Two things worth knowing if you try to reproduce this on a different
 machine, both hit and resolved during this session:
