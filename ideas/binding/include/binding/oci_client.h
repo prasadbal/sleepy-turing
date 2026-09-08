@@ -1,371 +1,124 @@
 #pragma once
-#include <memory>
-#include <optional>
-#include <set>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <type_traits>
-#include <valarray>
-#include <vector>
-
+// Bind IN parameters by name, run a statement against a connection, and (for
+// a SELECT) fetch rows in batches, handing each batch to a callback.
+//
+// Deliberately narrow: arithmetic fields only, optionally wrapped in
+// std::optional<U> to mark a value/column nullable. No strings, no LOB, no
+// dynamic-width anything, no IN-list/collection support -- those are
+// separate concerns for later, not half-built in here. Reworked from an
+// earlier, considerably larger version of this file that also handled all
+// of those; that version is still in git history if any of it is worth
+// resurrecting.
+//
+// No retry: every entry point here runs once and returns an ExecResult
+// (OciConnection::execute's classification, or QueryError from a bind/fetch
+// failure that never reached execute at all). A ConnectionLost result is the
+// caller's cue to reconnect and call the same entry point again -- nothing
+// here does that automatically.
+//
+// Implementation in details/oci_client.h.
 #include "binding/oci_connection.h"
-#include "binding/oci_datetime.h"
-#include "binding/oci_fixed_string.h"
-#include "binding/oci_lob.h"
 #include "binding/reflect.h"
+
+#include <cstddef>
+#include <functional>
+#include <string>
+#include <type_traits>
 
 namespace binding {
 
 // ----------------------------------------------------------------------------
-// Compile-time OCI external type code mapping. Add a specialization for any
-// new leaf/LOB type this client should know how to bind or define.
+// Compile-time OCI external type code for a scalar field. std::optional<U>
+// takes U's type code -- the indicator, not the type code, is what tells OCI
+// a value is NULL.
 // ----------------------------------------------------------------------------
-// The primary template is deliberately a hard error rather than being left
-// undeclared: `bindable` accepts any arithmetic field (see reflect.h's
-// is_bindable_leaf), which is a strictly larger set than the types this map
-// knows how to bind. Without this static_assert, a field type with no entry
-// here failed as "incomplete type OciTypeBinder<X> used in nested name
-// specifier" from deep inside oci_type_code_of, naming neither the field nor
-// the struct it came from.
-template <typename T>
-struct OciTypeBinder {
+template <typename T> struct OciTypeBinder {
     static_assert(sizeof(T) == 0,
-                  "binding: no OCI external type code is defined for this field type. "
-                  "Supported: the integer types, float/double, std::string (bind side only), "
-                  "FixedString<N> (binding/oci_fixed_string.h) for a CHAR/VARCHAR2 column, "
-                  "OciDate for a DATE column, OciTimestamp for a TIMESTAMP column, and "
-                  "OciClob/OciXml. Note bool has no Oracle SQL counterpart -- use a numeric "
-                  "flag or a FixedString<1>. Specialize OciTypeBinder for anything else.");
-    static constexpr ub2 type_code = 0; // never reached; keeps the assert above the only error
+                  "binding: no OCI type code for this field type -- oci_client.h only supports "
+                  "arithmetic fields (or optional<arithmetic> for a nullable one)");
 };
+template <> struct OciTypeBinder<short>              { static constexpr ub2 type_code = SQLT_INT; };
+template <> struct OciTypeBinder<int>                { static constexpr ub2 type_code = SQLT_INT; };
+template <> struct OciTypeBinder<long>               { static constexpr ub2 type_code = SQLT_INT; };
+template <> struct OciTypeBinder<long long>          { static constexpr ub2 type_code = SQLT_INT; };
+template <> struct OciTypeBinder<unsigned short>     { static constexpr ub2 type_code = SQLT_UIN; };
+template <> struct OciTypeBinder<unsigned int>       { static constexpr ub2 type_code = SQLT_UIN; };
+template <> struct OciTypeBinder<unsigned long>      { static constexpr ub2 type_code = SQLT_UIN; };
+template <> struct OciTypeBinder<unsigned long long> { static constexpr ub2 type_code = SQLT_UIN; };
+template <> struct OciTypeBinder<float>              { static constexpr ub2 type_code = SQLT_BFLOAT; };
+template <> struct OciTypeBinder<double>             { static constexpr ub2 type_code = SQLT_BDOUBLE; };
 
-// Integer widths all bind through SQLT_INT/SQLT_UIN -- OCI takes the actual
-// width from the bind/define value_sz, so one type code covers every size.
-// These were missing before, which meant an ordinary std::int64_t or
-// std::uint32_t id field satisfied `bindable` and then failed to compile.
-template <> struct OciTypeBinder<short>              { static constexpr ub2 type_code = SQLT_INT;     };
-template <> struct OciTypeBinder<int>                { static constexpr ub2 type_code = SQLT_INT;     };
-template <> struct OciTypeBinder<long>               { static constexpr ub2 type_code = SQLT_INT;     };
-template <> struct OciTypeBinder<long long>          { static constexpr ub2 type_code = SQLT_INT;     };
-template <> struct OciTypeBinder<unsigned short>     { static constexpr ub2 type_code = SQLT_UIN;     };
-template <> struct OciTypeBinder<unsigned int>       { static constexpr ub2 type_code = SQLT_UIN;     };
-template <> struct OciTypeBinder<unsigned long>      { static constexpr ub2 type_code = SQLT_UIN;     };
-template <> struct OciTypeBinder<unsigned long long> { static constexpr ub2 type_code = SQLT_UIN;     };
-
-// float is kept for compatibility but is a poor fit for anything money- or
-// sensitivity-shaped: SQLT_BFLOAT is a binary single, ~7 significant digits.
-template <> struct OciTypeBinder<float>       { static constexpr ub2 type_code = SQLT_BFLOAT;  };
-template <> struct OciTypeBinder<double>      { static constexpr ub2 type_code = SQLT_BDOUBLE; };
-template <> struct OciTypeBinder<std::string> { static constexpr ub2 type_code = SQLT_STR;     };
-template <> struct OciTypeBinder<OciClob>     { static constexpr ub2 type_code = SQLT_CLOB;    };
-template <> struct OciTypeBinder<OciXml>      { static constexpr ub2 type_code = SQLT_CLOB;    };
-
-// SQLT_ODT binds/defines directly through the real ::OCIDate struct
-// OciDate wraps -- no descriptor, no allocation, fixed 7-byte value (see
-// oci_datetime.h). SQLT_TIMESTAMP binds/defines OciTimestamp's own
-// OCIDateTime* locator, the same shape as OciClob/OciXml's locator field
-// above, for the same reason (an opaque descriptor, not a fixed-size
-// value) -- handled in bind_one_field's is_oci_datetime_v branch, not
-// eligible for the array bind/fetch paths.
-template <> struct OciTypeBinder<OciDate>      { static constexpr ub2 type_code = SQLT_ODT;       };
-template <> struct OciTypeBinder<OciTimestamp> { static constexpr ub2 type_code = SQLT_TIMESTAMP; };
-
-// FixedString<N> binds and defines as SQLT_CHR: an explicit-length VARCHAR2
-// with no null terminator required, which is what lets it work as a select()
-// output column (the buffer size OCI needs up front is N) as well as an
-// input. A CHAR(N) column comes back blank-padded to N, as it would through
-// any OCI client.
-template <std::size_t N> struct OciTypeBinder<FixedString<N>> { static constexpr ub2 type_code = SQLT_CHR; };
-
-// std::optional<U> takes U's type code -- the indicator, not the type code,
-// is what tells OCI a value is NULL.
-template <typename T> struct oci_type_code_of { static constexpr ub2 value = OciTypeBinder<std::remove_cv_t<T>>::type_code; };
+template <typename T> struct oci_type_code_of { static constexpr ub2 value = OciTypeBinder<T>::type_code; };
 template <typename U> struct oci_type_code_of<std::optional<U>> { static constexpr ub2 value = OciTypeBinder<U>::type_code; };
-template <typename T> inline constexpr ub2 oci_type_code_v = oci_type_code_of<T>::value;
+template <typename T> inline constexpr ub2 oci_type_code_v = oci_type_code_of<std::remove_cv_t<T>>::value;
 
 // ----------------------------------------------------------------------------
-// std::vector<U>/std::set<U>/std::valarray<U> recognition, for a struct
-// field meant to bind as a dynamic multi-value IN-list parameter (see
-// docs/in_list_binding.md) rather than a single scalar. Distinct from
-// reflect.h's is_vector_v/vector_value_t, which is about config's
-// "repeated nested struct" concept -- an entirely different thing sharing
-// only the word "vector".
-//
-// The trailing Rest... packs (rather than naming Allocator/Compare
-// explicitly) match std::vector<U>/std::set<U> regardless of their
-// allocator/comparator: as a specialization pattern, std::vector<U> only
-// matches the *default* std::allocator<U> (two defaulted parameters for
-// std::set<U> -- Compare and Allocator), so a container using any other
-// allocator/comparator fell through to false_type before these were packs.
-// std::valarray<U> has no such extra parameters, so it stays as-is.
+// A struct usable as a bind-parameter or result-row type here: every field
+// is arithmetic, or std::optional<arithmetic> to mark it nullable. Reuses
+// reflect.h's struct_field_auditor engine (the same MSVC-safe field-walker
+// flat_schema/config_schema use) with a predicate narrower than
+// is_bindable_leaf_v -- that one also allows string-convertible fields,
+// which this file has no way to bind (see the file comment above).
 // ----------------------------------------------------------------------------
-template <typename T> struct is_multi_bind_container_impl : std::false_type { using value_type = void; };
-template <typename U, typename... Rest> struct is_multi_bind_container_impl<std::vector<U, Rest...>> : std::true_type { using value_type = U; };
-template <typename U, typename... Rest> struct is_multi_bind_container_impl<std::set<U, Rest...>>     : std::true_type { using value_type = U; };
-template <typename U> struct is_multi_bind_container_impl<std::valarray<U>> : std::true_type  { using value_type = U; };
-
-template <typename T>
-inline constexpr bool is_multi_bind_container_v = is_multi_bind_container_impl<std::remove_cv_t<T>>::value;
-template <typename T>
-using multi_bind_value_t = typename is_multi_bind_container_impl<std::remove_cv_t<T>>::value_type;
-
-// ----------------------------------------------------------------------------
-// Predicate + concept: a struct usable as an OCI bind/row type has fields
-// that are each a flat leaf (arithmetic/string, optionally wrapped in
-// std::optional to mark it nullable), a recognized LOB wrapper, or (bind
-// side only -- select()'s output side static_asserts against this) a
-// vector/set/valarray<U> of a leaf U, for a dynamic multi-value IN-list
-// parameter. Reuses the same struct_field_auditor engine as flat_schema
-// (binding/reflect.h) -- this is the "config schema" and "SQL row schema"
-// ideas sharing one MSVC-safe core.
-// ----------------------------------------------------------------------------
-struct bindable_predicate {
+struct scalar_field_predicate {
     template <typename U>
-    static constexpr bool check() {
-        if constexpr (is_multi_bind_container_v<U>) {
-            return is_bindable_leaf_v<multi_bind_value_t<U>>;
-        } else {
-            // OciDate is a plain fixed-size value (see oci_datetime.h), so
-            // it's nullable the same way an arithmetic field is. OciTimestamp
-            // is locator-based like OciClob/OciXml, which aren't nullable
-            // yet either (see "What's deliberately not here" in README.md)
-            // -- not extending that scope here.
-            return is_bindable_leaf_v<U> || is_oci_lob_v<U> || is_oci_date_v<U> || is_oci_datetime_v<U> ||
-                   (is_optional_v<U> && is_oci_date_v<optional_value_t<U>>);
-        }
-    }
+    static constexpr bool check() { return std::is_arithmetic_v<optional_value_t<U>> || std::is_arithmetic_v<U>; }
 };
-
-// T can be bound as OciClient::execute()/insert()'s parameter struct or
-// select()'s result row.
 template <typename T>
-concept bindable = struct_field_auditor<T, bindable_predicate>::value;
-
-// Like a struct field bound as a dynamic multi-value IN-list (see
-// docs/in_list_binding.md), but named after the field itself
-// (":field_name_0,:field_name_1,..."), for OCIBindByName. Subject to
-// ORA-01795 ("maximum number of expressions in a list is 1000"), a
-// parser-level cap on a syntactic IN (...) list that applies whether its
-// elements are literals or bind placeholders -- caught here with a clear
-// message instead of surfacing as an opaque ORA-01795 from OCIStmtExecute.
-// A count of 0 produces "NULL": "IN ()" is a SQL syntax error, but
-// "IN (NULL)" is valid and, since x = NULL is never true in SQL's
-// three-valued logic, correctly matches nothing -- no special-casing
-// needed at the call site for an empty collection.
-//
-// For a collection with more than 1000 elements, or one whose size varies
-// enough between calls to fragment Oracle's shared-pool cursor cache (each
-// distinct generated placeholder-list size is different SQL text, hence a
-// different cached cursor), oci_collection_bind.h's
-// select_with_in_collection()/execute_with_in_collection() bind a single
-// Oracle collection object instead -- fixed SQL text regardless of size,
-// no cap. See docs/in_list_binding.md for the tradeoffs between the two.
-std::string make_named_placeholders(std::string_view field_name, std::size_t count);
-
-// Numbered-placeholder counterpart to make_named_placeholders, for a
-// standalone IN-list marker rather than a struct field's own name -- see
-// select_with_in_list()/execute_with_in_list() below. Same ORA-01795
-// 1000-element cap, same "count == 0 produces NULL" rule, for the same
-// reasons.
-std::string make_in_placeholders(std::size_t count, ub4 start_position = 1);
-
-// Standalone dynamic IN (...) list via placeholder expansion -- the
-// fallback for an ElemType oci_collection_bind.h's collection-object bind
-// can't handle. Concretely, today, that's std::string:
-// select_with_in_collection()'s SYS.ODCIVARCHAR2LIST path segfaults inside
-// OCICollAppend (see the KNOWN BROKEN banner at the top of
-// oci_collection_bind.h) -- this mechanism never touches Oracle's
-// object/collection API at all, just ordinary scalar OCIBindByPos, so it
-// isn't exposed to that crash. The tradeoff collection-bind exists to
-// avoid still applies here in full: capped at 1000 elements (ORA-01795,
-// via make_in_placeholders), and each distinct list size is different SQL
-// text, fragmenting Oracle's shared-pool cursor cache as sizes vary
-// between calls. Prefer select_with_in_collection() for a numeric
-// ElemType, where that mechanism is live-verified and uncapped; reach for
-// this for std::string until/unless the collection-bind crash is
-// resolved (or a custom collection type -- see docs/in_list_binding.md --
-// is set up and verified instead), or for any ElemType when the schema
-// can't have a collection type added to it at all.
-//
-// `query_template` must contain exactly one "{IN}" marker, e.g. "SELECT
-// trade_id, notional FROM trades WHERE ref_code IN ({IN})", replaced with
-// a placeholder list sized to ids.size() before preparing. `ids` is a
-// std::set (std::vector/std::valarray overloads dedupe/order into a set
-// first) for the same two reasons make_in_placeholders' sibling mechanism
-// wants one: a repeated value is never meaningful in an IN-list, and a
-// deterministic element order keeps two calls over the same logical ID
-// set generating identical SQL text (and so hitting the same cached
-// cursor) regardless of what order the caller collected them in.
-template <typename ElemType, bindable RowT, typename Alloc = std::allocator<RowT>>
-bool select_with_in_list(OciConnection& conn, const std::string& query_template,
-                          const std::set<ElemType>& ids, std::vector<RowT, Alloc>& results);
-
-template <typename ElemType, bindable RowT, typename Alloc = std::allocator<RowT>>
-bool select_with_in_list(OciConnection& conn, const std::string& query_template,
-                          const std::vector<ElemType>& ids, std::vector<RowT, Alloc>& results);
-
-template <typename ElemType, bindable RowT, typename Alloc = std::allocator<RowT>>
-bool select_with_in_list(OciConnection& conn, const std::string& query_template,
-                          const std::valarray<ElemType>& ids, std::vector<RowT, Alloc>& results);
-
-// DML counterpart (e.g. "DELETE FROM trades WHERE ref_code IN ({IN})") --
-// see select_with_in_list() above.
-template <typename ElemType>
-bool execute_with_in_list(OciConnection& conn, const std::string& query_template,
-                           const std::set<ElemType>& ids);
-
-template <typename ElemType>
-bool execute_with_in_list(OciConnection& conn, const std::string& query_template,
-                           const std::vector<ElemType>& ids);
-
-template <typename ElemType>
-bool execute_with_in_list(OciConnection& conn, const std::string& query_template,
-                           const std::valarray<ElemType>& ids);
+concept scalar_bindable = struct_field_auditor<T, scalar_field_predicate>::value;
 
 // ----------------------------------------------------------------------------
-// Core database execution client.
-//
-// Names read as SQL verbs: execute() runs any statement that doesn't return
-// rows (DDL, or DML with or without a bound struct); insert() is a
-// same-mechanism, intent-naming alias for execute() that also adds a
-// std::vector<T> overload for inserting several rows; select() runs a query
-// and returns its rows.
-//
-// Implementation in details/oci_client.h.
+// execute() -- no bind parameters. DDL, or DML that's fully literal in the
+// text. No fetch: a statement of this shape returns no rows.
 // ----------------------------------------------------------------------------
-class OciClient {
-public:
-    // Runs any SQL statement that returns no rows and needs no bind
-    // parameters -- DDL (CREATE/ALTER/TRUNCATE), or DML with everything
-    // already literal in the text. For a statement with bind parameters,
-    // use the execute(conn, query_text, bind_struct) overload below.
-    bool execute(OciConnection& conn, const std::string& query_text);
+ExecResult execute(OciConnection& conn, const std::string& sql);
 
-    // Runs any SQL statement that returns no rows (INSERT/UPDATE/DELETE/
-    // MERGE/a stored-procedure call/..., including RETURNING ... INTO),
-    // binding bind_struct's fields as named IN parameters. Each field binds
-    // to a `:field_name` placeholder in `query_text` by its own
-    // (compiler-derived) name -- e.g. field `bonus_pct` binds `:bonus_pct`
-    // wherever that placeholder appears, in any order, any number of times.
-    // A field declared as std::optional<U> binds SQL NULL when it's empty.
-    // A field declared as std::vector/std::set/std::valarray<U> binds as a
-    // dynamic multi-value IN-list -- its own `{field_name}` marker in
-    // `query_text` (not `:field_name`) gets replaced with a placeholder
-    // list sized to that field's element count before preparing (see
-    // docs/in_list_binding.md).
-    //
-    // conn.run_with_reconnect() reconnects and retries the whole statement
-    // only on a disconnect-class error; an ordinary execution error (bad
-    // SQL, constraint violation, etc.) is returned immediately, un-retried.
-    //
-    // Note: passes OCI_DEFAULT (no autocommit) to OCIStmtExecute -- deciding
-    // transaction/commit boundaries is left to the caller (OCITransCommit or
-    // OCI_COMMIT_ON_SUCCESS), it's out of scope for this reconnect scaffold.
-    template <bindable T>
-    bool execute(OciConnection& conn, const std::string& query_text, T& bind_struct);
+// execute() with a bind-parameter struct -- DML with named parameters
+// (":field_name", bound by the field's own compiler-derived name, any order,
+// any number of times it appears in the text). A field declared
+// std::optional<U> binds SQL NULL when empty.
+template <scalar_bindable T>
+ExecResult execute(OciConnection& conn, const std::string& sql, T& params);
 
-    // Same mechanism as execute(conn, query_text, bind_struct) -- an alias
-    // that reads as intent for the common case where the statement actually
-    // is an INSERT.
-    template <bindable T>
-    bool insert(OciConnection& conn, const std::string& query_text, T& row);
+// ----------------------------------------------------------------------------
+// select_rows() -- runs a query and fetches its rows in batches, calling
+// `on_batch` once per batch with a pointer to (up to) fetch_batch_size rows
+// and how many of them are actually valid (the last batch of a result set is
+// usually partial). Column order in `sql`'s SELECT list must match OutT's
+// declared field order -- OCIDefineByPos is the only column-output bind API
+// in raw OCI, so this is positional regardless of the IN side binding by
+// name.
+//
+// prefetch_rows and fetch_batch_size are deliberately two separate numbers,
+// not one: prefetch_rows controls Oracle's own client-side round-trip
+// batching (OCI_ATTR_PREFETCH_ROWS) and is what actually keeps network round
+// trips low; fetch_batch_size controls how many rows this code processes
+// per OCIStmtFetch2/OCIAttrGet call and how big the batch buffer (and any
+// optional field's staging/indicator arrays, sized to fetch_batch_size) is.
+// They don't have to match -- a large prefetch with a small fetch_batch_size
+// is a reasonable choice when the batch's ultimate destination doesn't
+// benefit from being handed large chunks at once (inserting into a
+// std::map, say, where each element is its own O(log n) insertion
+// regardless of batch size, unlike a vector's amortized bulk insert).
+//
+// A NULL landing on a field that isn't std::optional is not detected: that
+// field defines with no indicator at all (see define_one_column in
+// details/oci_client.h), so it silently keeps whatever the batch buffer
+// already held. Closing that -- giving every field a real, if throwaway,
+// indicator -- is a small, separate change, not attempted here.
+template <scalar_bindable OutT>
+ExecResult select_rows(OciConnection& conn, const std::string& sql,
+                        std::size_t prefetch_rows, std::size_t fetch_batch_size,
+                        const std::function<void(const OutT* rows, std::size_t count)>& on_batch);
 
-    // Inserts several rows as a real Oracle array bind: one OCIBindByName
-    // per field (pointing at rows[0]'s field) followed by
-    // OCIBindArrayOfStruct (stride sizeof(T) to the next row's value,
-    // sizeof(sb2) to the next row's indicator), then a single
-    // OCIStmtExecute with iters = rows.size() -- one network round trip
-    // for the whole batch, reading each field's values directly out of
-    // `rows`' own contiguous storage rather than staging/copying them
-    // anywhere first.
-    //
-    // Scope: only a plain (non-optional) arithmetic leaf field binds this
-    // way today -- its bytes already sit inline in T at a fixed offset,
-    // which is exactly what a fixed-stride array bind needs. std::string,
-    // std::optional<U>, LOB, and vector/set/valarray fields all
-    // static_assert here instead of silently doing the wrong thing:
-    //   - std::string's characters live in the string object's own
-    //     heap/SSO storage, not inline in T, so there's no fixed-width
-    //     value at a fixed stride to bind directly -- needs a
-    //     fixed-capacity string type (see oci_fixed_string.h, not yet
-    //     wired in here) before this can work.
-    //   - std::optional<U> would need every row's optional engaged (an
-    //     empty one has no address to bind through) and relies on an
-    //     implementation-defined payload offset being consistent across
-    //     rows -- fragile enough to defer rather than support today.
-    //   - LOB needs a per-row array of locators, not implemented.
-    //   - vector/set/valarray is a single query's dynamic IN-list, not a
-    //     per-row column value -- it has no bulk-insert meaning at all.
-    // For a row type with any of those fields, insert each row in a loop
-    // via insert(conn, query_text, T&) instead.
-    //
-    // On failure the whole batch is un-retried-as-a-batch by
-    // run_with_reconnect the same way every other method here is:
-    // reconnect-and-redo-the-whole-call only on a disconnect-class error.
-    // Transaction/commit boundaries remain the caller's responsibility.
-    // Alloc defaults to std::allocator<T> but isn't fixed to it: std::vector<T>
-    // as a template parameter pattern only deduces against the *default*
-    // allocator, so a caller passing std::vector<T, CustomAllocator<T>>&
-    // (a pool/arena allocator, say, for a latency-sensitive row buffer)
-    // would otherwise fail to match this overload at all.
-    template <bindable T, typename Alloc = std::allocator<T>>
-    bool insert(OciConnection& conn, const std::string& query_text, std::vector<T, Alloc>& rows);
-
-    // Runs a SELECT with no bind parameters and returns its rows -- the
-    // "vector<S> as a result set" case, for a query that's fully literal in
-    // the text (or has no WHERE clause at all). For a query that also needs
-    // bind parameters, use the select(conn, query_text, input, results)
-    // overload below.
-    //
-    // Column order in `query_text`'s SELECT list must match OutputT's
-    // declared field order: unlike execute()/insert(), which bind by name,
-    // OCIDefineByPos is the *only* way to bind output columns in raw OCI --
-    // there is no OCIDefineByName. That's an OCI limitation, not a choice
-    // made here, so this side stays positional regardless of boost::pfr's
-    // name-reflection support. A field declared as std::optional<U> comes
-    // back as std::nullopt when that column is NULL for the row; string,
-    // LOB, and vector/set/valarray output columns aren't supported here --
-    // for a dynamic-sized result set, see select_with_in_collection() in
-    // oci_collection_bind.h, which still returns std::vector<RowT>, just
-    // via a bound IN-list rather than a container-typed column.
-    //
-    // On a disconnect mid-fetch, results are cleared and the whole SELECT is
-    // re-run from scratch on reconnect (there's no cursor to resume from).
-    // Alloc defaults to std::allocator<OutputT> but, as with insert()'s
-    // rows above, isn't fixed to it -- a caller-supplied results vector
-    // with a custom allocator is deduced and threaded straight through.
-    template <bindable OutputT, typename Alloc = std::allocator<OutputT>>
-    bool select(OciConnection& conn, const std::string& query_text, std::vector<OutputT, Alloc>& results);
-
-    // Runs a SELECT that also binds parameters from `input`'s fields --
-    // e.g. "SELECT trade_id, notional FROM trades WHERE status = :status",
-    // with `input.status` bound by name exactly as execute(conn, query_text,
-    // bind_struct) binds its struct (same by-name rules, same {field_name}
-    // container-marker mechanism for a vector/set/valarray field in
-    // `input`). `results`' column-order/type rules are exactly the
-    // no-input overload above -- `input` only ever supplies parameters,
-    // never result columns.
-    template <bindable InputT, bindable OutputT, typename Alloc = std::allocator<OutputT>>
-    bool select(OciConnection& conn, const std::string& query_text,
-                InputT& input, std::vector<OutputT, Alloc>& results);
-
-private:
-    OciOutcome run_execute_once(OciConnection& conn, const std::string& query_text);
-
-    template <bindable T>
-    OciOutcome run_execute_once(OciConnection& conn, const std::string& query_text, T& bind_struct);
-
-    template <bindable T, typename Alloc>
-    OciOutcome run_insert_array_once(OciConnection& conn, const std::string& query_text, std::vector<T, Alloc>& rows);
-
-    template <bindable OutputT, typename Alloc>
-    OciOutcome run_select_once(OciConnection& conn, const std::string& query_text, std::vector<OutputT, Alloc>& results);
-
-    template <bindable InputT, bindable OutputT, typename Alloc>
-    OciOutcome run_select_once(OciConnection& conn, const std::string& query_text,
-                                InputT& input, std::vector<OutputT, Alloc>& results);
-};
+// Same as above, but also binds `input`'s fields as named IN parameters
+// first (e.g. a WHERE clause) -- the read-side counterpart to
+// execute(conn, sql, params). `input` only ever supplies parameters; OutT's
+// column-order/type rules are unchanged from the no-input overload above.
+template <scalar_bindable InT, scalar_bindable OutT>
+ExecResult select_rows(OciConnection& conn, const std::string& sql, InT& input,
+                        std::size_t prefetch_rows, std::size_t fetch_batch_size,
+                        const std::function<void(const OutT* rows, std::size_t count)>& on_batch);
 
 } // namespace binding
 

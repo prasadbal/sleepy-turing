@@ -6,25 +6,18 @@
 
 namespace binding {
 
-struct OciOutcome {
-    bool success = false;
-    sword status = OCI_ERROR;
-};
+// What running a statement against a session came back as. There is no
+// retry logic anywhere in this file: a caller that gets ConnectionLost
+// decides for itself whether and how to reconnect and try again (this
+// class's own connect()/disconnect() are what it would use to do that); a
+// caller that gets QueryError knows retrying is pointless -- bad SQL, a
+// constraint violation, and the like will just fail the same way again.
+enum class ExecStatus { Success, ConnectionLost, QueryError };
+struct ExecResult { ExecStatus status; sword oci_status; };
 
-// Owns the OCI environment/service/error handles for one database session
-// and implements the reconnect policy:
+// Owns the OCI environment/service/error handles for one database session.
 //
-//   - On a disconnect-class error (session/network lost), tear down and
-//     re-establish the session, then retry the *whole* failed operation from
-//     scratch, up to max_retries() times, sleeping retry_interval() between
-//     attempts.
-//   - On any other execution error (bad SQL, constraint violation, no data
-//     found, ...) the operation is returned to the caller immediately,
-//     un-retried -- it isn't a connectivity problem, and retrying would just
-//     reproduce the same error.
-//
-// connect() must be called once before running statements; run_with_reconnect
-// only handles a session dying *during* use, not the initial connect.
+// connect() must be called once before running statements.
 //
 // Implementation in details/oci_connection.h.
 class OciConnection {
@@ -48,14 +41,6 @@ public:
     // down whatever partially succeeded via disconnect() rather than
     // continuing on with a handle from a call that never happened.
     //
-    // Creates the OCI environment with OCI_OBJECT (not OCI_DEFAULT):
-    // oci_collection_bind.h's OCIType/OCIObjectNew/OCICollAppend/
-    // OCIBindObject calls need the object cache this mode initializes;
-    // without it they fail with ORA-21301 "not initialized in object
-    // mode". OCI_OBJECT is additive over the plain scalar bind/define
-    // path, so it doesn't change behavior for callers that never touch
-    // collections -- confirmed by running the scalar-only path unchanged
-    // against a real database after this switched from OCI_DEFAULT.
     bool connect();
 
     void disconnect();
@@ -73,13 +58,14 @@ public:
     // environment (RAC failover, DRCP, firewall idle-kills, ...).
     bool is_disconnect_error() const;
 
-    // Runs `attempt` (one full prepare+bind+execute[+fetch] cycle for a
-    // single command). If it fails with a disconnect-class error, reconnects
-    // and re-runs the *same* attempt from scratch, sleeping retry_interval()
-    // in between, up to max_retries() times. Any other failure is returned
-    // immediately, un-retried.
-    template <typename Fn>
-    bool run_with_reconnect(Fn&& attempt);
+    // Runs an already-prepared, already-bound statement against this
+    // session and classifies the result. `iters` is OCIStmtExecute's own
+    // parameter: 1 for an ordinary single-row statement (DML or SELECT), N
+    // for an array bind of N rows, 0 for a SELECT you intend to fetch from
+    // without pre-fetching any rows at execute time. The caller builds the
+    // statement (prepare + bind) and owns/frees the handle -- this only
+    // runs it.
+    ExecResult execute(OCIStmt* stmt, ub4 iters = 1) const;
 
 private:
     std::string connect_string_;

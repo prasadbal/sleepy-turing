@@ -46,9 +46,6 @@ endif()
 add_executable(binding_demo examples/main.cpp)
 target_link_libraries(binding_demo PRIVATE binding)
 
-add_executable(collection_demo examples/collection_demo.cpp)
-target_link_libraries(collection_demo PRIVATE binding)
-
 # A timing comparison, not a correctness demo -- always optimized regardless
 # of the overall build type, since an unoptimized comparison of an O(1)
 # hash lookup against an O(N) linear scan mostly measures debug-build
