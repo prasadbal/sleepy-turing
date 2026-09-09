@@ -547,11 +547,12 @@ real database" below for exactly what was checked and how to reproduce it.
 ## Testing against a real database
 
 `examples/live_oracle_demo.cpp`, `examples/live_oracle_disconnect_demo.cpp`,
-`examples/live_oracle_fetch_benchmark.cpp`, and
-`examples/live_oracle_insert_benchmark.cpp` run against a real Oracle
-instance rather than the mock -- none of them are part of the normal CMake
-build (there's no Oracle client in the default build environment), so each
-has its own compile command in its header comment.
+`examples/live_oracle_fetch_benchmark.cpp`,
+`examples/live_oracle_insert_benchmark.cpp`, and
+`examples/live_oracle_insert_saturation_benchmark.cpp` run against a real
+Oracle instance rather than the mock -- none of them are part of the normal
+CMake build (there's no Oracle client in the default build environment), so
+each has its own compile command in its header comment.
 
 Verified end to end against `gvenzl/oracle-free:23` (docker container
 `oracle-free`, `ORACLE_PASSWORD=BindingTest123`, port 1521, service
@@ -709,6 +710,48 @@ Three sizes, two completely different relationships:
   wall time) scale close to linearly with `1 / chunk_size`, measured: 422x
   between the extremes on the same 50,000 rows. Chunk for bounded memory,
   incremental progress, or commit granularity -- not because it's free.
+
+That write-side number was measured with `total_rows` fixed and `chunk_size`
+varying -- it isolates round-trip cost, but a wall-time model actually has a
+second term underneath it that number doesn't separate out:
+
+```
+elapsed_time ~= round_trips * per_round_trip_overhead
+              + total_rows  * per_row_server_cost
+```
+
+`live_oracle_insert_saturation_benchmark.cpp` inverts the experiment: hold
+`chunk_size` fixed (sized from a memory budget -- see the file's header
+comment for why that, not an arbitrary row count, is the more meaningful
+way to pick it) and vary `total_rows` instead, so `round_trips` stays flat
+and whatever moves is `per_row_server_cost`. At a 100MB budget with
+`BenchRow` (`sizeof` = 40 bytes), `chunk_size` comes out to ~2.6M rows --
+larger than every `total_rows` tested, so every case ran as a single
+`OCIStmtExecute` call (round trips stayed at 2 throughout):
+
+| total_rows | chunks | elapsed_ms | rows/sec | roundtrips |
+|---:|---:|---:|---:|---:|
+| 50,000 | 1 | 35.6 | 1,405,567 | 2 |
+| 200,000 | 1 | 126.1 | 1,586,373 | 2 |
+| 500,000 | 1 | 721.7 | 692,793 | 2 |
+
+Not the clean convergence-to-a-ceiling the model above predicts. Two
+different effects, not one: 50k -> 200k improving is consistent with fixed
+per-statement overhead (prepare, bind setup) amortizing over more rows;
+200k -> 500k getting more than **2x worse** is not overhead amortizing away,
+it's something becoming genuinely more expensive per row as the single
+transaction grows -- a redo log switch triggered mid-transaction, undo
+segment extent growth, or buffer-cache/DBWR pressure as more dirty blocks
+accumulate than this container's (small, default-sized) Oracle Free
+instance comfortably holds are the likely candidates, in roughly that order
+of suspicion. Not diagnosed further here -- checking `V$LOG`/`V$UNDOSTAT`/
+buffer cache stats around the 500,000-row run, ideally against an instance
+with production-realistic redo/undo/buffer cache sizing rather than this
+container's defaults, is the natural next step. The honest finding: "does
+per-row cost converge to a ceiling" was the wrong question for this range
+of `total_rows` -- there's a cliff, not a plateau, and where it sits is
+probably a property of this specific instance's resource sizing, not a
+fundamental constant of the server.
 
 Two things worth knowing if you try to reproduce this on a different
 machine, both hit and resolved during this session:
