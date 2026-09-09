@@ -554,6 +554,47 @@ Oracle instance rather than the mock -- none of them are part of the normal
 CMake build (there's no Oracle client in the default build environment), so
 each has its own compile command in its header comment.
 
+### Measuring round trips: the query, not a guess
+
+Every round-trip number in this section comes from Oracle's own server-side
+accounting, not from timing or from inferring it out of configuration.
+`V$SESSTAT` is a per-session statistics table; `'SQL*Net roundtrips to/from
+client'` is a counter the server increments itself, internally, at the TTC
+(Two-Task Common) protocol layer, every time it registers a round trip on
+that session -- not something reconstructed from packets or guessed from
+elapsed time:
+
+```sql
+SELECT ss.VALUE
+FROM V$SESSTAT ss
+JOIN V$STATNAME sn ON ss.STATISTIC# = sn.STATISTIC#
+WHERE sn.NAME = 'SQL*Net roundtrips to/from client'
+  AND ss.SID = SYS_CONTEXT('USERENV','SID')
+```
+
+Usage: read it once immediately before the operation you care about, once
+immediately after, and the delta is the round-trip count for exactly what
+ran in between (see `read_roundtrips()` in any of the `live_oracle_*`
+files below for the exact pattern -- it's the same few lines in each).
+`ss.SID = SYS_CONTEXT('USERENV','SID')` scopes it to *your own* session,
+so it's safe to run on a shared instance without picking up other
+sessions' traffic. Needs `SELECT` on `V$SESSTAT`/`V$STATNAME` -- typically
+available to any account, but a locked-down application user might not
+have it.
+
+This is a different vantage point from a packet-level proxy or sniffer,
+not a competing way of producing the same number: `V$SESSTAT` gives an
+authoritative *count* for free, with no protocol parsing, but nothing about
+per-round-trip latency or byte volume, and nothing you can use to inject
+artificial delay or drops. A proxy has to work harder to get a count that
+agrees with this one at all -- Oracle Net (TNS) packets are framed with
+their own length header, and one logical round trip can span multiple TCP
+segments depending on SDU size, so naively counting `send()`/`recv()` calls
+or raw segments will overcount; you'd need to parse TNS packet boundaries,
+or at minimum track distinct write-then-read cycles, to match what this
+query reports. Good cross-check either way: this query's delta should equal
+whatever a packet-level tool reports for the same operation.
+
 Verified end to end against `gvenzl/oracle-free:23` (docker container
 `oracle-free`, `ORACLE_PASSWORD=BindingTest123`, port 1521, service
 `FREEPDB1`) using Oracle Instant Client 19.32 (basic + SDK):
