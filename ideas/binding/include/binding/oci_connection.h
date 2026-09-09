@@ -65,6 +65,19 @@ public:
     // without pre-fetching any rows at execute time. The caller builds the
     // statement (prepare + bind) and owns/frees the handle -- this only
     // runs it.
+    //
+    // Deliberately no rowoff parameter: OCIStmtExecute's own row-offset
+    // parameter looked like the natural way to run a chunked array bind
+    // (bind once against row 0, then repeated calls with iters=chunk_size
+    // and rowoff stepping by chunk_size, no rebinding between them) --
+    // tried exactly that for insert_rows() and it crashed on the *second*
+    // chunk against a real database (confirmed with gdb: the first call,
+    // rowoff=0, succeeds; the next one, rowoff>0 against the same bind,
+    // segfaults inside OCI's own network-marshaling code). insert_rows()
+    // rebinds fresh for every chunk instead, pointed at that chunk's own
+    // starting row -- the conventional, unambiguously-documented pattern.
+    // Root cause of the rowoff crash not identified; not exposed here
+    // rather than document a parameter with a known trap and no caller.
     ExecResult execute(OCIStmt* stmt, ub4 iters = 1) const;
 
 private:

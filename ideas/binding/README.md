@@ -109,11 +109,13 @@ for each, not an oversight.
   `ConnectionLost`, or `QueryError` (see "Running a statement" below). No
   retry logic lives here or anywhere else in this file.
 - `include/binding/oci_client.h` -- free functions, not a class: `execute()`
-  (no bind, or a bind-parameter struct) and `select_rows()` (with or without
-  an input struct), all built on `scalar_bindable<T>` -- every field
-  arithmetic, `FixedString<N>`, or `OciDate`, each optionally wrapped in
-  `std::optional<U>` to mark it nullable. Still no `std::string`, LOB,
-  `OciTimestamp`, collections, or IN-lists.
+  (no bind, or a bind-parameter struct), `select_rows()` (with or without
+  an input struct), and `insert_rows()` (a chunked array bind of a
+  `vector<T>`), all built on `scalar_bindable<T>` -- every field arithmetic,
+  `FixedString<N>`, or `OciDate`, each optionally wrapped in `std::optional<U>`
+  to mark it nullable (except in `insert_rows()`, which rejects `optional<U>`
+  fields entirely -- see "Running a statement" below). Still no `std::string`,
+  LOB, `OciTimestamp`, collections, or IN-lists.
 - `examples/main.cpp` -- execute() with no bind struct, execute() with a
   bind struct (one field `std::optional`), select_rows() with and without
   an input struct, a NULL output column coming back as `nullopt`,
@@ -160,6 +162,16 @@ for each, not an oversight.
 - **`select_rows(conn, sql, input, prefetch_rows, fetch_batch_size, on_batch)`**
   -- same, but also binds `input`'s fields as named parameters first (e.g. a
   `WHERE` clause) -- the read-side counterpart to `execute(conn, sql, params)`.
+- **`insert_rows(conn, sql, rows, chunk_size)`** -- a real Oracle array bind
+  of `rows` (`std::vector<T>&`), executed in chunks of at most `chunk_size`
+  rows per `OCIStmtExecute` call rather than one call for the whole vector.
+  `optional<U>` fields are rejected at compile time here -- every row's
+  optional would need to be engaged, with no per-row NULL indicator
+  tracked in this path at all; use `execute(conn, sql, row)` in a loop for
+  a row type with a nullable field. Unlike `select_rows()`'s
+  `prefetch_rows`/`fetch_batch_size`, there is no server-side write-ahead
+  mechanism to decouple round trips from `chunk_size` -- see "Bottom line"
+  below for what that costs, measured.
 
 `prefetch_rows` and `fetch_batch_size` are two independent numbers, not one:
 `prefetch_rows` sets `OCI_ATTR_PREFETCH_ROWS`, Oracle's own client-side
@@ -476,10 +488,12 @@ of this file it came from (still in git history):
   never join the array bind/fetch path `FixedString<N>`/`OciDate` use --
   it would need its own single-row-only bind path, the way the earlier,
   larger version of this file had one.
-- Bulk array-bind (`insert(vector<T>&)`) and its read-side counterpart
-  (batch-fetch straight into a `vector<T>`). Both existed and were
-  live-verified in the earlier version -- see "Running a statement" above.
-  `select_rows()`'s `on_batch` callback is the seam either would sit behind.
+- A read-side counterpart to `insert_rows()`: batch-fetch straight into a
+  `vector<T>` rather than through a callback. Existed and was live-verified
+  in the earlier version -- `select_rows()`'s `on_batch` callback is the
+  seam it would sit behind; filling a `vector<T>` is a few lines inside
+  that callback today (see Demo 3 in `examples/main.cpp`), not a separate
+  code path.
 - A NULL landing on a field that isn't `std::optional` going undetected --
   see "NULL handling" above for the trade and how to reverse it.
 - The strict, every-field-checked NULL safety net the earlier version had
@@ -532,10 +546,12 @@ real database" below for exactly what was checked and how to reproduce it.
 
 ## Testing against a real database
 
-`examples/live_oracle_demo.cpp` and `examples/live_oracle_disconnect_demo.cpp`
-run against a real Oracle instance rather than the mock -- neither is part
-of the normal CMake build (there's no Oracle client in the default build
-environment), so each has its own compile command in its header comment.
+`examples/live_oracle_demo.cpp`, `examples/live_oracle_disconnect_demo.cpp`,
+`examples/live_oracle_fetch_benchmark.cpp`, and
+`examples/live_oracle_insert_benchmark.cpp` run against a real Oracle
+instance rather than the mock -- none of them are part of the normal CMake
+build (there's no Oracle client in the default build environment), so each
+has its own compile command in its header comment.
 
 Verified end to end against `gvenzl/oracle-free:23` (docker container
 `oracle-free`, `ORACLE_PASSWORD=BindingTest123`, port 1521, service
@@ -588,13 +604,26 @@ Verified end to end against `gvenzl/oracle-free:23` (docker container
   | 5000 | 1000 | 196.9 | 2,539,519 | 85 |
   | 50000 | 1000 | 170.6 | 2,930,444 | 11 |
 
-  Sweep B (`prefetch_rows` varies, `fetch_batch_size` fixed at 1000) is the
-  headline result: round trips drop 502 -> 11 (a 45x reduction) as
-  `prefetch_rows` goes from 50 to 50000, `fetch_batch_size` never changing.
-  This is the same "prefetch controls round trips" claim the pre-rewrite
-  version of this file measured at 500 rows; here it holds at 500,000 --
-  1000x the row count, independently re-verified via server-side
-  accounting rather than the client's own guess.
+  Sweep B (`prefetch_rows` varies, `fetch_batch_size` fixed at 1000): round
+  trips drop 502 -> 11 as `prefetch_rows` goes from 50 to 50000. **Correction
+  to the first cut of this analysis**: this is *not* simply "`prefetch_rows`
+  controls round trips, independent of `fetch_batch_size`" -- checking the
+  four numbers above against `total_rows / prefetch_rows` predicts 10,000
+  and 1,000 round trips for the first two rows, not the 502 both actually
+  measured. What actually fits every row in both Sweep A and Sweep B is
+  `total_rows / max(prefetch_rows, fetch_batch_size)`: 500 (matches 502),
+  500 (matches 502), 100 (vs. measured 85), 10 (matches 11). In other
+  words, asking `OCIStmtFetch2` for more rows per call than the configured
+  prefetch outruns the prefetch cache and forces a round trip anyway --
+  `fetch_batch_size` is a **floor** under the effective prefetch size, not
+  fully independent of it. The practical rule: set `prefetch_rows` to
+  whatever round-trip cost you're willing to pay, and keep `fetch_batch_size`
+  at or below it -- going above it quietly reintroduces the round trips
+  `prefetch_rows` was supposed to have bought you. (The original,
+  incomplete claim -- "prefetch controls round trips" -- is the pre-rewrite
+  version of this file's own finding at 500 rows; it's directionally right,
+  just missing this interaction, which only shows up once you test a case
+  where `fetch_batch_size` exceeds `prefetch_rows`.)
 
   | container | fetch_batch_size | elapsed_ms | rows/sec |
   |---|---:|---:|---:|
@@ -613,6 +642,73 @@ Verified end to end against `gvenzl/oracle-free:23` (docker container
   (vector: 201.7ms vs 172.7ms, ~15% apart; map: 269.1ms vs 224.2ms, ~20%
   apart) -- so a small batch costs relatively less when you were paying for
   per-element insertion overhead either way, not that it costs nothing.
+
+- `live_oracle_insert_benchmark.cpp`: the write-side counterpart --
+  `insert_rows()` (see "Running a statement" below for what that is)
+  chunked over 50,000 rows, `chunk_size` swept from 1 to 50,000, measuring
+  the same way (server-side round trips via `V$SESSTAT`):
+
+  | chunk | elapsed_ms | rows/sec | roundtrips |
+  |---:|---:|---:|---:|
+  | 1 | 12,872.0 | 3,884 | 50,001 |
+  | 10 | 1,617.7 | 30,908 | 5,001 |
+  | 100 | 167.4 | 298,619 | 501 |
+  | 1000 | 52.6 | 951,350 | 51 |
+  | 10000 | 37.7 | 1,325,467 | 6 |
+  | 50000 | 30.5 | 1,639,731 | 2 |
+
+  This is the fetch side's mirror image, and it's clean: round trips track
+  `total_rows / chunk_size` almost exactly (50001, 5001, 501, 51, 6, 2 --
+  no `max()` interaction, because there is no second, independent knob on
+  this side to interact with). `chunk_size=1` to `chunk_size=50000` is a
+  **422x** wall-time difference (12.87s -> 30.5ms) on the exact same
+  50,000 rows. This is the direct, empirical answer to "can `insert_rows`'s
+  chunk size be small the way `fetch_batch_size` can": no -- there is no
+  server-side write-ahead cache analogous to `OCI_ATTR_PREFETCH_ROWS` to
+  absorb a small chunk size against, so shrinking it costs round trips
+  (and wall time) close to linearly, not for free.
+
+  **A real bug this benchmark caught, worth recording**: `insert_rows()`'s
+  first implementation bound the whole array once against row 0 and reused
+  that single bind across every chunk via `OCIStmtExecute`'s own `rowoff`
+  parameter (documented for exactly this: re-running a subset of an
+  already-bound array without rebinding). Against the mock this worked
+  fine and all the unit-level checks passed. Against a real database it
+  segfaulted on the *second* chunk -- confirmed with `gdb`: the first call
+  (`rowoff=0`) succeeds, the next one (`rowoff>0`, same bind) crashes
+  inside OCI's own network-marshaling code (`ttcacs`/`ttci2n`). Root cause
+  not identified. `insert_rows()` now rebinds fresh for every chunk instead
+  (pointed at that chunk's own starting row) -- the more conventional,
+  unambiguously-documented pattern -- and the crash is gone, verified
+  against a mixed row type (int/double/`FixedString<16>`/`OciDate`) with a
+  deliberately-non-dividing chunk size (37 rows, `chunk_size=7`, a partial
+  final chunk) round-tripped and checked value-for-value. This is exactly
+  the class of bug the mock cannot catch: it never actually reads through
+  the pointers/strides it's handed, so a real memory-layout mistake in an
+  array bind is invisible there and only surfaces against a real OCI
+  client. `OciConnection::execute()` no longer exposes a `rowoff`
+  parameter at all -- better to not offer a knob with a known trap and no
+  remaining caller than to document around it.
+
+## Bottom line: fetch size, Oracle prefetch, and array-bind size
+
+Three sizes, two completely different relationships:
+
+- **Read side** (`select_rows()`): `prefetch_rows` and `fetch_batch_size`
+  are *almost* independent. `prefetch_rows` is what actually buys round-trip
+  savings; `fetch_batch_size` is close to free to shrink -- *as long as it
+  stays at or below `prefetch_rows`*. Cross that line and `fetch_batch_size`
+  becomes the effective floor and you silently lose the round-trip savings
+  you thought `prefetch_rows` had bought you (see Sweep B's correction
+  above). Rule of thumb: pick `prefetch_rows` for round-trip cost, keep
+  `fetch_batch_size` ≤ it for whatever memory/CPU reason you have (a
+  `std::map` destination, say).
+- **Write side** (`insert_rows()`): there is no such decoupling. `chunk_size`
+  *is* the round-trip granularity -- Oracle has no write-side equivalent of
+  `OCI_ATTR_PREFETCH_ROWS` to buffer a small chunk against. Round trips (and
+  wall time) scale close to linearly with `1 / chunk_size`, measured: 422x
+  between the extremes on the same 50,000 rows. Chunk for bounded memory,
+  incremental progress, or commit granularity -- not because it's free.
 
 Two things worth knowing if you try to reproduce this on a different
 machine, both hit and resolved during this session:

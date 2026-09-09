@@ -143,6 +143,36 @@ ExecResult select_rows(OciConnection& conn, const std::string& sql, InT& input,
                         std::size_t prefetch_rows, std::size_t fetch_batch_size,
                         const std::function<void(const OutT* rows, std::size_t count)>& on_batch);
 
+// insert_rows() -- a real Oracle array bind of `rows`, executed in bounded
+// chunks of at most `chunk_size` rows per OCIStmtExecute call (via its own
+// rowoff parameter -- see OciConnection::execute's comment) rather than one
+// call covering the whole vector. Binds once, against rows[0]'s own storage
+// with OCIBindArrayOfStruct telling OCI the stride to the next row, and
+// reuses that same bind across every chunk -- no rebinding between them.
+//
+// Unlike select_rows()'s fetch_batch_size/prefetch_rows, there is no
+// server-side "prefetch" mechanism for writes: each chunk's OCIStmtExecute
+// call *is* one round trip covering exactly that many rows, so a smaller
+// chunk_size trades round trips (and, measured, wall time) roughly
+// linearly -- see README's "Testing against a real database" for the
+// numbers. Chunking exists for bounded memory and incremental progress,
+// not because it's free the way a small fetch_batch_size can be on the
+// read side.
+//
+// Scope: only a plain (non-optional) arithmetic, FixedString<N>, or OciDate
+// field binds this way -- an optional<U> field static_asserts here, since
+// every row's optional would need to be engaged (an empty one has no
+// address to bind through) and this path has no per-row NULL indicator at
+// all. A row type with a nullable field needs execute(conn, sql, row) in a
+// loop instead.
+//
+// Runs chunks in order, stopping at the first one that doesn't classify as
+// Success -- no retry, same as everything else here; rows already sent in
+// prior chunks are not rolled back (transaction/commit boundaries are the
+// caller's responsibility, as everywhere else in this file).
+template <scalar_bindable T>
+ExecResult insert_rows(OciConnection& conn, const std::string& sql, std::vector<T>& rows, std::size_t chunk_size);
+
 } // namespace binding
 
 #include "binding/details/oci_client.h"

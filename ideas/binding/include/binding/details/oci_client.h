@@ -3,6 +3,7 @@
 // interface and behavioral contract. Not meant to be included directly.
 #include "binding/oci_client.h"
 
+#include <algorithm>
 #include <boost/pfr.hpp>
 #include <optional>
 #include <tuple>
@@ -240,6 +241,83 @@ ExecResult run_select_fetch_loop(OciConnection& conn, OCIStmt* stmt,
     }
 }
 
+// ---- array bind: one OCIBindByName per field against rows[0], plus
+// OCIBindArrayOfStruct telling OCI the stride to the next row. Rebound
+// fresh for every chunk (insert_rows below), pointed at that chunk's own
+// starting row -- an earlier version of this bound once against rows[0]
+// and reused that single bind across every chunk via OCIStmtExecute's own
+// rowoff parameter (intended for exactly this: re-running a subset of an
+// already-bound array without rebinding). That crashed on the *second*
+// chunk against a real database (confirmed with gdb: the first
+// OCIStmtExecute, rowoff=0, succeeds; the next one, rowoff>0 against the
+// same bind, segfaults inside OCI's own network-marshaling code,
+// ttcacs/ttci2n) -- root cause not identified, but rebinding per chunk is
+// the conventional, unambiguously-documented pattern, so this uses that
+// instead of continuing to chase rowoff's exact real-world behavior here.
+// ---------------------------------------------------------------------
+
+template <std::size_t I, typename T>
+void bind_array_field(OCIStmt* stmt, OciConnection& conn, std::vector<T>& rows,
+                       std::vector<std::vector<sb2>>& indicators,
+                       std::size_t offset, std::size_t count, std::string_view name) {
+    using FieldT = boost::pfr::tuple_element_t<I, T>;
+    static_assert(!is_optional_v<FieldT>,
+                  "insert_rows: optional<T> fields are not supported in the array-bind path -- "
+                  "every row's optional would need to be engaged (an empty one has no address to "
+                  "bind through), and there is no NULL semantics tracked for it here. Use "
+                  "execute(conn, sql, row) in a loop for a row type with a nullable field instead.");
+    // Every field gets a real, always-OCI_IND_NOTNULL indicator array here,
+    // even though nothing in this path is ever actually NULL: a null indp
+    // crashed against a real database for an array bind (OCIBindArrayOfStruct
+    // + iters > 1), even though the exact same nullptr indp is fine for a
+    // single-row bind (execute(conn, sql, row) does this safely) and for an
+    // array *define* on the fetch side (select_rows() does this safely too,
+    // see run_select_fetch_loop). The mock does not exercise this at all,
+    // since it never dereferences indp either way.
+    auto& ind = indicators[I];
+    ind.assign(count, OCI_IND_NOTNULL);
+
+    const std::string placeholder = ":" + std::string(name);
+    OCIBind* bind_handle = nullptr;
+
+    if constexpr (is_fixed_string_v<FieldT>) {
+        auto& first = boost::pfr::get<I>(rows[offset]);
+        OCIBindByName(stmt, &bind_handle, conn.err(),
+                      reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
+                      first.data(), static_cast<sb4>(FieldT::capacity), oci_type_code_v<FieldT>,
+                      ind.data(), &first.length_ref(), nullptr, 0, nullptr, OCI_DEFAULT);
+        // alskip = sizeof(T): each row's own length_ field sits inside its
+        // own FixedString, one whole row apart from the previous row's --
+        // same stride pvskip already uses for the value itself.
+        OCIBindArrayOfStruct(bind_handle, conn.err(), static_cast<ub4>(sizeof(T)),
+                              static_cast<ub4>(sizeof(sb2)), static_cast<ub4>(sizeof(T)), 0);
+    } else {
+        OCIBindByName(stmt, &bind_handle, conn.err(),
+                      reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
+                      &boost::pfr::get<I>(rows[offset]), sizeof(FieldT), oci_type_code_v<FieldT>,
+                      ind.data(), nullptr, nullptr, 0, nullptr, OCI_DEFAULT);
+        OCIBindArrayOfStruct(bind_handle, conn.err(), static_cast<ub4>(sizeof(T)), static_cast<ub4>(sizeof(sb2)), 0, 0);
+    }
+}
+
+template <typename T, std::size_t... I>
+void bind_array_fields_impl(OCIStmt* stmt, OciConnection& conn, std::vector<T>& rows,
+                             std::vector<std::vector<sb2>>& indicators,
+                             std::size_t offset, std::size_t count, std::index_sequence<I...>) {
+    constexpr auto names = boost::pfr::names_as_array<T>();
+    (bind_array_field<I>(stmt, conn, rows, indicators, offset, count, names[I]), ...);
+}
+
+// Binds `count` rows starting at rows[offset] -- called once per chunk from
+// insert_rows, not once for the whole vector (see the rowoff/rebind
+// comment above).
+template <typename T>
+void bind_array_fields(OCIStmt* stmt, OciConnection& conn, std::vector<T>& rows,
+                        std::vector<std::vector<sb2>>& indicators, std::size_t offset, std::size_t count) {
+    bind_array_fields_impl(stmt, conn, rows, indicators, offset, count,
+                            std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
+}
+
 } // namespace detail
 
 inline ExecResult execute(OciConnection& conn, const std::string& sql) {
@@ -296,6 +374,32 @@ ExecResult select_rows(OciConnection& conn, const std::string& sql, InT& input,
     detail::bind_params(stmt, conn, input, in_indicators, in_staging);
 
     const ExecResult result = detail::run_select_fetch_loop<OutT>(conn, stmt, prefetch_rows, fetch_batch_size, on_batch);
+    OCIHandleFree(stmt, OCI_HTYPE_STMT);
+    return result;
+}
+
+template <scalar_bindable T>
+ExecResult insert_rows(OciConnection& conn, const std::string& sql, std::vector<T>& rows, std::size_t chunk_size) {
+    if (rows.empty()) return {ExecStatus::Success, OCI_SUCCESS};
+
+    OCIStmt* stmt = nullptr;
+    OCIHandleAlloc(conn.env(), reinterpret_cast<void**>(&stmt), OCI_HTYPE_STMT, 0, nullptr);
+    OCIStmtPrepare(stmt, conn.err(), reinterpret_cast<const text*>(sql.c_str()),
+                   static_cast<ub4>(sql.size()), OCI_NTV_SYNTAX, OCI_DEFAULT);
+
+    // Owned here, not inside bind_array_fields: each chunk's indicator
+    // arrays must stay alive from that chunk's bind through its own
+    // execute() call.
+    std::vector<std::vector<sb2>> indicators(boost::pfr::tuple_size_v<T>);
+
+    ExecResult result{ExecStatus::Success, OCI_SUCCESS};
+    for (std::size_t offset = 0; offset < rows.size(); offset += chunk_size) {
+        const std::size_t this_chunk = std::min(chunk_size, rows.size() - offset);
+        detail::bind_array_fields(stmt, conn, rows, indicators, offset, this_chunk);
+        result = conn.execute(stmt, static_cast<ub4>(this_chunk));
+        if (result.status != ExecStatus::Success) break;
+    }
+
     OCIHandleFree(stmt, OCI_HTYPE_STMT);
     return result;
 }
