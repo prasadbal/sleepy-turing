@@ -567,11 +567,12 @@ real database" below for exactly what was checked and how to reproduce it.
 `examples/live_oracle_fetch_benchmark.cpp`,
 `examples/live_oracle_insert_benchmark.cpp`,
 `examples/live_oracle_insert_saturation_benchmark.cpp`,
-`examples/live_oracle_wide_row_benchmark.cpp`, and
-`examples/live_oracle_lob_demo.cpp` run against a real Oracle instance
-rather than the mock -- none of them are part of the normal CMake build
-(there's no Oracle client in the default build environment), so each has
-its own compile command in its header comment.
+`examples/live_oracle_wide_row_benchmark.cpp`,
+`examples/live_oracle_lob_demo.cpp`, and
+`examples/live_oracle_lob_fetch_benchmark.cpp` run against a real Oracle
+instance rather than the mock -- none of them are part of the normal CMake
+build (there's no Oracle client in the default build environment), so each
+has its own compile command in its header comment.
 
 ### OciClob/OciBlob: the one thing the mock can't check
 
@@ -627,6 +628,54 @@ so far have been real-database-only, not mock-only, so a clean first run
 here is itself informative about which design choices (locator-per-row,
 `OCILobGetLength2`-sized reads, `OCI_ONE_PIECE` writes) held up rather
 than assumed to.
+
+### LOB round trips don't follow prefetch_rows/fetch_batch_size -- they follow row count
+
+`examples/live_oracle_lob_fetch_benchmark.cpp` scales the same check up to
+1,000 rows of ~256KB CLOB each (~250MB total, an XML-shaped payload --
+the kind of thing one desk/risk-class's worth of an FRTB run might
+produce) specifically to surface something `live_oracle_lob_demo.cpp`'s
+3 rows can't: **a LOB column fetches in two separate phases, and only the
+first one is what `prefetch_rows`/`fetch_batch_size` govern.**
+`OCIStmtFetch2` only ever transfers the *locator* for a LOB column --
+a small handle, batched exactly like every other column's define. The
+LOB's actual bytes move later, inside `apply_one_column`'s
+`OCILobGetLength2` + `OCILobRead2` pair (`details/oci_client.h`), called
+once **per row, per LOB column**, with no batching knob over it at all.
+Every other type in this library has its round-trip cost fully explained
+by `total_rows / max(prefetch_rows, fetch_batch_size)` (see "Bottom line"
+below); a LOB field adds a second, flat `total_rows` term on top that
+those two knobs cannot touch.
+
+Run against `oracle-free`, 1,000 rows, `prefetch_rows=200`,
+`fetch_batch_size=50`:
+
+```
+insert: 10789.4ms, 4001 round trips (4.00/row)
+
+fetch: 2388.0ms, 2023 round trips (2.02/row), 250.0MB, 104.7MB/s
+
+rows seen: 1000, mismatches: 0 -> ALL CHECKS PASSED
+```
+
+The fetch side's **2.02 round trips/row** is the headline number, and it
+matches the two-call read path exactly (`OCILobGetLength2` +
+`OCILobRead2`, one pair per row) -- not `1000 / max(200, 50) = 5` round
+trips the way a scalar/`FixedString<N>`/`OciDate` column of this row
+count and batch configuration would cost. Bumping `fetch_batch_size` or
+`prefetch_rows` higher would not move this number: the row-level fetch
+they govern is already cheap relative to the flat per-row LOB-read cost
+sitting on top of it. The write side's **4.00 round trips/row** is the
+mirror finding on the insert path: `OCIDescriptorAlloc` (client-side, no
+round trip) `OCILobCreateTemporary` + `OCILobWrite2` + `OCIStmtExecute` +
+`OCILobFreeTemporary` -- four server-touching calls per row, `chunk_size`
+having no purchase here either, since `insert_rows()`'s array-bind path
+doesn't support LOB fields at all (see oci_lob.h) and a loop of
+`execute(conn, sql, row)` is genuinely one row at a time.
+
+Every row round-tripped byte-for-byte on this run (`mismatches: 0`),
+including the 256KB length itself -- the scale this benchmark was built
+to check that `live_oracle_lob_demo.cpp`'s 3-row pass couldn't.
 
 ### Measuring round trips: the query, not a guess
 
