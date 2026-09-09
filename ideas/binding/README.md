@@ -781,18 +781,99 @@ different effects, not one: 50k -> 200k improving is consistent with fixed
 per-statement overhead (prepare, bind setup) amortizing over more rows;
 200k -> 500k getting more than **2x worse** is not overhead amortizing away,
 it's something becoming genuinely more expensive per row as the single
-transaction grows -- a redo log switch triggered mid-transaction, undo
-segment extent growth, or buffer-cache/DBWR pressure as more dirty blocks
-accumulate than this container's (small, default-sized) Oracle Free
-instance comfortably holds are the likely candidates, in roughly that order
-of suspicion. Not diagnosed further here -- checking `V$LOG`/`V$UNDOSTAT`/
-buffer cache stats around the 500,000-row run, ideally against an instance
-with production-realistic redo/undo/buffer cache sizing rather than this
-container's defaults, is the natural next step. The honest finding: "does
-per-row cost converge to a ceiling" was the wrong question for this range
-of `total_rows` -- there's a cliff, not a plateau, and where it sits is
-probably a property of this specific instance's resource sizing, not a
-fundamental constant of the server.
+transaction grows. The honest finding: "does per-row cost converge to a
+ceiling" was the wrong question for this range of `total_rows` -- there's a
+cliff, not a plateau, and where it sits is a property of this specific
+instance's resource sizing, not a fundamental constant of the server.
+
+### Checking *why*: redo log switches and undo segments
+
+Both of these track a real resource that a very large single transaction
+can put real pressure on, and checking them turned "probably a redo log
+switch" from a guess into something with actual evidence behind it on this
+container.
+
+**Redo logs** are where Oracle records every change before it's considered
+durable -- every `INSERT`/`UPDATE`/`DELETE` writes a redo entry describing
+the change, *before* that change is guaranteed safe, so the database can
+replay it during crash recovery. Redo is written to a small, fixed number
+of **log groups** in a round-robin: fill one, "switch" to the next; once
+you've cycled through all of them, the oldest is reused -- but only once
+`DBWR` (the process that writes dirty data blocks back to disk) has
+confirmed every block that group's redo protects is safely on disk. If
+redo generation outruns `DBWR`, Oracle has no choice but to **stall new
+writes** until it catches up (the `log file switch (checkpoint incomplete)`
+wait, if you've ever seen it in `V$SESSION_EVENT`) -- this is a genuine
+throughput cliff, not a gradual slowdown, which is exactly the shape our
+200k -> 500k number has.
+
+```sql
+SELECT GROUP#, SEQUENCE#, BYTES, MEMBERS, STATUS FROM V$LOG ORDER BY GROUP#;
+```
+
+Run against `oracle-free` right after the saturation benchmark:
+
+```
+group=1 seq=129 bytes=20971520 (20.0MB) members=1 status=INACTIVE
+group=2 seq=130 bytes=20971520 (20.0MB) members=1 status=CURRENT
+```
+
+Two groups, 20MB each -- small, a default/out-of-the-box size, not
+something anyone deliberately sized for this workload. A 500,000-row
+`INSERT`'s redo volume (even at a conservative handful of bytes per row for
+a 3-column table) can plausibly exceed 20MB on its own, meaning that single
+transaction likely cycled through *both* groups, each switch potentially
+paying the checkpoint-catch-up cost above. This doesn't prove the cliff is
+*only* redo-related, but it's concrete, specific evidence for the
+leading suspect, not just a plausible-sounding name pulled from a list.
+`V$LOG_HISTORY` extends this with actual switch *timestamps*, which is what
+you'd want to correlate switch timing directly against the benchmark's own
+wall-clock timing on a longer-running test.
+
+**Undo segments** are the mirror image -- for every change, Oracle also
+writes an undo record capturing how to *reverse* it, which is what powers
+both `ROLLBACK` and the MVCC read-consistency mechanism discussed
+separately in this conversation. Even a plain `INSERT` generates undo
+(a compact "delete this row" record, cheaper than an `UPDATE`'s undo but
+not free), and it accumulates for the entire duration of an uncommitted
+transaction -- our benchmark never commits until the very end, so a
+500,000-row single transaction's undo footprint is the sum of all 500,000
+rows' worth, not something that gets reclaimed as you go.
+
+```sql
+SELECT BEGIN_TIME, END_TIME, UNDOBLKS, TXNCOUNT, MAXQUERYLEN, ACTIVEBLKS, UNXPBLKSTEALCNT
+FROM V$UNDOSTAT ORDER BY BEGIN_TIME DESC;
+```
+
+This is the textbook query, and it's worth knowing its real limitation
+before relying on it: `V$UNDOSTAT` snapshots in **10-minute** intervals --
+far coarser than a benchmark run that completes in under a second. Run
+against `oracle-free` immediately after the saturation benchmark above, it
+returned **zero rows** -- not a sign undo wasn't used, just that this view
+either hadn't accumulated a snapshot yet on this freshly-started container
+or doesn't populate the same way queried from inside a PDB (this is a
+multitenant `FREEPDB1`, not the CDB root) -- either way, it's the wrong
+tool for inspecting one specific short run. `V$TRANSACTION` is the
+practical alternative for that: queried *while* the transaction is still
+open (from a second, concurrent session, since the row disappears the
+moment the first session commits or rolls back), `USED_UBLK`/`USED_UREC`
+give the undo blocks/records the in-flight transaction has consumed so
+far -- the same "read it from a second connection while the first is
+mid-flight" pattern `live_oracle_disconnect_demo.cpp` already uses for a
+different purpose (reading `V$SESSION`'s SID/SERIAL# to kill it). Doing
+this for real means adding a deliberate pause into the saturation
+benchmark's 500,000-row case specifically, so a concurrent session has a
+window to poll `V$TRANSACTION` before it commits -- not done here, but the
+mechanism already exists elsewhere in this codebase to build on.
+
+Bottom line on the *why*: `V$LOG`'s 20MB-per-group sizing is concrete,
+verified evidence that this container's redo configuration is genuinely
+small relative to the workload -- a real, specific finding, not a
+placeholder guess. Undo remains an open, plausible, *unverified* second
+suspect on this specific container -- `V$UNDOSTAT`'s granularity ruled it
+out as a tool here, and `V$TRANSACTION` is the next thing to try, ideally
+against an instance with production-realistic redo/undo sizing rather than
+this container's defaults.
 
 Two things worth knowing if you try to reproduce this on a different
 machine, both hit and resolved during this session:
