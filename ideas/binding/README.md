@@ -875,6 +875,19 @@ out as a tool here, and `V$TRANSACTION` is the next thing to try, ideally
 against an instance with production-realistic redo/undo sizing rather than
 this container's defaults.
 
+A related question that came up alongside this: does *concurrent read*
+traffic against the same table affect these write-side numbers? The answer
+turned out to hinge on how Oracle's MVCC (multi-version read consistency)
+actually works, which is its own topic, written up separately in
+[docs/mvcc_notes.md](docs/mvcc_notes.md) -- short version: no locking
+interaction between readers and writers at all (that part of the intuition
+behind the question was correct), but reads still compete for the same
+finite CPU/buffer-cache/I/O a concurrent insert needs, so "shouldn't
+matter" is right about locking and incomplete as a claim about elapsed
+time. Not measured here -- running a concurrent read workload alongside
+`live_oracle_insert_benchmark.cpp` and comparing against the idle numbers
+above is the natural way to quantify that, not attempted in this pass.
+
 Two things worth knowing if you try to reproduce this on a different
 machine, both hit and resolved during this session:
 
