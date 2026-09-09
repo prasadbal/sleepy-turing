@@ -548,8 +548,9 @@ real database" below for exactly what was checked and how to reproduce it.
 
 `examples/live_oracle_demo.cpp`, `examples/live_oracle_disconnect_demo.cpp`,
 `examples/live_oracle_fetch_benchmark.cpp`,
-`examples/live_oracle_insert_benchmark.cpp`, and
-`examples/live_oracle_insert_saturation_benchmark.cpp` run against a real
+`examples/live_oracle_insert_benchmark.cpp`,
+`examples/live_oracle_insert_saturation_benchmark.cpp`, and
+`examples/live_oracle_wide_row_benchmark.cpp` run against a real
 Oracle instance rather than the mock -- none of them are part of the normal
 CMake build (there's no Oracle client in the default build environment), so
 each has its own compile command in its header comment.
@@ -785,6 +786,59 @@ transaction grows. The honest finding: "does per-row cost converge to a
 ceiling" was the wrong question for this range of `total_rows` -- there's a
 cliff, not a plateau, and where it sits is a property of this specific
 instance's resource sizing, not a fundamental constant of the server.
+
+### A wider row: sizing the buffer from a 256MB budget, not a row count
+
+`BenchRow` above is ~40 bytes -- realistic for a narrow table, but it means
+a memory-budget-derived `chunk_size` (~2.6M rows at 100MB) ends up larger
+than any `total_rows` worth testing, so every saturation case above ran as
+a single `OCIStmtExecute` call. `examples/live_oracle_wide_row_benchmark.cpp`
+repeats the same methodology with a much wider row -- one `VARCHAR2`
+column sized to get close to 4KB/row -- specifically so the memory budget
+actually becomes the binding constraint and `insert_rows()` genuinely has
+to chunk, which is the more realistic shape for a table with several
+sizeable columns rather than a handful of numbers.
+
+The first attempt used a straight `VARCHAR2(4080)` column and hit a real
+wall immediately: `CREATE TABLE` failed with `ORA-00910: specified length
+too long for its datatype`. `VARCHAR2` has a hard 4000-byte ceiling under
+the default `MAX_STRING_SIZE=STANDARD` (which is what this container runs,
+and what a stock Oracle instance ships with) -- getting past it needs
+`MAX_STRING_SIZE=EXTENDED`, a one-way instance-level migration, or a
+different type (`CLOB`) entirely. Neither was worth it just to hit a round
+number, so the row is a 3900-byte payload instead (`sizeof(WideRow)` =
+3908 once the 4-byte `id` and `FixedString`'s own 2-byte length field are
+in) -- close enough to "~4K" for what this actually tests (buffer-sizing
+arithmetic, not the exact byte count), and it's a real, worth-remembering
+ceiling if you're ever sizing a genuinely wide row for real.
+
+At a 256MB budget, `chunk_size = 256MB / 3908 bytes` comes out to 68,688
+rows -- for the first time in this series, *smaller* than some of the
+`total_rows` values tested, so `insert_rows()` genuinely splits into
+multiple chunks:
+
+| total_rows | chunks | elapsed_ms | rows/sec | roundtrips |
+|---:|---:|---:|---:|---:|
+| 20,000 | 1 | 8.6 | 2,325,184 | 2 |
+| 100,000 | 2 | 32.2 | 3,100,935 | 3 |
+| 300,000 | 5 | 88.8 | 3,379,757 | 6 |
+
+Round trips track `chunks + 1` almost exactly (2, 3, 6 for 1, 2, 5 chunks),
+same linear relationship the narrow-row insert benchmark found earlier --
+unsurprising, since chunking is chunking regardless of row width. The
+rows/sec numbers themselves aren't directly comparable to `BenchRow`'s
+(different table, far more bytes moved per row, and -- like every insert
+benchmark in this file -- no `COMMIT`, so this is buffer-cache/redo-buffer
+work, not disk-durable write throughput); what's notable is that this
+configuration shows no sign of the 200k->500k cliff the narrow-row
+saturation benchmark hit -- 300,000 rows here stays on the same trend as
+20,000 and 100,000. That's consistent with (not proof of) the redo-log
+theory from the next section: this run moves *more* total bytes per row
+than the narrow-row case at a comparable row count, so if the cliff really
+is redo-log-switch-driven, a wider row should, if anything, hit it *sooner*
+in row-count terms -- the fact that it doesn't at 300,000 rows here is a
+useful data point for whoever picks up `V$TRANSACTION` next, not a
+contradiction (500,000 wide rows wasn't tested in this pass).
 
 ### Checking *why*: redo log switches and undo segments
 
