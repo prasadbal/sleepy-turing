@@ -40,7 +40,7 @@ namespace binding {
 // replicate those macros in the mock.
 //
 // Fixed-size (7 bytes on a real client), no descriptor/locator, no
-// allocation -- unlike OciTimestamp below (and OciClob/OciXml,
+// allocation -- unlike OciTimestamp below (and OciClob/OciBlob,
 // binding/oci_lob.h), an OciDate field's bytes sit inline in its row
 // struct at a fixed offset, so it needs no special-casing in
 // bind_one_field/define_one_field_array at all: it flows through the
@@ -172,7 +172,7 @@ inline constexpr bool is_oci_date_v = std::is_same_v<T, OciDate>;
 // mechanisms insert(vector<T>&)/select() use for a batch: a
 // std::optional<OciTimestamp> or OciTimestamp field is excluded from
 // those paths (bind_one_field's is_oci_datetime_v branch handles it
-// row-by-row instead, mirroring OciClob/OciXml's own locator lifecycle).
+// row-by-row instead, mirroring OciClob/OciBlob's own locator lifecycle).
 // Fractional seconds and timezone are not modeled -- add them if a real
 // use needs sub-second precision or a TIMESTAMP WITH (LOCAL) TIME ZONE
 // column; this covers plain TIMESTAMP (year/month/day/hour/minute/second).

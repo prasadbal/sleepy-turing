@@ -3,15 +3,21 @@
 // a SELECT) fetch rows in batches, handing each batch to a callback.
 //
 // Deliberately narrow: arithmetic fields, FixedString<N> (a fixed-capacity
-// character buffer -- see oci_fixed_string.h), and OciDate (see
-// oci_datetime.h), each optionally wrapped in std::optional<U> to mark a
-// value/column nullable. No LOB, no OciTimestamp (its OCIDateTime* is a
-// per-value descriptor, not a fixed-stride value -- a different shape of
-// problem from everything else here), no dynamic-width anything, no
-// IN-list/collection support -- those are separate concerns for later, not
-// half-built in here. Reworked from an earlier, considerably larger version
-// of this file that also handled all of those; that version is still in
-// git history if any of it is worth resurrecting.
+// character buffer -- see oci_fixed_string.h), OciDate (see oci_datetime.h),
+// and OciClob/OciBlob (see oci_lob.h), each optionally wrapped in
+// std::optional<U> to mark a value/column nullable -- except OciClob/
+// OciBlob themselves, which aren't nullable yet (see oci_lob.h for why).
+// LOB fields also don't participate in insert_rows()'s array-bind path
+// (same file, same reason): a locator's per-value allocate/write/free
+// lifecycle has no fixed-stride raw buffer for OCIBindArrayOfStruct to
+// stride over. No OciTimestamp (its OCIDateTime* is a per-value descriptor
+// too, but unlike a LOB locator, wiring it in would still be pure
+// bind/define plumbing with no separate read/write API -- just not done
+// yet), no dynamic-width anything, no IN-list/collection support -- those
+// are separate concerns for later, not half-built in here. Reworked from
+// an earlier, considerably larger version of this file that also handled
+// all of those; that version is still in git history if any of it is
+// worth resurrecting.
 //
 // No retry: every entry point here runs once and returns an ExecResult
 // (OciConnection::execute's classification, or QueryError from a bind/fetch
@@ -23,6 +29,7 @@
 #include "binding/oci_connection.h"
 #include "binding/oci_datetime.h"
 #include "binding/oci_fixed_string.h"
+#include "binding/oci_lob.h"
 #include "binding/reflect.h"
 
 #include <cstddef>
@@ -66,6 +73,16 @@ template <std::size_t N> struct OciTypeBinder<FixedString<N>> { static constexpr
 // needs no special-casing anywhere below beyond this type-code entry.
 template <> struct OciTypeBinder<OciDate> { static constexpr ub2 type_code = SQLT_ODT; };
 
+// OciClob/OciBlob: SQLT_CLOB/SQLT_BLOB. Unlike every entry above, the type
+// code alone doesn't tell the whole story -- what actually gets bound/
+// defined is an OCILobLocator*, not the field's own bytes, and that
+// locator's allocate/write-or-read/free lifecycle is real, non-trivial
+// logic living in details/oci_client.h's LOB-specific branches (bind_one_
+// param, define_one_column, apply_one_column), not just a memcpy the way
+// every other type code here is.
+template <> struct OciTypeBinder<OciClob> { static constexpr ub2 type_code = SQLT_CLOB; };
+template <> struct OciTypeBinder<OciBlob> { static constexpr ub2 type_code = SQLT_BLOB; };
+
 template <typename T> struct oci_type_code_of { static constexpr ub2 value = OciTypeBinder<T>::type_code; };
 template <typename U> struct oci_type_code_of<std::optional<U>> { static constexpr ub2 value = OciTypeBinder<U>::type_code; };
 template <typename T> inline constexpr ub2 oci_type_code_v = oci_type_code_of<std::remove_cv_t<T>>::value;
@@ -82,9 +99,18 @@ struct scalar_field_predicate {
     template <typename U>
     static constexpr bool check() {
         using V = optional_value_t<U>; // void if U isn't std::optional<something>
+        // is_oci_lob_v<U> only, deliberately not is_oci_lob_v<V> too: that
+        // would let std::optional<OciClob>/std::optional<OciBlob> satisfy
+        // this concept, but nothing in bind_one_param's is_optional_v<>
+        // branch (details/oci_client.h) handles a LOB sub-case -- a
+        // nullable LOB isn't wired in yet (see oci_lob.h). Excluding it
+        // here means that mismatch is a clear "doesn't satisfy
+        // scalar_bindable" at the call site instead of a confusing failure
+        // three layers down in the bind code.
         return std::is_arithmetic_v<V> || std::is_arithmetic_v<U> ||
                is_fixed_string_v<V> || is_fixed_string_v<U> ||
-               is_oci_date_v<V> || is_oci_date_v<U>;
+               is_oci_date_v<V> || is_oci_date_v<U> ||
+               is_oci_lob_v<U>;
     }
 };
 template <typename T>
@@ -164,7 +190,12 @@ ExecResult select_rows(OciConnection& conn, const std::string& sql, InT& input,
 // every row's optional would need to be engaged (an empty one has no
 // address to bind through) and this path has no per-row NULL indicator at
 // all. A row type with a nullable field needs execute(conn, sql, row) in a
-// loop instead.
+// loop instead. An OciClob/OciBlob field static_asserts here too, for a
+// different reason: each row's LOB needs its own locator allocated,
+// written, and freed individually, and there's no fixed-stride raw buffer
+// for OCIBindArrayOfStruct to stride over the way there is for a plain
+// scalar or FixedString<N> row. execute(conn, sql, row) in a loop again,
+// not this.
 //
 // Runs chunks in order, stopping at the first one that doesn't classify as
 // Success -- no retry, same as everything else here; rows already sent in

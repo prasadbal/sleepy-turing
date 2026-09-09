@@ -12,6 +12,64 @@
 namespace binding {
 namespace detail {
 
+// ---- LOB locator lifecycle: allocate/write on the way in, allocate/read on
+// the way out, free either way. Shared by both the IN (bind_one_param) and
+// OUT (define_one_column/apply_one_column) sides below -- everything else
+// in this file binds/defines straight through a field's own fixed-size
+// address, but a LOB locator is a real OCI-managed descriptor with its own
+// allocate/populate/free lifecycle, not a buffer OCI reads/writes in place.
+// ---------------------------------------------------------------------------
+
+// Allocates a temporary LOB, writes `data`/`size` into it in one
+// OCI_ONE_PIECE call, and returns the locator -- what bind_one_param binds
+// for an OciClob/OciBlob IN parameter. Caller frees it via free_temp_lob
+// once the execute() that used it has run.
+inline OCILobLocator* make_temp_lob(OciConnection& conn, const void* data, std::size_t size, ub1 lob_type) {
+    OCILobLocator* locator = nullptr;
+    OCIDescriptorAlloc(conn.env(), reinterpret_cast<void**>(&locator), OCI_DTYPE_LOB, 0, nullptr);
+    OCILobCreateTemporary(conn.svc(), conn.err(), locator, 0, SQLCS_IMPLICIT, lob_type, 0, OCI_DURATION_SESSION);
+    if (size > 0) {
+        oraub8 byte_amt = static_cast<oraub8>(size);
+        oraub8 char_amt = 0;
+        OCILobWrite2(conn.svc(), conn.err(), locator, &byte_amt, &char_amt, 1,
+                     const_cast<void*>(data), static_cast<oraub8>(size), OCI_ONE_PIECE,
+                     nullptr, nullptr, 0, SQLCS_IMPLICIT);
+    }
+    return locator;
+}
+
+inline void free_temp_lob(OciConnection& conn, OCILobLocator* locator) {
+    if (!locator) return;
+    OCILobFreeTemporary(conn.svc(), conn.err(), locator);
+    OCIDescriptorFree(locator, OCI_DTYPE_LOB);
+}
+
+// Reads a fetched LOB's entire contents in one call: OCILobGetLength2 first
+// (characters for a CLOB, bytes for a BLOB -- see the Oracle docs for
+// OCILobGetLength2), then a single OCI_ONE_PIECE OCILobRead2 sized off
+// that. A CLOB's length is in *characters*, not bytes, so the byte buffer
+// needs headroom for a multi-byte charset -- AL32UTF8's worst case is 4
+// bytes/character -- a BLOB's length is already in bytes, no expansion
+// needed. Simpler than a polling FIRST_PIECE/NEXT_PIECE read loop, at the
+// cost of one extra round trip (the length call) and holding the whole
+// value in memory at once -- the right tradeoff for the report/config-sized
+// LOBs this library targets, not a multi-gigabyte streaming case.
+inline std::string read_lob_bytes(OciConnection& conn, OCILobLocator* locator, bool is_char_lob) {
+    oraub8 length = 0;
+    OCILobGetLength2(conn.svc(), conn.err(), locator, &length);
+    if (length == 0) return {};
+    const std::size_t buffer_bytes = is_char_lob ? static_cast<std::size_t>(length) * 4 + 16
+                                                  : static_cast<std::size_t>(length);
+    std::string buf(buffer_bytes, '\0');
+    oraub8 byte_amt = static_cast<oraub8>(buffer_bytes);
+    oraub8 char_amt = 0;
+    OCILobRead2(conn.svc(), conn.err(), locator, &byte_amt, &char_amt, 1,
+                buf.data(), static_cast<oraub8>(buffer_bytes), OCI_ONE_PIECE,
+                nullptr, nullptr, 0, SQLCS_IMPLICIT);
+    buf.resize(static_cast<std::size_t>(byte_amt));
+    return buf;
+}
+
 // ---- IN: bind a struct's fields by name ------------------------------------
 //
 // A plain field binds straight through its own address -- `params` is the
@@ -32,13 +90,29 @@ using in_staging_t = decltype(in_staging_tuple<T>(std::make_index_sequence<boost
 
 template <std::size_t I, typename T>
 void bind_one_param(OCIStmt* stmt, OciConnection& conn, T& params, std::string_view name,
-                     std::vector<sb2>& indicators, in_staging_t<T>& staging) {
+                     std::vector<sb2>& indicators, in_staging_t<T>& staging,
+                     std::vector<OCILobLocator*>& lob_locators) {
     using FieldT = boost::pfr::tuple_element_t<I, T>;
     auto& field = boost::pfr::get<I>(params);
     const std::string placeholder = ":" + std::string(name);
     OCIBind* bind_handle = nullptr;
 
-    if constexpr (is_optional_v<FieldT>) {
+    if constexpr (is_oci_lob_v<FieldT>) {
+        // Never optional here -- see scalar_field_predicate's comment in
+        // oci_client.h for why std::optional<OciClob/OciBlob> doesn't even
+        // satisfy scalar_bindable yet.
+        indicators[I] = OCI_IND_NOTNULL;
+        OCILobLocator*& locator = lob_locators[I];
+        if constexpr (is_oci_clob_v<FieldT>) {
+            locator = make_temp_lob(conn, field.text_data.data(), field.text_data.size(), OCI_TEMP_CLOB);
+        } else {
+            locator = make_temp_lob(conn, field.binary_data.data(), field.binary_data.size(), OCI_TEMP_BLOB);
+        }
+        OCIBindByName(stmt, &bind_handle, conn.err(),
+                      reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
+                      &locator, sizeof(OCILobLocator*), oci_type_code_v<FieldT>, nullptr,
+                      nullptr, nullptr, 0, nullptr, OCI_DEFAULT);
+    } else if constexpr (is_optional_v<FieldT>) {
         using ElemT = optional_value_t<FieldT>;
         auto& stage = std::get<I>(staging);
         if (field) { stage = *field; indicators[I] = OCI_IND_NOTNULL; }
@@ -75,20 +149,26 @@ void bind_one_param(OCIStmt* stmt, OciConnection& conn, T& params, std::string_v
 
 template <typename T, std::size_t... I>
 void bind_params_impl(OCIStmt* stmt, OciConnection& conn, T& params, std::vector<sb2>& indicators,
-                       in_staging_t<T>& staging, std::index_sequence<I...>) {
+                       in_staging_t<T>& staging, std::vector<OCILobLocator*>& lob_locators,
+                       std::index_sequence<I...>) {
     constexpr auto names = boost::pfr::names_as_array<T>();
-    (bind_one_param<I>(stmt, conn, params, names[I], indicators, staging), ...);
+    (bind_one_param<I>(stmt, conn, params, names[I], indicators, staging, lob_locators), ...);
 }
 
-// indicators/staging are owned by the caller (see run_execute_once below)
-// rather than hidden as locals in here, because they must stay alive from
-// this call through OciConnection::execute() -- the same lifetime rule the
-// field-level comment above explains, just at the whole-struct level.
+// indicators/staging/lob_locators are owned by the caller (see execute()
+// below) rather than hidden as locals in here, because they must stay
+// alive from this call through OciConnection::execute() -- the same
+// lifetime rule the field-level comment above explains, just at the
+// whole-struct level. The caller also owns freeing lob_locators'
+// non-null entries (via free_temp_lob) after execute() runs -- this
+// function only allocates and writes them, same division of
+// responsibility bind vs. free has everywhere else in this file.
 template <typename T>
-void bind_params(OCIStmt* stmt, OciConnection& conn, T& params,
-                  std::vector<sb2>& indicators, in_staging_t<T>& staging) {
+void bind_params(OCIStmt* stmt, OciConnection& conn, T& params, std::vector<sb2>& indicators,
+                  in_staging_t<T>& staging, std::vector<OCILobLocator*>& lob_locators) {
     indicators.assign(boost::pfr::tuple_size_v<T>, OCI_IND_NOTNULL);
-    bind_params_impl(stmt, conn, params, indicators, staging,
+    lob_locators.assign(boost::pfr::tuple_size_v<T>, nullptr);
+    bind_params_impl(stmt, conn, params, indicators, staging, lob_locators,
                       std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
 }
 
@@ -101,7 +181,8 @@ void bind_params(OCIStmt* stmt, OciConnection& conn, T& params,
 // own address; an optional<T> column needs its own batch-sized staging
 // array (same reason as the bind side) plus a batch-sized indicator array.
 template <typename T>
-using out_staging_slot_t = std::conditional_t<is_optional_v<T>, std::vector<optional_value_t<T>>, std::monostate>;
+using out_staging_slot_t = std::conditional_t<is_optional_v<T>, std::vector<optional_value_t<T>>,
+                            std::conditional_t<is_oci_lob_v<T>, std::vector<OCILobLocator*>, std::monostate>>;
 
 template <typename T, std::size_t... I>
 auto out_staging_tuple(std::index_sequence<I...>)
@@ -144,6 +225,27 @@ void define_one_column(OCIStmt* stmt, OciConnection& conn, std::vector<T>& batch
                            ind.data(), nullptr, nullptr, OCI_DEFAULT);
             OCIDefineArrayOfStruct(define_handle, conn.err(), sizeof(ElemT), sizeof(sb2), 0, 0);
         }
+    } else if constexpr (is_oci_lob_v<FieldT>) {
+        // Unlike every other branch here, the buffer OCI writes into isn't
+        // part of the row struct at all: a LOB locator is a separate
+        // OCI-managed allocation, so the "column" this defines against is
+        // a standalone, batch-sized vector<OCILobLocator*> living in
+        // `staging`, one entry per row, each individually allocated up
+        // front. OCIDefineArrayOfStruct's pvskip is that vector's own
+        // element stride (sizeof(OCILobLocator*)), not sizeof(T) -- there
+        // is no host struct here the way FixedString<N>/optional<T> have.
+        auto& ind = indicators[I];
+        ind.assign(batch.size(), OCI_IND_NOTNULL);
+        auto& locators = std::get<I>(staging);
+        locators.assign(batch.size(), nullptr);
+        for (auto& loc : locators) {
+            OCIDescriptorAlloc(conn.env(), reinterpret_cast<void**>(&loc), OCI_DTYPE_LOB, 0, nullptr);
+        }
+        OCIDefineByPos(stmt, &define_handle, conn.err(), position,
+                       locators.data(), sizeof(OCILobLocator*), oci_type_code_v<FieldT>,
+                       ind.data(), nullptr, nullptr, OCI_DEFAULT);
+        OCIDefineArrayOfStruct(define_handle, conn.err(),
+                               static_cast<ub4>(sizeof(OCILobLocator*)), static_cast<ub4>(sizeof(sb2)), 0, 0);
     } else if constexpr (is_fixed_string_v<FieldT>) {
         // rlskip = sizeof(T): OCI reports each row's fetched length into
         // that row's own FixedString::length_, one whole row apart -- same
@@ -175,7 +277,7 @@ void define_columns(OCIStmt* stmt, OciConnection& conn, std::vector<T>& batch,
 // field -- its value already landed directly in batch[row] via the plain
 // OCIDefineArrayOfStruct path above, nothing further to do.
 template <std::size_t I, typename T>
-void apply_one_column(std::vector<T>& batch, std::size_t row,
+void apply_one_column(std::vector<T>& batch, std::size_t row, OciConnection& conn,
                        const std::vector<std::vector<sb2>>& indicators, const out_staging_t<T>& staging) {
     using FieldT = boost::pfr::tuple_element_t<I, T>;
     if constexpr (is_optional_v<FieldT>) {
@@ -183,14 +285,42 @@ void apply_one_column(std::vector<T>& batch, std::size_t row,
         field = (indicators[I][row] == OCI_IND_NULL)
                     ? std::nullopt
                     : std::make_optional(std::get<I>(staging)[row]);
+    } else if constexpr (is_oci_lob_v<FieldT>) {
+        auto& field = boost::pfr::get<I>(batch[row]);
+        if (indicators[I][row] == OCI_IND_NULL) {
+            field = FieldT{};
+        } else {
+            const std::string bytes = read_lob_bytes(conn, std::get<I>(staging)[row], is_oci_clob_v<FieldT>);
+            if constexpr (is_oci_clob_v<FieldT>) field.text_data = bytes;
+            else field.binary_data.assign(bytes.begin(), bytes.end());
+        }
     }
 }
 
 template <typename T, std::size_t... I>
-void apply_columns(std::vector<T>& batch, std::size_t row,
+void apply_columns(std::vector<T>& batch, std::size_t row, OciConnection& conn,
                     const std::vector<std::vector<sb2>>& indicators, const out_staging_t<T>& staging,
                     std::index_sequence<I...>) {
-    (apply_one_column<I>(batch, row, indicators, staging), ...);
+    (apply_one_column<I>(batch, row, conn, indicators, staging), ...);
+}
+
+// Frees every locator define_one_column allocated for a LOB column --
+// called once, after the whole fetch loop finishes (success or error),
+// never per-batch: the same locator array is reused across every
+// OCIStmtFetch2 call on a given define, not reallocated each time.
+template <std::size_t I, typename T>
+void free_one_column_lobs(out_staging_t<T>& staging) {
+    using FieldT = boost::pfr::tuple_element_t<I, T>;
+    if constexpr (is_oci_lob_v<FieldT>) {
+        for (OCILobLocator* loc : std::get<I>(staging)) {
+            if (loc) OCIDescriptorFree(loc, OCI_DTYPE_LOB);
+        }
+    }
+}
+
+template <typename T, std::size_t... I>
+void free_lob_columns(out_staging_t<T>& staging, std::index_sequence<I...>) {
+    (free_one_column_lobs<I, T>(staging), ...);
 }
 
 // Shared by both select_rows() overloads: defines OutT's columns as one
@@ -217,28 +347,35 @@ ExecResult run_select_fetch_loop(OciConnection& conn, OCIStmt* stmt,
 
     // iters=0: nothing to fetch up front, the loop below does all of it.
     ExecResult result = conn.execute(stmt, 0);
-    if (result.status != ExecStatus::Success) return result;
+    if (result.status == ExecStatus::Success) {
+        for (;;) {
+            const sword status = OCIStmtFetch2(stmt, conn.err(), static_cast<ub4>(fetch_batch_size),
+                                                OCI_FETCH_NEXT, 0, OCI_DEFAULT);
+            if (status != OCI_SUCCESS && status != OCI_NO_DATA) {
+                result = conn.is_disconnect_error() ? ExecResult{ExecStatus::ConnectionLost, status}
+                                                     : ExecResult{ExecStatus::QueryError, status};
+                break;
+            }
 
-    for (;;) {
-        const sword status = OCIStmtFetch2(stmt, conn.err(), static_cast<ub4>(fetch_batch_size),
-                                            OCI_FETCH_NEXT, 0, OCI_DEFAULT);
-        if (status != OCI_SUCCESS && status != OCI_NO_DATA) {
-            return conn.is_disconnect_error() ? ExecResult{ExecStatus::ConnectionLost, status}
-                                               : ExecResult{ExecStatus::QueryError, status};
+            ub4 rows_fetched = 0;
+            ub4 attr_size = sizeof(rows_fetched);
+            OCIAttrGet(stmt, OCI_HTYPE_STMT, &rows_fetched, &attr_size, OCI_ATTR_ROWS_FETCHED, conn.err());
+
+            for (ub4 row = 0; row < rows_fetched; ++row) {
+                apply_columns(batch, row, conn, indicators, staging,
+                              std::make_index_sequence<boost::pfr::tuple_size_v<OutT>>{});
+            }
+            on_batch(batch.data(), rows_fetched);
+
+            if (status == OCI_NO_DATA) { result = {ExecStatus::Success, OCI_SUCCESS}; break; }
         }
-
-        ub4 rows_fetched = 0;
-        ub4 attr_size = sizeof(rows_fetched);
-        OCIAttrGet(stmt, OCI_HTYPE_STMT, &rows_fetched, &attr_size, OCI_ATTR_ROWS_FETCHED, conn.err());
-
-        for (ub4 row = 0; row < rows_fetched; ++row) {
-            apply_columns(batch, row, indicators, staging,
-                          std::make_index_sequence<boost::pfr::tuple_size_v<OutT>>{});
-        }
-        on_batch(batch.data(), rows_fetched);
-
-        if (status == OCI_NO_DATA) return {ExecStatus::Success, OCI_SUCCESS};
     }
+
+    // Runs on every exit path (success, no rows, or a mid-loop error) --
+    // a define_one_column LOB branch always allocates its locators up
+    // front, so they need freeing regardless of how the loop above ended.
+    free_lob_columns<OutT>(staging, std::make_index_sequence<boost::pfr::tuple_size_v<OutT>>{});
+    return result;
 }
 
 // ---- array bind: one OCIBindByName per field against rows[0], plus
@@ -266,6 +403,12 @@ void bind_array_field(OCIStmt* stmt, OciConnection& conn, std::vector<T>& rows,
                   "every row's optional would need to be engaged (an empty one has no address to "
                   "bind through), and there is no NULL semantics tracked for it here. Use "
                   "execute(conn, sql, row) in a loop for a row type with a nullable field instead.");
+    static_assert(!is_oci_lob_v<FieldT>,
+                  "insert_rows: LOB fields (OciClob/OciBlob) are not supported in the array-bind "
+                  "path -- each row's LOB needs its own locator allocated via OCIDescriptorAlloc "
+                  "and written via OCILobWrite2, not a fixed-stride raw buffer OCIBindArrayOfStruct "
+                  "can stride over. Use execute(conn, sql, row) in a loop for a row type with a "
+                  "LOB field instead.");
     // Every field gets a real, always-OCI_IND_NOTNULL indicator array here,
     // even though nothing in this path is ever actually NULL: a null indp
     // crashed against a real database for an array bind (OCIBindArrayOfStruct
@@ -339,9 +482,11 @@ ExecResult execute(OciConnection& conn, const std::string& sql, T& params) {
 
     std::vector<sb2> indicators;
     detail::in_staging_t<T> staging{};
-    detail::bind_params(stmt, conn, params, indicators, staging);
+    std::vector<OCILobLocator*> lob_locators;
+    detail::bind_params(stmt, conn, params, indicators, staging, lob_locators);
 
     const ExecResult result = conn.execute(stmt, 1);
+    for (OCILobLocator* loc : lob_locators) detail::free_temp_lob(conn, loc);
     OCIHandleFree(stmt, OCI_HTYPE_STMT);
     return result;
 }
@@ -371,9 +516,11 @@ ExecResult select_rows(OciConnection& conn, const std::string& sql, InT& input,
 
     std::vector<sb2> in_indicators;
     detail::in_staging_t<InT> in_staging{};
-    detail::bind_params(stmt, conn, input, in_indicators, in_staging);
+    std::vector<OCILobLocator*> in_lob_locators;
+    detail::bind_params(stmt, conn, input, in_indicators, in_staging, in_lob_locators);
 
     const ExecResult result = detail::run_select_fetch_loop<OutT>(conn, stmt, prefetch_rows, fetch_batch_size, on_batch);
+    for (OCILobLocator* loc : in_lob_locators) detail::free_temp_lob(conn, loc);
     OCIHandleFree(stmt, OCI_HTYPE_STMT);
     return result;
 }

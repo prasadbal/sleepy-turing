@@ -31,6 +31,17 @@
 //      plain and std::optional (a nullable VARCHAR2/DATE column), through
 //      the same bind/select_rows() surface as every scalar above; no
 //      special-casing needed at the call site.
+//   9. OciClob as a bindable field: execute(conn, sql, row) with a CLOB IN
+//      parameter, then select_rows() fetching it back. The mock doesn't
+//      round-trip an inserted value back out of a real table the way a
+//      live database does (see oci_mock.h -- it's a call-shape simulator,
+//      not a stateful one), so what this demo actually exercises is that
+//      a LOB locator's allocate/write/bind path (IN side) and allocate/
+//      define/read/free path (OUT side) both run against the mock without
+//      crashing, and that the mock's own synthetic fetch content comes
+//      back correctly through OciClob::text_data. Real insert-then-
+//      select-back round-tripping is verified against a live database
+//      instead -- see examples/live_oracle_lob_demo.cpp.
 //
 // Builds against the mock OCI backend (binding/oci_mock.h) since there's no
 // real Oracle client in this environment -- see oci_compat.h.
@@ -43,6 +54,7 @@
 #include "binding/oci_connection.h"
 #include "binding/oci_datetime.h"
 #include "binding/oci_fixed_string.h"
+#include "binding/oci_lob.h"
 
 namespace {
 
@@ -85,6 +97,16 @@ struct PositionRow {
     binding::OciDate cob_date;
     std::optional<binding::FixedString<8>> risk_class;
     std::optional<binding::OciDate> maturity_date;
+};
+
+struct ReportInsert {
+    int report_id;
+    binding::OciClob body;
+};
+
+struct ReportRow {
+    int report_id;
+    binding::OciClob body;
 };
 
 int main() {
@@ -218,6 +240,23 @@ int main() {
                       << " maturity_date="
                       << (row.maturity_date ? std::to_string(row.maturity_date->year()) : std::string("NULL"))
                       << "\n";
+        }
+    }
+
+    std::cout << "--- Demo 9: OciClob as a bindable field ---\n";
+    {
+        ReportInsert report{9001, binding::OciClob(
+            "FRTB sensitivities-based method report, desk RATES_LDN, run 2026-09-09")};
+        binding::execute(conn, "INSERT INTO reports VALUES(:report_id,:body)", report);
+
+        std::vector<ReportRow> rows;
+        std::function<void(const ReportRow*, std::size_t)> on_batch =
+            [&](const ReportRow* batch, std::size_t count) {
+                for (std::size_t i = 0; i < count; ++i) rows.push_back(batch[i]);
+            };
+        binding::select_rows<ReportRow>(conn, "SELECT report_id, body FROM reports", 100, 100, on_batch);
+        for (auto& row : rows) {
+            std::cout << "  report_id=" << row.report_id << " body=[" << row.body.text_data << "]\n";
         }
     }
 

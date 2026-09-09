@@ -67,6 +67,7 @@ struct OCIDate { sb2 OCIDateYYYY = 0; unsigned char OCIDateMM = 0, OCIDateDD = 0
 #define OCI_FETCH_NEXT    2
 #define OCI_ATTR_PREFETCH_ROWS 11
 #define OCI_TEMP_CLOB     1
+#define OCI_TEMP_BLOB     2
 #define SQLCS_IMPLICIT    1
 #ifndef OCI_DURATION_SESSION
 #define OCI_DURATION_SESSION 10
@@ -91,6 +92,7 @@ constexpr ub2 SQLT_STR     = 5;
 constexpr ub2 SQLT_BFLOAT  = 21;
 constexpr ub2 SQLT_BDOUBLE = 22;
 constexpr ub2 SQLT_CLOB    = 112;
+constexpr ub2 SQLT_BLOB    = 113;
 constexpr ub2 SQLT_ODT       = 156;
 constexpr ub2 SQLT_TIMESTAMP = 187;
 
@@ -141,19 +143,30 @@ inline std::atomic<bool> g_simulate_null_last_column{false};
 inline void set_simulate_null_last_column(bool enabled) { g_simulate_null_last_column = enabled; }
 
 // ----------------------------------------------------------------------------
-// Real, addressable backing storage for a mock OCIDateTime descriptor.
-// Every other descriptor type (a LOB locator, via OCI_DTYPE_LOB) only ever
-// needs to be a non-null, never-dereferenced sentinel, since nothing in this
-// mock reads a LOB locator's own bytes. OCIDateTimeGetDate/GetTime (added
-// below for OciTimestamp::from_text/to_text's OCI-format-model conversion)
-// break that: they need to read back whatever OCIDateTimeConstruct or
-// OCIDateTimeFromText last wrote, so OCI_DTYPE_TIMESTAMP gets real memory
-// instead of the `1` sentinel every other descriptor type still uses.
+// Real, addressable backing storage for mock descriptors that something
+// actually reads back. OCI_DTYPE_TIMESTAMP needs this for OCIDateTimeGet
+// Date/GetTime (OciTimestamp::from_text/to_text's OCI-format-model
+// conversion); OCI_DTYPE_LOB needs it so OCILobWrite2/OCILobRead2/
+// OCILobGetLength2 (oci_client.h's LOB bind/fetch path) can actually store
+// and return bytes instead of being no-ops. Every other descriptor type
+// still only needs to be a non-null, never-dereferenced sentinel (the `1`
+// OCIDescriptorAlloc below falls back to).
 // ----------------------------------------------------------------------------
 struct MockDateTimeDescriptor {
     sb2 year = 1970;
     unsigned char month = 1, day = 1, hour = 0, minute = 0, second = 0;
     ub4 fsec = 0;
+};
+
+// Backing store for a mock LOB locator: OCILobWrite2 (bind side) and the
+// SQLT_CLOB/SQLT_BLOB branch of OCIStmtFetch2 (fetch side) both just set
+// `data` directly; OCILobRead2/OCILobGetLength2 read it back. No read
+// cursor needed -- unlike a real polling LOB read, the mock always serves
+// the whole thing in one OCILobRead2 call, matching how details/
+// oci_client.h's read_lob_bytes always calls it (one OCI_ONE_PIECE read
+// sized off OCILobGetLength2, never FIRST_PIECE/NEXT_PIECE polling).
+struct MockLobDescriptor {
+    std::string data;
 };
 
 // ----------------------------------------------------------------------------
@@ -520,6 +533,17 @@ inline sword OCIStmtFetch2(OCIStmt*, OCIError*, ub4 nrows, ub2, sb4, ub4) {
                         reinterpret_cast<unsigned char*>(d.rlenp) + static_cast<std::size_t>(fetched) * d.rlskip);
                     *rlen_ptr = static_cast<ub2>(n);
                 }
+            } else if ((d.dty == SQLT_CLOB || d.dty == SQLT_BLOB) && d.size == sizeof(OCILobLocator*)) {
+                // row_ptr here points into the standalone vector<OCILobLocator*>
+                // define_one_column allocated (see out_staging_slot_t's LOB
+                // case) -- *not* into the row struct, unlike every other
+                // branch in this loop. Each element is already a real
+                // MockLobDescriptor* from OCIDescriptorAlloc; just set its
+                // content directly, the same way OCILobWrite2 would if the
+                // caller had bound this value instead of fetched it.
+                auto* locator = *reinterpret_cast<OCILobLocator**>(row_ptr);
+                auto* desc = reinterpret_cast<binding::mock::MockLobDescriptor*>(locator);
+                desc->data = "lob_row" + std::to_string(g_fetch_row) + "_col" + std::to_string(i);
             } else if (d.dty == SQLT_ODT && d.size == sizeof(::OCIDate)) {
                 // Writes the real 7-byte ::OCIDate layout directly -- OciDate
                 // (oci_datetime.h) wraps that struct with no descriptor and
@@ -564,14 +588,20 @@ inline sword OCIErrorGet(dvoid*, ub4, text*, sb4* errcodep, text* bufp, ub4 bufs
 
 inline sword OCIDescriptorAlloc(const dvoid*, dvoid** descpp, ub4 type, size_t, dvoid**) {
     using namespace binding::mock;
-    *descpp = (type == OCI_DTYPE_TIMESTAMP)
-        ? reinterpret_cast<dvoid*>(new MockDateTimeDescriptor{})
-        : reinterpret_cast<dvoid*>(1); // LOB locator and anything else: never dereferenced
+    if (type == OCI_DTYPE_TIMESTAMP) {
+        *descpp = reinterpret_cast<dvoid*>(new MockDateTimeDescriptor{});
+    } else if (type == OCI_DTYPE_LOB) {
+        *descpp = reinterpret_cast<dvoid*>(new MockLobDescriptor{});
+    } else {
+        *descpp = reinterpret_cast<dvoid*>(1); // anything else: never dereferenced
+    }
     return OCI_SUCCESS;
 }
 inline sword OCIDescriptorFree(dvoid* descp, ub4 type) {
     if (type == OCI_DTYPE_TIMESTAMP) {
         delete reinterpret_cast<binding::mock::MockDateTimeDescriptor*>(descp);
+    } else if (type == OCI_DTYPE_LOB) {
+        delete reinterpret_cast<binding::mock::MockLobDescriptor*>(descp);
     }
     return OCI_SUCCESS;
 }
@@ -687,21 +717,34 @@ inline sword OCIDateTimeGetTime(void*, OCIError*, OCIDateTime* datetime,
 // or turned into a temporary LOB. oci_client.h binds temporary LOBs, so the
 // mock needs both calls.
 inline sword OCILobCreateTemporary(OCISvcCtx*, OCIError*, OCILobLocator*, ub2, ub1, ub1, int, ub2) {
+    // No-op: the descriptor already has real backing storage (an empty
+    // std::string) from OCIDescriptorAlloc -- nothing further to set up
+    // before OCILobWrite2 below can just assign into it.
     return OCI_SUCCESS;
 }
 
 inline sword OCILobFreeTemporary(OCISvcCtx*, OCIError*, OCILobLocator*) { return OCI_SUCCESS; }
 
-inline sword OCILobWrite2(OCISvcCtx*, OCIError*, OCILobLocator*, oraub8*, oraub8*, ub4,
-                           dvoid*, oraub8, ub1, dvoid*, dvoid*, ub2, ub1) {
+inline sword OCILobWrite2(OCISvcCtx*, OCIError*, OCILobLocator* locp, oraub8* byte_amtp, oraub8* char_amtp, ub4,
+                           dvoid* bufp, oraub8 buflen, ub1, dvoid*, dvoid*, ub2, ub1) {
+    auto* desc = reinterpret_cast<binding::mock::MockLobDescriptor*>(locp);
+    desc->data.assign(static_cast<const char*>(bufp), static_cast<std::size_t>(buflen));
+    if (byte_amtp) *byte_amtp = buflen;
+    if (char_amtp) *char_amtp = buflen;
     return OCI_SUCCESS;
 }
-inline sword OCILobGetLength2(OCISvcCtx*, OCIError*, OCILobLocator*, oraub8* lenp) {
-    if (lenp) *lenp = 0;
+inline sword OCILobGetLength2(OCISvcCtx*, OCIError*, OCILobLocator* locp, oraub8* lenp) {
+    auto* desc = reinterpret_cast<binding::mock::MockLobDescriptor*>(locp);
+    if (lenp) *lenp = static_cast<oraub8>(desc->data.size());
     return OCI_SUCCESS;
 }
-inline sword OCILobRead2(OCISvcCtx*, OCIError*, OCILobLocator*, oraub8*, oraub8*, ub4,
-                          dvoid*, oraub8, ub1, dvoid*, dvoid*, ub2, ub1) {
+inline sword OCILobRead2(OCISvcCtx*, OCIError*, OCILobLocator* locp, oraub8* byte_amtp, oraub8* char_amtp, ub4,
+                          dvoid* bufp, oraub8 bufl, ub1, dvoid*, dvoid*, ub2, ub1) {
+    auto* desc = reinterpret_cast<binding::mock::MockLobDescriptor*>(locp);
+    const std::size_t to_copy = std::min(desc->data.size(), static_cast<std::size_t>(bufl));
+    std::memcpy(bufp, desc->data.data(), to_copy);
+    if (byte_amtp) *byte_amtp = to_copy;
+    if (char_amtp) *char_amtp = to_copy;
     return OCI_SUCCESS;
 }
 

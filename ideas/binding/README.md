@@ -13,13 +13,17 @@ that's worth doing, not a committed dependency.
 considerably larger version of itself** -- collections, dynamic IN-lists,
 LOB, and an automatic reconnect-and-retry wrapper have all been removed in
 favor of a small core plus one classified result instead of automatic
-retry. All of the removed code is still in git history. `FixedString<N>`
-and `OciDate` have since been added back on top of the rewrite, live-verified
-against a real database (see "Testing against a real database" below);
-`OciTimestamp`, LOB, and `std::string` output columns have not, and
-`oci_lob.h`/the `OciTimestamp` half of `oci_datetime.h` exist only as
-standalone types today -- wiring one in is a deliberate, separate decision
-for each, not an oversight.
+retry. All of the removed code is still in git history. `FixedString<N>`,
+`OciDate`, and now `OciClob`/`OciBlob` have since been added back on top of
+the rewrite, live-verified against a real database (see "Testing against a
+real database" below); `OciTimestamp` and `std::string` output columns have
+not, and the `OciTimestamp` half of `oci_datetime.h` exists only as a
+standalone type today -- wiring it in is a deliberate, separate decision,
+not an oversight. `OciClob`/`OciBlob` are narrower than the other three,
+though: not nullable (`std::optional<OciClob>` doesn't satisfy
+`scalar_bindable` at all yet), and not usable in `insert_rows()`'s
+array-bind path -- see oci_lob.h and "What's deliberately not here" below
+for why.
 
 ## Layout
 
@@ -37,7 +41,7 @@ for each, not an oversight.
   mistyped `ODI_DTYPE_LOB` instead of `OCI_DTYPE_LOB`, a malformed lambda,
   and a missing `OCIErrorGet` (the connection class needs it to tell a
   dropped session apart from an ordinary SQL error).
-- `include/binding/oci_lob.h` -- `OciClob`/`OciXml` wrapper types.
+- `include/binding/oci_lob.h` -- `OciClob`/`OciBlob`, wired into `oci_client.h`'s bind/select_rows() path and live-verified against a real database (see "Testing against a real database" below) -- not `insert_rows()`, and not nullable yet; see the file's own header comment.
 - `include/binding/oci_fixed_string.h` -- `FixedString<N>` (`OciChar<N>` /
   `OciVarchar2<N>`), a fixed-capacity character buffer. This is the type a
   CHAR/VARCHAR2 column binds *and* defines through: `N` is the maximum output
@@ -59,11 +63,13 @@ for each, not an oversight.
   way `FixedString<N>` was.
   `OciTimestamp` is different, and is **not** wired in: its `OCIDateTime*`
   is a per-value descriptor (allocated via `OCIDescriptorAlloc`, populated via
-  `OCIDateTimeConstruct`), the same shape as `OciClob`/`OciXml`'s locator
-  -- so it's bind-side only (`execute()`/`insert()`, single-row), not
-  select()-able and not bulk-bindable, exactly like a LOB field. Use
-  `OciDate` for a plain calendar date (e.g. a COB/business date, which
-  has no meaningful time-of-day); reach for `OciTimestamp` only when
+  `OCIDateTimeConstruct`), the same *shape* of problem `OciClob`/`OciBlob`'s
+  locator is -- but LOB *is* wired in now (see "Testing against a real
+  database" below), so the read/write pattern for a descriptor-based field
+  is proven out; `OciTimestamp` specifically just hasn't had that same
+  work done yet, not "can't". Use `OciDate` for a plain calendar date
+  (e.g. a COB/business date, which has no meaningful time-of-day); reach
+  for `OciTimestamp` only when
   sub-day precision genuinely matters. Neither models fractional seconds
   or timezones yet.
 
@@ -473,21 +479,32 @@ of this file it came from (still in git history):
   bind (`oci_collection_bind.h`, deleted). IN-clause support is a later,
   separate feature built on query-text rewriting, not something woven into
   the scalar bind/fetch path.
-- `std::string`, LOB (`OciClob`/`OciXml`), and `OciTimestamp` as bindable
-  fields -- `FixedString<N>` and `OciDate` *are* wired in now (see the
-  Layout bullets above and "Testing against a real database" below);
-  these three still aren't. The type definitions all exist
-  (`oci_lob.h`/`oci_datetime.h`) and work standalone; none of them
-  currently register an `OciTypeBinder` in `oci_client.h`, so a struct
-  using one won't satisfy `scalar_bindable` at all. Wiring one back in
-  means adding its `OciTypeBinder` specialization and its bind/define
-  special-casing to `details/oci_client.h` -- the same shape of change
-  `FixedString<N>`/`OciDate` just went through, one type at a time rather
-  than all at once. `OciTimestamp` specifically needs more than that: its
-  `OCIDateTime*` descriptor has no fixed-stride representation, so it can
-  never join the array bind/fetch path `FixedString<N>`/`OciDate` use --
-  it would need its own single-row-only bind path, the way the earlier,
-  larger version of this file had one.
+- `std::string` and `OciTimestamp` as bindable fields -- `FixedString<N>`,
+  `OciDate`, and `OciClob`/`OciBlob` *are* wired in now (see the Layout
+  bullets above and "Testing against a real database" below); these two
+  still aren't. Neither currently registers an `OciTypeBinder` in
+  `oci_client.h`, so a struct using one won't satisfy `scalar_bindable` at
+  all. `OciTimestamp` specifically needs more than just an `OciTypeBinder`
+  entry: its `OCIDateTime*` descriptor has no fixed-stride representation,
+  so it can never join the array bind/fetch path `FixedString<N>`/`OciDate`
+  use -- it would need its own single-row-only bind path, the way
+  `OciClob`/`OciBlob` (see the next bullet) and the earlier, larger version
+  of this file both do it.
+- `OciClob`/`OciBlob` in `insert_rows()`, and as a nullable
+  (`std::optional<OciClob>`/`std::optional<OciBlob>`) field -- unlike
+  every other field type here, a LOB bind/define is a locator
+  (`OCILobLocator*`) with its own allocate/write-or-read/free lifecycle,
+  not a fixed-stride raw buffer, so it has no way to join
+  `insert_rows()`'s array-bind path (`bind_array_field` static_asserts
+  against it, same as it does against `optional<T>`, for a parallel but
+  distinct reason -- see that file's comment). Nullability specifically
+  was left out not because it's hard but because it's unverified: what
+  locator (if any) a NULL LOB bind should actually pass needs checking
+  against a real database rather than guessing, and that check just
+  hasn't been done yet. `execute(conn, sql, row)` in a loop is the
+  work-around for bulk LOB writes today; there's no work-around for
+  nullability yet beyond keeping the field non-optional and using an
+  empty value in place of NULL.
 - A read-side counterpart to `insert_rows()`: batch-fetch straight into a
   `vector<T>` rather than through a callback. Existed and was live-verified
   in the earlier version -- `select_rows()`'s `on_batch` callback is the
@@ -549,11 +566,67 @@ real database" below for exactly what was checked and how to reproduce it.
 `examples/live_oracle_demo.cpp`, `examples/live_oracle_disconnect_demo.cpp`,
 `examples/live_oracle_fetch_benchmark.cpp`,
 `examples/live_oracle_insert_benchmark.cpp`,
-`examples/live_oracle_insert_saturation_benchmark.cpp`, and
-`examples/live_oracle_wide_row_benchmark.cpp` run against a real
-Oracle instance rather than the mock -- none of them are part of the normal
-CMake build (there's no Oracle client in the default build environment), so
-each has its own compile command in its header comment.
+`examples/live_oracle_insert_saturation_benchmark.cpp`,
+`examples/live_oracle_wide_row_benchmark.cpp`, and
+`examples/live_oracle_lob_demo.cpp` run against a real Oracle instance
+rather than the mock -- none of them are part of the normal CMake build
+(there's no Oracle client in the default build environment), so each has
+its own compile command in its header comment.
+
+### OciClob/OciBlob: the one thing the mock can't check
+
+Every other type in this library got its live-database pass because the
+*mechanics* needed checking (real format-model parsing for `OciDate`, a
+real crash for `insert_rows()`'s array bind). LOB needed one for a
+different reason: `oci_mock.h` is a call-shape simulator, not a stateful
+one -- Demo 9 in `examples/main.cpp` confirms a LOB locator's allocate/
+write/bind path (IN) and allocate/define/read/free path (OUT) both run
+against the mock without crashing, but the mock never stores what a bind
+actually wrote, so it can't tell you whether a value survives a real
+insert-then-select-back round trip. That's exactly what
+`examples/live_oracle_lob_demo.cpp` checks, and only a live database can:
+
+- An ordinary short `CLOB` and `BLOB` value.
+- A 60,000-character `CLOB` -- large enough that a hard-coded read-buffer
+  size would have been a real bug, not just an inelegance
+  (`read_lob_bytes` in `details/oci_client.h` sizes its buffer off
+  `OCILobGetLength2` instead of guessing, precisely so this case works).
+- A `BLOB` containing all 256 byte values, including embedded `0x00` --
+  the case that would break silently if anything on the read/write path
+  ever treated the bytes as a C string instead of a length-prefixed
+  buffer.
+- All three rows fetched in a single `select_rows()` batch, not one row
+  at a time -- `define_one_column`'s LOB branch allocates one locator per
+  row up front (a standalone `vector<OCILobLocator*>`, sized to the
+  batch, not embedded in the row struct the way every other field type's
+  buffer is), so this is what actually confirms those locators stay
+  distinct per row rather than all aliasing the same descriptor.
+
+Run against `oracle-free`, first attempt, all of it passed:
+
+```
+fetched 3 rows, checking round-trip:
+  [OK] fetched exactly 3 rows
+  [OK] row 1: short CLOB matches
+  [OK] row 1: short BLOB matches
+  [OK] row 2: large CLOB length matches (60000 vs 60000)
+  [OK] row 2: large CLOB content matches byte-for-byte
+  [OK] row 2: short BLOB matches
+  [OK] row 3: short CLOB matches
+  [OK] row 3: all-byte-values BLOB length matches (5120 vs 5120)
+  [OK] row 3: all-byte-values BLOB matches byte-for-byte (including embedded 0x00)
+
+ALL CHECKS PASSED
+  [OK] bad table name -> QueryError, not a crash
+```
+
+No bug this time, unlike `insert_rows()`'s `rowoff` crash or the
+`FixedString`/format-model gaps earlier passes found -- worth recording
+precisely because it's the exception: most of this library's real bugs
+so far have been real-database-only, not mock-only, so a clean first run
+here is itself informative about which design choices (locator-per-row,
+`OCILobGetLength2`-sized reads, `OCI_ONE_PIECE` writes) held up rather
+than assumed to.
 
 ### Measuring round trips: the query, not a guess
 

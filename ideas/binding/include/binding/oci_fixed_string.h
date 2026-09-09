@@ -10,7 +10,7 @@
 // ============================================================================
 // A fixed-capacity character buffer, for binding/defining a CHAR(N) or
 // VARCHAR2(N) column -- OCI needs a buffer size fixed before it can define
-// an output column, the same reason OciClob/OciXml (oci_lob.h) exist for
+// an output column, the same reason OciClob/OciBlob (oci_lob.h) exist for
 // LOB columns. One type serves both CHAR and VARCHAR2 identically from the
 // client's side: that distinction is a server-side storage detail (fixed,
 // blank-padded vs. variable-length up to N) that doesn't change how the
