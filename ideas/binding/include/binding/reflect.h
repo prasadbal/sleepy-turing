@@ -66,6 +66,25 @@ struct optional_value_impl<std::optional<U>> { using type = U; };
 template <typename T>
 using optional_value_t = typename optional_value_impl<std::remove_cv_t<T>>::type;
 
+// T with any std::optional<> wrapper stripped -- U for optional<U>, T
+// itself otherwise. This is "the type that can actually be bound/defined
+// through a raw address": OCI has no type code for std::optional<U> at
+// all, only for U, so anything that ultimately hands OCI a pointer (a
+// bind, a define, a config value lookup) is really asking for
+// bindable_type_t<T>, not T. Two independent call sites already
+// hand-rolled this exact conditional before this alias existed --
+// config_bind.h's local `Value` alias, and oci_client.h's per-field
+// staging-slot logic -- this gives that one pattern a shared name instead
+// of two copies.
+//
+// Note this only answers the optional axis. A LOB field (OciClob/OciBlob,
+// binding/oci_lob.h) is a second, unrelated reason a field's own type
+// isn't directly bindable -- OCI transfers an OCILobLocator* for those,
+// not the field's own bytes -- and that case is handled separately in
+// oci_client.h/details/oci_client.h, not folded into this alias.
+template <typename T>
+using bindable_type_t = std::conditional_t<is_optional_v<T>, optional_value_t<T>, T>;
+
 // ----------------------------------------------------------------------------
 // Core leaf value validation (arithmetic primitives + string-like layouts,
 // optionally wrapped in std::optional to mark the column/value nullable).

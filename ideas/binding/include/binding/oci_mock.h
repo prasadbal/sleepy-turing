@@ -535,7 +535,7 @@ inline sword OCIStmtFetch2(OCIStmt*, OCIError*, ub4 nrows, ub2, sb4, ub4) {
                 }
             } else if ((d.dty == SQLT_CLOB || d.dty == SQLT_BLOB) && d.size == sizeof(OCILobLocator*)) {
                 // row_ptr here points into the standalone vector<OCILobLocator*>
-                // define_one_column allocated (see out_staging_slot_t's LOB
+                // define_one_column allocated (see define_slot_t's LOB
                 // case) -- *not* into the row struct, unlike every other
                 // branch in this loop. Each element is already a real
                 // MockLobDescriptor* from OCIDescriptorAlloc; just set its

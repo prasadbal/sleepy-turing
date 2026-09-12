@@ -568,11 +568,50 @@ real database" below for exactly what was checked and how to reproduce it.
 `examples/live_oracle_insert_benchmark.cpp`,
 `examples/live_oracle_insert_saturation_benchmark.cpp`,
 `examples/live_oracle_wide_row_benchmark.cpp`,
-`examples/live_oracle_lob_demo.cpp`, and
-`examples/live_oracle_lob_fetch_benchmark.cpp` run against a real Oracle
-instance rather than the mock -- none of them are part of the normal CMake
-build (there's no Oracle client in the default build environment), so each
-has its own compile command in its header comment.
+`examples/live_oracle_lob_demo.cpp`,
+`examples/live_oracle_lob_fetch_benchmark.cpp`, and
+`examples/live_oracle_optional_fetch_benchmark.cpp` run against a real
+Oracle instance rather than the mock -- none of them are part of the
+normal CMake build (there's no Oracle client in the default build
+environment), so each has its own compile command in its header comment.
+
+### bind_t/define_t: is the per-optional-field staging array actually free?
+
+`details/oci_client.h`'s per-field staging machinery (renamed from
+`in_staging_t`/`out_staging_t` to `bind_t`/`define_t`, matching the
+`bind_one_param`/`define_one_column` functions they serve) only ever
+allocates a separate array for a field that isn't directly bindable --
+`std::optional<U>` or a LOB. A plain field never touches it: a
+`static_assert`-backed compile-time check confirms `define_t<T>`/
+`bind_t<T>` are all-`std::monostate` for a struct with no optional/LOB
+fields, i.e. genuinely zero staging, pure row-major `vector<T>` all the
+way through.
+
+`examples/live_oracle_optional_fetch_benchmark.cpp` checks whether the
+one case that *does* allocate a separate array -- a single
+`std::optional<double>` field -- costs anything measurable against an
+otherwise-identical all-plain row, at 500,000 rows, `prefetch_rows` fixed
+at 20,000 (large enough that round trips come out equal for every
+`fetch_batch_size` tested, isolating client-side cost from network cost):
+
+| fetch_batch_size | PlainRow | OptionalRow | roundtrips (both) |
+|---:|---:|---:|---:|
+| 32 | 285.7ms | 282.3ms | 26 |
+| 100 | 256.7ms | 258.7ms | 26 |
+| 1000 | 244.6ms | 245.0ms | 25 |
+| 20000 | 231.5ms | 231.8ms | 15 |
+
+Plain and optional differ by 1-3ms out of 230-285ms at every batch size,
+including 20,000 (matching `prefetch_rows` exactly) -- noise, not a real
+cost. What does move, independent of row type, is `fetch_batch_size`
+itself: 32 costs ~20% more than 20,000 for *both* row types equally,
+consistent with per-call (`OCIStmtFetch2`/`apply_columns`) overhead
+compounding over ~15,600 calls instead of ~25 -- a batch-size effect, not
+an optional-field one. (Round trips at batch=20,000 came in at 15, not
+the ~25 the `total_rows / max(prefetch_rows, fetch_batch_size)` model
+predicts -- the model has always been stated as an approximation, and
+this is the first case seen where it undershoots rather than matches;
+not chased further here.)
 
 ### OciClob/OciBlob: the one thing the mock can't check
 

@@ -410,7 +410,7 @@ void bind_one_value(FieldPtr f, T& out, std::string_view name, bool strict) {
 // being copied out of something the caller is about to drop anyway.
 template <typename T>
 void bind_resolved_node(std::optional<FieldValue> node, T& out, std::string_view path, bool strict) {
-    using Value = std::conditional_t<is_optional_v<T>, optional_value_t<T>, T>;
+    using Value = bindable_type_t<T>; // U for optional<U>, T itself otherwise -- reflect.h
 
     if (!node) {
         if constexpr (is_optional_v<T>) {

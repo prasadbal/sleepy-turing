@@ -80,17 +80,17 @@ inline std::string read_lob_bytes(OciConnection& conn, OCILobLocator* locator, b
 // storage that outlives this whole function. `staging`, owned by the caller
 // (see bind_params below), is that storage.
 template <typename T>
-using in_staging_slot_t = std::conditional_t<is_optional_v<T>, optional_value_t<T>, std::monostate>;
+using bind_slot_t = std::conditional_t<is_optional_v<T>, optional_value_t<T>, std::monostate>;
 
 template <typename T, std::size_t... I>
-auto in_staging_tuple(std::index_sequence<I...>)
-    -> std::tuple<in_staging_slot_t<boost::pfr::tuple_element_t<I, T>>...>;
+auto bind_tuple(std::index_sequence<I...>)
+    -> std::tuple<bind_slot_t<boost::pfr::tuple_element_t<I, T>>...>;
 template <typename T>
-using in_staging_t = decltype(in_staging_tuple<T>(std::make_index_sequence<boost::pfr::tuple_size_v<T>>{}));
+using bind_t = decltype(bind_tuple<T>(std::make_index_sequence<boost::pfr::tuple_size_v<T>>{}));
 
 template <std::size_t I, typename T>
 void bind_one_param(OCIStmt* stmt, OciConnection& conn, T& params, std::string_view name,
-                     std::vector<sb2>& indicators, in_staging_t<T>& staging,
+                     std::vector<sb2>& indicators, bind_t<T>& staging,
                      std::vector<OCILobLocator*>& lob_locators) {
     using FieldT = boost::pfr::tuple_element_t<I, T>;
     auto& field = boost::pfr::get<I>(params);
@@ -149,7 +149,7 @@ void bind_one_param(OCIStmt* stmt, OciConnection& conn, T& params, std::string_v
 
 template <typename T, std::size_t... I>
 void bind_params_impl(OCIStmt* stmt, OciConnection& conn, T& params, std::vector<sb2>& indicators,
-                       in_staging_t<T>& staging, std::vector<OCILobLocator*>& lob_locators,
+                       bind_t<T>& staging, std::vector<OCILobLocator*>& lob_locators,
                        std::index_sequence<I...>) {
     constexpr auto names = boost::pfr::names_as_array<T>();
     (bind_one_param<I>(stmt, conn, params, names[I], indicators, staging, lob_locators), ...);
@@ -165,7 +165,7 @@ void bind_params_impl(OCIStmt* stmt, OciConnection& conn, T& params, std::vector
 // responsibility bind vs. free has everywhere else in this file.
 template <typename T>
 void bind_params(OCIStmt* stmt, OciConnection& conn, T& params, std::vector<sb2>& indicators,
-                  in_staging_t<T>& staging, std::vector<OCILobLocator*>& lob_locators) {
+                  bind_t<T>& staging, std::vector<OCILobLocator*>& lob_locators) {
     indicators.assign(boost::pfr::tuple_size_v<T>, OCI_IND_NOTNULL);
     lob_locators.assign(boost::pfr::tuple_size_v<T>, nullptr);
     bind_params_impl(stmt, conn, params, indicators, staging, lob_locators,
@@ -181,14 +181,14 @@ void bind_params(OCIStmt* stmt, OciConnection& conn, T& params, std::vector<sb2>
 // own address; an optional<T> column needs its own batch-sized staging
 // array (same reason as the bind side) plus a batch-sized indicator array.
 template <typename T>
-using out_staging_slot_t = std::conditional_t<is_optional_v<T>, std::vector<optional_value_t<T>>,
+using define_slot_t = std::conditional_t<is_optional_v<T>, std::vector<optional_value_t<T>>,
                             std::conditional_t<is_oci_lob_v<T>, std::vector<OCILobLocator*>, std::monostate>>;
 
 template <typename T, std::size_t... I>
-auto out_staging_tuple(std::index_sequence<I...>)
-    -> std::tuple<out_staging_slot_t<boost::pfr::tuple_element_t<I, T>>...>;
+auto define_tuple(std::index_sequence<I...>)
+    -> std::tuple<define_slot_t<boost::pfr::tuple_element_t<I, T>>...>;
 template <typename T>
-using out_staging_t = decltype(out_staging_tuple<T>(std::make_index_sequence<boost::pfr::tuple_size_v<T>>{}));
+using define_t = decltype(define_tuple<T>(std::make_index_sequence<boost::pfr::tuple_size_v<T>>{}));
 
 // One indicator array per field, sized to the batch -- but only ever
 // populated for an optional<T> field. A plain field defines with no
@@ -198,7 +198,7 @@ using out_staging_t = decltype(out_staging_tuple<T>(std::make_index_sequence<boo
 // not an oversight.
 template <std::size_t I, typename T>
 void define_one_column(OCIStmt* stmt, OciConnection& conn, std::vector<T>& batch,
-                        std::vector<std::vector<sb2>>& indicators, out_staging_t<T>& staging) {
+                        std::vector<std::vector<sb2>>& indicators, define_t<T>& staging) {
     using FieldT = boost::pfr::tuple_element_t<I, T>;
     constexpr ub4 position = I + 1;
     OCIDefine* define_handle = nullptr;
@@ -267,7 +267,7 @@ void define_one_column(OCIStmt* stmt, OciConnection& conn, std::vector<T>& batch
 
 template <typename T, std::size_t... I>
 void define_columns(OCIStmt* stmt, OciConnection& conn, std::vector<T>& batch,
-                     std::vector<std::vector<sb2>>& indicators, out_staging_t<T>& staging,
+                     std::vector<std::vector<sb2>>& indicators, define_t<T>& staging,
                      std::index_sequence<I...>) {
     (define_one_column<I>(stmt, conn, batch, indicators, staging), ...);
 }
@@ -278,7 +278,7 @@ void define_columns(OCIStmt* stmt, OciConnection& conn, std::vector<T>& batch,
 // OCIDefineArrayOfStruct path above, nothing further to do.
 template <std::size_t I, typename T>
 void apply_one_column(std::vector<T>& batch, std::size_t row, OciConnection& conn,
-                       const std::vector<std::vector<sb2>>& indicators, const out_staging_t<T>& staging) {
+                       const std::vector<std::vector<sb2>>& indicators, const define_t<T>& staging) {
     using FieldT = boost::pfr::tuple_element_t<I, T>;
     if constexpr (is_optional_v<FieldT>) {
         auto& field = boost::pfr::get<I>(batch[row]);
@@ -299,7 +299,7 @@ void apply_one_column(std::vector<T>& batch, std::size_t row, OciConnection& con
 
 template <typename T, std::size_t... I>
 void apply_columns(std::vector<T>& batch, std::size_t row, OciConnection& conn,
-                    const std::vector<std::vector<sb2>>& indicators, const out_staging_t<T>& staging,
+                    const std::vector<std::vector<sb2>>& indicators, const define_t<T>& staging,
                     std::index_sequence<I...>) {
     (apply_one_column<I>(batch, row, conn, indicators, staging), ...);
 }
@@ -309,7 +309,7 @@ void apply_columns(std::vector<T>& batch, std::size_t row, OciConnection& conn,
 // never per-batch: the same locator array is reused across every
 // OCIStmtFetch2 call on a given define, not reallocated each time.
 template <std::size_t I, typename T>
-void free_one_column_lobs(out_staging_t<T>& staging) {
+void free_one_column_lobs(define_t<T>& staging) {
     using FieldT = boost::pfr::tuple_element_t<I, T>;
     if constexpr (is_oci_lob_v<FieldT>) {
         for (OCILobLocator* loc : std::get<I>(staging)) {
@@ -319,7 +319,7 @@ void free_one_column_lobs(out_staging_t<T>& staging) {
 }
 
 template <typename T, std::size_t... I>
-void free_lob_columns(out_staging_t<T>& staging, std::index_sequence<I...>) {
+void free_lob_columns(define_t<T>& staging, std::index_sequence<I...>) {
     (free_one_column_lobs<I, T>(staging), ...);
 }
 
@@ -338,7 +338,7 @@ ExecResult run_select_fetch_loop(OciConnection& conn, OCIStmt* stmt,
                                   const std::function<void(const OutT*, std::size_t)>& on_batch) {
     std::vector<OutT> batch(fetch_batch_size);
     std::vector<std::vector<sb2>> indicators(boost::pfr::tuple_size_v<OutT>);
-    out_staging_t<OutT> staging{};
+    define_t<OutT> staging{};
     define_columns(stmt, conn, batch, indicators, staging,
                    std::make_index_sequence<boost::pfr::tuple_size_v<OutT>>{});
 
@@ -481,7 +481,7 @@ ExecResult execute(OciConnection& conn, const std::string& sql, T& params) {
                    static_cast<ub4>(sql.size()), OCI_NTV_SYNTAX, OCI_DEFAULT);
 
     std::vector<sb2> indicators;
-    detail::in_staging_t<T> staging{};
+    detail::bind_t<T> staging{};
     std::vector<OCILobLocator*> lob_locators;
     detail::bind_params(stmt, conn, params, indicators, staging, lob_locators);
 
@@ -515,7 +515,7 @@ ExecResult select_rows(OciConnection& conn, const std::string& sql, InT& input,
                    static_cast<ub4>(sql.size()), OCI_NTV_SYNTAX, OCI_DEFAULT);
 
     std::vector<sb2> in_indicators;
-    detail::in_staging_t<InT> in_staging{};
+    detail::bind_t<InT> in_staging{};
     std::vector<OCILobLocator*> in_lob_locators;
     detail::bind_params(stmt, conn, input, in_indicators, in_staging, in_lob_locators);
 
