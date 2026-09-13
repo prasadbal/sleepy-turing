@@ -133,10 +133,19 @@ ExecResult execute(OciConnection& conn, const std::string& sql, T& params);
 // select_rows() -- runs a query and fetches its rows in batches, calling
 // `on_batch` once per batch with a pointer to (up to) fetch_batch_size rows
 // and how many of them are actually valid (the last batch of a result set is
-// usually partial). Column order in `sql`'s SELECT list must match OutT's
-// declared field order -- OCIDefineByPos is the only column-output bind API
-// in raw OCI, so this is positional regardless of the IN side binding by
-// name.
+// usually partial). Columns are matched to OutT's fields *by name*, not by
+// declared order: right after `conn.execute(stmt, 0)` resolves the
+// statement, OCIParamGet/OCIAttrGet(OCI_ATTR_NAME) (details/oci_client.h's
+// resolve_column_positions) asks Oracle what each SELECT-list column is
+// actually called -- fully resolved, through any CTE/subquery/UNION/
+// expression alias -- and that name is matched (case-insensitively)
+// against boost::pfr::names_as_array<OutT>(). No SQL parsing happens on
+// this side: OCIStmtPrepare already parsed the statement to build an
+// execution plan, and this is just reading back what it resolved. A
+// computed/derived column needs an explicit `AS fieldname` for this to
+// work -- Oracle only reports a meaningful name for an aliased expression.
+// A field with no matching column name is a QueryError, not a silent
+// fetch of whatever happened to be at some position.
 //
 // prefetch_rows and fetch_batch_size are deliberately two separate numbers,
 // not one: prefetch_rows controls Oracle's own client-side round-trip
@@ -163,7 +172,7 @@ ExecResult select_rows(OciConnection& conn, const std::string& sql,
 // Same as above, but also binds `input`'s fields as named IN parameters
 // first (e.g. a WHERE clause) -- the read-side counterpart to
 // execute(conn, sql, params). `input` only ever supplies parameters; OutT's
-// column-order/type rules are unchanged from the no-input overload above.
+// column-matching/type rules are unchanged from the no-input overload above.
 template <scalar_bindable InT, scalar_bindable OutT>
 ExecResult select_rows(OciConnection& conn, const std::string& sql, InT& input,
                         std::size_t prefetch_rows, std::size_t fetch_batch_size,

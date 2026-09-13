@@ -94,7 +94,7 @@ long long read_row_count(binding::OciConnection& conn) {
         [&](const RowCount* batch, std::size_t count) {
             for (std::size_t i = 0; i < count; ++i) rows.push_back(batch[i]);
         };
-    binding::select_rows<RowCount>(conn, "SELECT COUNT(*) FROM bench_wide_row_test", 10, 10, on_batch);
+    binding::select_rows<RowCount>(conn, "SELECT COUNT(*) AS value FROM bench_wide_row_test", 10, 10, on_batch);
     return rows.empty() ? -1 : rows[0].value;
 }
 

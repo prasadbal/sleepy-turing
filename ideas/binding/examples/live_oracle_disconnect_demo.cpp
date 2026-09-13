@@ -61,7 +61,7 @@ int main(int argc, char** argv) {
             for (std::size_t i = 0; i < count; ++i) self.push_back(batch[i]);
         };
     binding::select_rows<SidSerial>(
-        victim, "SELECT SID, SERIAL# FROM V$SESSION WHERE AUDSID = SYS_CONTEXT('USERENV','SESSIONID')",
+        victim, "SELECT SID, SERIAL# AS serial FROM V$SESSION WHERE AUDSID = SYS_CONTEXT('USERENV','SESSIONID')",
         5, 5, on_batch);
     if (self.empty()) {
         std::fprintf(stderr, "could not read back the victim's own SID/SERIAL#\n");

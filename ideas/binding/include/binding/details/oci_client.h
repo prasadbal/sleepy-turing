@@ -5,8 +5,11 @@
 
 #include <algorithm>
 #include <boost/pfr.hpp>
+#include <cctype>
 #include <optional>
+#include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace binding {
@@ -172,6 +175,83 @@ void bind_params(OCIStmt* stmt, OciConnection& conn, T& params, std::vector<sb2>
                       std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
 }
 
+// ---- Column-name resolution: which OCI column position does field I of
+// OutT actually correspond to? -----------------------------------------
+//
+// Historically this file assumed OutT's field declaration order matched
+// the SELECT list's column order 1:1 -- position = I + 1, no questions
+// asked. That's fragile: it silently breaks if the SQL's column order
+// and the struct's field order ever drift apart (a reordered SELECT
+// list, a struct field added in the middle rather than the end), with
+// no error, just wrong data quietly landing in the wrong field.
+//
+// OCIParamGet + OCIAttrGet(OCI_ATTR_NAME), called on the statement handle
+// right after OCIStmtPrepare, is Oracle's own "describe" mechanism -- the
+// same thing JDBC/ODBC drivers use to build result-set metadata. It hands
+// back each column's *actual, fully-resolved* name -- through any CTE,
+// subquery, UNION, or expression alias -- with no SQL parsing on our
+// part at all: OCIStmtPrepare already parsed the whole statement to build
+// an execution plan, and this is just a lookup against what it already
+// resolved. Matching is case-insensitive (both sides uppercased) since
+// Oracle folds unquoted identifiers to uppercase by default, while a
+// C++ field name is whatever case the caller wrote it in.
+//
+// A computed/derived column needs an explicit `AS name` in the SQL for
+// this to work: Oracle only reports a meaningful name for an aliased
+// expression, not a bare `x*100`.
+inline std::string uppercased(std::string_view s) {
+    std::string result(s);
+    for (char& c : result) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return result;
+}
+
+inline std::string describe_column_name(OciConnection& conn, OCIStmt* stmt, ub4 position) {
+    void* parmdp = nullptr;
+    OCIParamGet(stmt, OCI_HTYPE_STMT, conn.err(), &parmdp, position);
+    text* name_ptr = nullptr;
+    ub4 name_len = 0;
+    OCIAttrGet(parmdp, OCI_DTYPE_PARAM, &name_ptr, &name_len, OCI_ATTR_NAME, conn.err());
+    std::string name(reinterpret_cast<const char*>(name_ptr), name_len);
+    OCIDescriptorFree(parmdp, OCI_DTYPE_PARAM);
+    return uppercased(name);
+}
+
+// Returns, for each field of T (in declaration order), the 1-based OCI
+// column position whose resolved name matches that field's own name --
+// or 0 if no column matched (the caller must treat that as an error, not
+// silently fetch nothing into that field). If the backend doesn't support
+// describing the result set at all (OCI_ATTR_PARAM_COUNT comes back 0 --
+// true of the mock, which has no notion of column names; never true of a
+// real Oracle statement with at least one column), falls back to the
+// original position = I + 1 contract instead, so mock-based code that
+// never cared about this keeps working unchanged.
+template <typename T>
+std::vector<ub4> resolve_column_positions(OciConnection& conn, OCIStmt* stmt) {
+    ub4 column_count = 0;
+    ub4 attr_size = sizeof(column_count);
+    OCIAttrGet(stmt, OCI_HTYPE_STMT, &column_count, &attr_size, OCI_ATTR_PARAM_COUNT, conn.err());
+
+    constexpr std::size_t field_count = boost::pfr::tuple_size_v<T>;
+    std::vector<ub4> positions(field_count);
+
+    if (column_count == 0) {
+        for (std::size_t i = 0; i < field_count; ++i) positions[i] = static_cast<ub4>(i + 1);
+        return positions;
+    }
+
+    std::unordered_map<std::string, ub4> name_to_position;
+    for (ub4 pos = 1; pos <= column_count; ++pos) {
+        name_to_position[describe_column_name(conn, stmt, pos)] = pos;
+    }
+
+    constexpr auto field_names = boost::pfr::names_as_array<T>();
+    for (std::size_t i = 0; i < field_count; ++i) {
+        auto it = name_to_position.find(uppercased(field_names[i]));
+        positions[i] = (it != name_to_position.end()) ? it->second : 0;
+    }
+    return positions;
+}
+
 // ---- OUT: define a batch of result rows ------------------------------------
 //
 // One OCIDefineByPos per column, then OCIDefineArrayOfStruct telling OCI the
@@ -198,9 +278,8 @@ using define_t = decltype(define_tuple<T>(std::make_index_sequence<boost::pfr::t
 // not an oversight.
 template <std::size_t I, typename T>
 void define_one_column(OCIStmt* stmt, OciConnection& conn, std::vector<T>& batch,
-                        std::vector<std::vector<sb2>>& indicators, define_t<T>& staging) {
+                        std::vector<std::vector<sb2>>& indicators, define_t<T>& staging, ub4 position) {
     using FieldT = boost::pfr::tuple_element_t<I, T>;
-    constexpr ub4 position = I + 1;
     OCIDefine* define_handle = nullptr;
 
     if constexpr (is_optional_v<FieldT>) {
@@ -268,8 +347,8 @@ void define_one_column(OCIStmt* stmt, OciConnection& conn, std::vector<T>& batch
 template <typename T, std::size_t... I>
 void define_columns(OCIStmt* stmt, OciConnection& conn, std::vector<T>& batch,
                      std::vector<std::vector<sb2>>& indicators, define_t<T>& staging,
-                     std::index_sequence<I...>) {
-    (define_one_column<I>(stmt, conn, batch, indicators, staging), ...);
+                     const std::vector<ub4>& positions, std::index_sequence<I...>) {
+    (define_one_column<I>(stmt, conn, batch, indicators, staging, positions[I]), ...);
 }
 
 // After a fetch, copies each optional field's per-row staging value (or
@@ -339,41 +418,69 @@ ExecResult run_select_fetch_loop(OciConnection& conn, OCIStmt* stmt,
     std::vector<OutT> batch(fetch_batch_size);
     std::vector<std::vector<sb2>> indicators(boost::pfr::tuple_size_v<OutT>);
     define_t<OutT> staging{};
-    define_columns(stmt, conn, batch, indicators, staging,
-                   std::make_index_sequence<boost::pfr::tuple_size_v<OutT>>{});
 
     ub4 prefetch = static_cast<ub4>(prefetch_rows);
     OCIAttrSet(stmt, OCI_HTYPE_STMT, &prefetch, 0, OCI_ATTR_PREFETCH_ROWS, conn.err());
 
-    // iters=0: nothing to fetch up front, the loop below does all of it.
+    // iters=0: nothing to fetch up front -- but this is also what actually
+    // resolves the result set's column names against a real database.
+    // resolve_column_positions called *before* this execute() consistently
+    // saw OCI_ATTR_PARAM_COUNT come back 0 against oracle-free (confirmed
+    // empirically -- describing straight after OCIStmtPrepare, with no
+    // execute at all, isn't enough), so column-name resolution and the
+    // OCIDefineByPos calls that depend on it both have to happen *after*
+    // this call succeeds, not before it the way position-only binding
+    // used to.
     ExecResult result = conn.execute(stmt, 0);
     if (result.status == ExecStatus::Success) {
-        for (;;) {
-            const sword status = OCIStmtFetch2(stmt, conn.err(), static_cast<ub4>(fetch_batch_size),
-                                                OCI_FETCH_NEXT, 0, OCI_DEFAULT);
-            if (status != OCI_SUCCESS && status != OCI_NO_DATA) {
-                result = conn.is_disconnect_error() ? ExecResult{ExecStatus::ConnectionLost, status}
-                                                     : ExecResult{ExecStatus::QueryError, status};
-                break;
+        const std::vector<ub4> positions = resolve_column_positions<OutT>(conn, stmt);
+        bool all_matched = true;
+        for (ub4 pos : positions) {
+            // A field with no matching output column is a hard error, not
+            // a silent skip -- see resolve_column_positions's comment. The
+            // mock's own fallback (no describe support at all) never
+            // produces a 0 here; only a real mismatch against a real
+            // Oracle result set does.
+            if (pos == 0) { all_matched = false; break; }
+        }
+
+        if (!all_matched) {
+            result = {ExecStatus::QueryError, OCI_ERROR};
+        } else {
+            define_columns(stmt, conn, batch, indicators, staging, positions,
+                           std::make_index_sequence<boost::pfr::tuple_size_v<OutT>>{});
+
+            for (;;) {
+                const sword status = OCIStmtFetch2(stmt, conn.err(), static_cast<ub4>(fetch_batch_size),
+                                                    OCI_FETCH_NEXT, 0, OCI_DEFAULT);
+                if (status != OCI_SUCCESS && status != OCI_NO_DATA) {
+                    result = conn.is_disconnect_error() ? ExecResult{ExecStatus::ConnectionLost, status}
+                                                         : ExecResult{ExecStatus::QueryError, status};
+                    break;
+                }
+
+                ub4 rows_fetched = 0;
+                ub4 attr_size = sizeof(rows_fetched);
+                OCIAttrGet(stmt, OCI_HTYPE_STMT, &rows_fetched, &attr_size, OCI_ATTR_ROWS_FETCHED, conn.err());
+
+                for (ub4 row = 0; row < rows_fetched; ++row) {
+                    apply_columns(batch, row, conn, indicators, staging,
+                                  std::make_index_sequence<boost::pfr::tuple_size_v<OutT>>{});
+                }
+                on_batch(batch.data(), rows_fetched);
+
+                if (status == OCI_NO_DATA) { result = {ExecStatus::Success, OCI_SUCCESS}; break; }
             }
-
-            ub4 rows_fetched = 0;
-            ub4 attr_size = sizeof(rows_fetched);
-            OCIAttrGet(stmt, OCI_HTYPE_STMT, &rows_fetched, &attr_size, OCI_ATTR_ROWS_FETCHED, conn.err());
-
-            for (ub4 row = 0; row < rows_fetched; ++row) {
-                apply_columns(batch, row, conn, indicators, staging,
-                              std::make_index_sequence<boost::pfr::tuple_size_v<OutT>>{});
-            }
-            on_batch(batch.data(), rows_fetched);
-
-            if (status == OCI_NO_DATA) { result = {ExecStatus::Success, OCI_SUCCESS}; break; }
         }
     }
 
-    // Runs on every exit path (success, no rows, or a mid-loop error) --
-    // a define_one_column LOB branch always allocates its locators up
-    // front, so they need freeing regardless of how the loop above ended.
+    // Runs on every exit path (success, no rows, a name-mismatch error, or
+    // a mid-loop error) -- a define_one_column LOB branch always allocates
+    // its locators up front, so they need freeing regardless of how far
+    // this got. Freeing an all-monostate/never-populated staging tuple
+    // (the name-mismatch and execute-failure paths, where define_columns
+    // never ran) is a no-op, same as it always is for a struct with no
+    // LOB fields.
     free_lob_columns<OutT>(staging, std::make_index_sequence<boost::pfr::tuple_size_v<OutT>>{});
     return result;
 }

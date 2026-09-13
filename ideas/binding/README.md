@@ -161,10 +161,14 @@ for why.
 - **`select_rows(conn, sql, prefetch_rows, fetch_batch_size, on_batch)`** --
   runs a `SELECT` with no bind parameters, fetches its rows in batches of
   up to `fetch_batch_size`, and calls `on_batch(rows_pointer, count)` once
-  per batch. Column order in `sql`'s `SELECT` list must match `OutT`'s
-  declared field order -- `OCIDefineByPos` is the only column-output bind
-  API in raw OCI, so this side stays positional regardless of the bind
-  side's by-name binding.
+  per batch. Columns match `OutT`'s fields **by name**, not by declared
+  order -- `OCIParamGet`/`OCIAttrGet(OCI_ATTR_NAME)`, called right after
+  `conn.execute(stmt, 0)` resolves the statement, ask Oracle what each
+  column is actually called (fully resolved, through any CTE/subquery/
+  UNION/expression alias) and that name is matched case-insensitively
+  against the struct's own field names. A computed column needs an
+  explicit `AS fieldname`; a field with no matching column name is a
+  `QueryError`, not a silent fetch of whatever sat at some position.
 - **`select_rows(conn, sql, input, prefetch_rows, fetch_batch_size, on_batch)`**
   -- same, but also binds `input`'s fields as named parameters first (e.g. a
   `WHERE` clause) -- the read-side counterpart to `execute(conn, sql, params)`.
@@ -202,7 +206,7 @@ result checksum-matched) and are straightforward to bring back on top of
 what's here now -- `select_rows`'s `on_batch` callback is exactly the seam
 a `vector`-filling wrapper would sit behind.
 
-## Binding: by name for parameters, by position for result columns
+## Binding: by name, both directions
 
 `execute()`'s parameters bind **by name** (`OCIBindByName`): each field
 binds to a `:field_name` placeholder using its own (compiler-derived) name,
@@ -210,13 +214,29 @@ e.g. field `bonus_pct` binds `:bonus_pct` wherever that placeholder occurs
 in the SQL text -- in any order, and even if it occurs more than once (a
 bind placeholder's "position" is the Nth *distinct* placeholder in order of
 first appearance, not the Nth occurrence -- `WHERE a = :1 OR b = :1` is one
-bind, reused, not two).
+bind, reused, not two). One field can't bind under a *different* name than
+its own, or feed two differently-named placeholders at once (`:begin_date`
+and `:end_date` from one `cob_date` field) -- that would need an explicit
+name-override mechanism this file doesn't have; Oracle's own
+`OCIStmtGetBindInfo` could enumerate a statement's actual bind names to
+validate such a mapping if this were ever built, but discovering names
+isn't the same problem as supplying a mapping between two different
+spellings, and nothing here does either yet.
 
-`select_rows()`'s result columns bind **by position** (`OCIDefineByPos`):
-column order in the `SELECT` list must match `OutT`'s declared field order.
-This isn't a design choice made here -- raw OCI simply has no
-`OCIDefineByName`; binding an output column is only ever positional in
-classic OCI, regardless of what `boost::pfr` can do.
+`select_rows()`'s result columns *also* bind by name now, despite raw OCI
+having no `OCIDefineByName` to call directly: `OCIParamGet` on the
+statement handle plus `OCIAttrGet(OCI_ATTR_NAME)` on each column's
+parameter descriptor (`resolve_column_positions`, `details/oci_client.h`)
+asks Oracle what every column actually resolved to -- after
+`conn.execute(stmt, 0)`, not before it; describing straight after
+`OCIStmtPrepare` with no execute at all reliably returned zero columns
+against a real database (confirmed against `oracle-free` while building
+this) -- and matches that, case-insensitively, against
+`boost::pfr::names_as_array<OutT>()`, before any `OCIDefineByPos` call
+happens. No SQL parsing on this library's part either direction:
+`OCIStmtPrepare` already parsed the whole statement to build an execution
+plan, and both `OCIBindByName` and this describe step are just reading
+back what that parse already resolved.
 
 ## Running a statement, and why there's no retry loop
 
@@ -402,8 +422,8 @@ renaming both the tag and the field to `item` in an otherwise-identical
 tree reproduces the exact same binding result.
 
 `config_bind.h`'s `bind_from_fields<T>(fields, out)` walks `T`'s fields by
-name (see "Binding: by name for parameters, by position for result
-columns" above -- name matching is necessary here, not just convenient) and,
+name (see "Binding: by name, both directions" above -- name matching is
+necessary here, not just convenient) and,
 per field: an absent `std::optional` leaf becomes `nullopt`; a present leaf
 is parsed via `std::from_chars` (rejecting partial matches like `"10abc"`)
 or taken as-is for `std::string`; a nested struct field recurses into the
@@ -569,11 +589,79 @@ real database" below for exactly what was checked and how to reproduce it.
 `examples/live_oracle_insert_saturation_benchmark.cpp`,
 `examples/live_oracle_wide_row_benchmark.cpp`,
 `examples/live_oracle_lob_demo.cpp`,
-`examples/live_oracle_lob_fetch_benchmark.cpp`, and
-`examples/live_oracle_optional_fetch_benchmark.cpp` run against a real
-Oracle instance rather than the mock -- none of them are part of the
-normal CMake build (there's no Oracle client in the default build
-environment), so each has its own compile command in its header comment.
+`examples/live_oracle_lob_fetch_benchmark.cpp`,
+`examples/live_oracle_optional_fetch_benchmark.cpp`, and
+`examples/live_oracle_output_by_name_demo.cpp` run against a real Oracle
+instance rather than the mock -- none of them are part of the normal
+CMake build (there's no Oracle client in the default build environment),
+so each has its own compile command in its header comment.
+
+### select_rows() matches columns by name now, not by position
+
+`examples/live_oracle_output_by_name_demo.cpp` is the proof that output
+binding is genuinely name-driven rather than "still positional, but we
+didn't notice because every other example here happens to declare fields
+in the same order as its SELECT list" -- every prior example in this
+directory does exactly that, so none of them could tell the two apart.
+This one can't be satisfied by position at all:
+
+```cpp
+struct MismatchedRow {
+    binding::FixedString<16> name;  // declared first...
+    int id;                         // ...but "id" is column 1 in the query
+};
+```
+
+fetched via `SELECT id, middle_extra, name FROM ...` -- reversed field
+order relative to the struct, plus a `middle_extra` column the struct
+doesn't reference at all, sitting between the two columns it does want.
+There is no positional arrangement that makes this correct against
+`MismatchedRow`; passing is only possible if each field's data came from
+the column matching its *name*, not whatever position it landed at.
+
+The fix that made this actually work took one real, empirically-found
+correction: `resolve_column_positions` calling `OCIParamGet`/
+`OCIAttrGet(OCI_ATTR_PARAM_COUNT)` immediately after `OCIStmtPrepare` (no
+`OCIStmtExecute` yet) consistently returned **0 columns** against
+`oracle-free` -- describing a statement's result-set shape isn't available
+until the statement has actually been executed (even with `iters=0`,
+which transfers no rows), not merely prepared. Moving the describe step
+to run right after `conn.execute(stmt, 0)` instead of before it fixed
+this immediately; `run_select_fetch_loop` now does execute -> describe ->
+define -> fetch, not define -> execute -> fetch the way the purely
+positional version did.
+
+Run against `oracle-free`, all real, including the negative case:
+
+```
+  [OK] select_rows succeeded
+  [OK] fetched exactly 2 rows
+  [OK] row 1: id=7, name=SEVEN despite reversed field order + extra middle column
+  [OK] row 2: id=8, name=EIGHT despite reversed field order + extra middle column
+  [OK] a field with no matching column name -> QueryError, not silent garbage
+```
+
+That last line matters as much as the reordering does: a struct field
+that doesn't match any real output column fails the whole `select_rows()`
+call with `QueryError` before a single row is fetched, rather than
+silently landing garbage from whatever position it would have occupied
+under the old scheme.
+
+**A real compatibility fix this required**: three existing benchmarks
+(`live_oracle_insert_benchmark.cpp`, `live_oracle_insert_saturation_benchmark.cpp`,
+`live_oracle_wide_row_benchmark.cpp`) queried `SELECT COUNT(*) FROM ...`
+with no alias into a struct field named `value` -- Oracle only reports a
+meaningful column name for an *aliased* expression, so this would have
+failed under by-name matching. Fixed by adding `AS value` to each. A
+fourth, `live_oracle_disconnect_demo.cpp`, queried `SELECT SID, SERIAL#
+FROM V$SESSION` into a struct field named `serial` -- `SERIAL#` is a
+valid Oracle identifier but not a valid C++ one, so the struct necessarily
+spelled it differently; fixed with `SERIAL# AS serial`. Both are exactly
+the class of mismatch by-name matching is meant to catch loudly instead
+of silently -- these two were just old enough to predate the check that
+would have caught them immediately, and got fixed by inspection instead.
+All four, plus every other existing real-Oracle example, re-verified
+against `oracle-free` after the change and still pass.
 
 ### bind_t/define_t: is the per-optional-field staging array actually free?
 
@@ -1120,7 +1208,7 @@ machine, both hit and resolved during this session:
   `libaio.so.1`), which plain `-L` does not make the linker load.
 
 Not yet verified against MSVC in this session -- but `boost::pfr::names_as_array()`
-being available there at all (see "Binding: by name for parameters..."
+being available there at all (see "Binding: by name, both directions"
 above) has been confirmed directly by whoever's building this against the
 real MSVC toolchain in question. The `flat_schema`/`bindable`/
 `config_schema` position-based field-walking engine in `reflect.h` has

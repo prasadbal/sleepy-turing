@@ -73,6 +73,9 @@ struct OCIDate { sb2 OCIDateYYYY = 0; unsigned char OCIDateMM = 0, OCIDateDD = 0
 #define OCI_DURATION_SESSION 10
 #endif
 #define OCI_ATTR_ROWS_FETCHED  197
+#define OCI_DTYPE_PARAM        53  // a parameter descriptor from OCIParamGet
+#define OCI_ATTR_PARAM_COUNT   18  // number of columns in the select list
+#define OCI_ATTR_NAME          4   // the name of the column/argument
 
 // ---- Status codes --------------------------------------------------------
 constexpr sword OCI_SUCCESS = 0;
@@ -455,8 +458,29 @@ inline sword OCIAttrGet(const dvoid*, ub4, dvoid* attributep, ub4* sizep, ub4 at
     if (attrtype == OCI_ATTR_ROWS_FETCHED && attributep) {
         *static_cast<ub4*>(attributep) = static_cast<ub4>(binding::mock::g_last_rows_fetched.load());
         if (sizep) *sizep = sizeof(ub4);
+    } else if (attrtype == OCI_ATTR_PARAM_COUNT && attributep) {
+        // 0 columns describable -- this mock has no notion of a query's
+        // actual column names (it never parses SQL at all), so it can't
+        // participate in output-by-name matching. Reporting 0 here is
+        // what makes resolve_column_positions (details/oci_client.h) fall
+        // back to the pre-existing position = I + 1 contract instead of
+        // failing every select_rows() call against the mock.
+        *static_cast<ub4*>(attributep) = 0;
+        if (sizep) *sizep = sizeof(ub4);
+    } else if (attrtype == OCI_ATTR_NAME && attributep) {
+        // Never actually reached in practice: resolve_column_positions
+        // only calls OCIParamGet/OCIAttrGet(OCI_ATTR_NAME) when
+        // OCI_ATTR_PARAM_COUNT came back non-zero, which the mock never
+        // reports. Present for signature completeness only.
+        *static_cast<text**>(attributep) = nullptr;
+        if (sizep) *sizep = 0;
     }
     return OCI_SUCCESS;
+}
+
+inline sword OCIParamGet(const dvoid*, ub4, OCIError*, dvoid**, ub4) {
+    // Never actually reached -- see the OCI_ATTR_NAME branch above.
+    return OCI_ERROR;
 }
 
 inline sword OCIStmtExecute(OCISvcCtx*, OCIStmt*, OCIError*, ub4 iters, ub4, const dvoid*, dvoid*, ub4) {
