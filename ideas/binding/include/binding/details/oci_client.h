@@ -73,6 +73,67 @@ inline std::string read_lob_bytes(OciConnection& conn, OCILobLocator* locator, b
     return buf;
 }
 
+// ---- Query logging: render one field's value, build one log line per
+// statement. Skipped entirely by insert_rows() (see oci_client.h's
+// set_query_logger comment) -- these helpers are only ever called from
+// the single-row execute()/select_rows() overloads.
+// ---------------------------------------------------------------------------
+
+template <typename FieldT>
+std::string format_bind_value(OciConnection& conn, const FieldT& value) {
+    if constexpr (is_optional_v<FieldT>) {
+        return value ? format_bind_value(conn, *value) : std::string("NULL");
+    } else if constexpr (is_fixed_string_v<FieldT>) {
+        return "'" + std::string(value.view()) + "'";
+    } else if constexpr (is_oci_date_v<FieldT>) {
+        return "'" + value.to_text(conn) + "'";
+    } else if constexpr (is_oci_clob_v<FieldT>) {
+        return "<CLOB, " + std::to_string(value.text_data.size()) + " bytes>";
+    } else if constexpr (is_oci_blob_v<FieldT>) {
+        return "<BLOB, " + std::to_string(value.binary_data.size()) + " bytes>";
+    } else {
+        return std::to_string(value); // every remaining case here is arithmetic
+    }
+}
+
+template <std::size_t I, typename T>
+void append_one_param_repr(OciConnection& conn, T& params, std::string_view name, std::string& out) {
+    if (!out.empty()) out += ", ";
+    out += name;
+    out += "=";
+    out += format_bind_value(conn, boost::pfr::get<I>(params));
+}
+
+template <typename T, std::size_t... I>
+std::string build_params_string_impl(OciConnection& conn, T& params, std::index_sequence<I...>) {
+    constexpr auto names = boost::pfr::names_as_array<T>();
+    std::string result;
+    (append_one_param_repr<I>(conn, params, names[I], result), ...);
+    return result;
+}
+
+template <typename T>
+std::string build_params_string(OciConnection& conn, T& params) {
+    return build_params_string_impl(conn, params, std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
+}
+
+inline void log_query(const std::string& sql) {
+    QueryLogger& logger = query_logger();
+    if (logger) logger("SQL: " + sql);
+}
+
+template <typename T>
+void log_query(OciConnection& conn, const std::string& sql, T& params) {
+    QueryLogger& logger = query_logger();
+    if (logger) logger("SQL: " + sql + " | " + build_params_string(conn, params));
+}
+
+inline void log_query_array(const std::string& sql, std::size_t row_count) {
+    QueryLogger& logger = query_logger();
+    if (logger) logger("SQL: " + sql + " | <array bind, " + std::to_string(row_count) +
+                        " rows, values omitted>");
+}
+
 // ---- IN: bind a struct's fields by name ------------------------------------
 //
 // A plain field binds straight through its own address -- `params` is the
@@ -571,6 +632,7 @@ void bind_array_fields(OCIStmt* stmt, OciConnection& conn, std::vector<T>& rows,
 } // namespace detail
 
 inline ExecResult execute(OciConnection& conn, const std::string& sql) {
+    detail::log_query(sql);
     OCIStmt* stmt = nullptr;
     OCIHandleAlloc(conn.env(), reinterpret_cast<void**>(&stmt), OCI_HTYPE_STMT, 0, nullptr);
     OCIStmtPrepare(stmt, conn.err(), reinterpret_cast<const text*>(sql.c_str()),
@@ -582,6 +644,7 @@ inline ExecResult execute(OciConnection& conn, const std::string& sql) {
 
 template <scalar_bindable T>
 ExecResult execute(OciConnection& conn, const std::string& sql, T& params) {
+    detail::log_query(conn, sql, params);
     OCIStmt* stmt = nullptr;
     OCIHandleAlloc(conn.env(), reinterpret_cast<void**>(&stmt), OCI_HTYPE_STMT, 0, nullptr);
     OCIStmtPrepare(stmt, conn.err(), reinterpret_cast<const text*>(sql.c_str()),
@@ -602,6 +665,7 @@ template <scalar_bindable OutT>
 ExecResult select_rows(OciConnection& conn, const std::string& sql,
                         std::size_t prefetch_rows, std::size_t fetch_batch_size,
                         const std::function<void(const OutT*, std::size_t)>& on_batch) {
+    detail::log_query(sql);
     OCIStmt* stmt = nullptr;
     OCIHandleAlloc(conn.env(), reinterpret_cast<void**>(&stmt), OCI_HTYPE_STMT, 0, nullptr);
     OCIStmtPrepare(stmt, conn.err(), reinterpret_cast<const text*>(sql.c_str()),
@@ -616,6 +680,7 @@ template <scalar_bindable InT, scalar_bindable OutT>
 ExecResult select_rows(OciConnection& conn, const std::string& sql, InT& input,
                         std::size_t prefetch_rows, std::size_t fetch_batch_size,
                         const std::function<void(const OutT*, std::size_t)>& on_batch) {
+    detail::log_query(conn, sql, input);
     OCIStmt* stmt = nullptr;
     OCIHandleAlloc(conn.env(), reinterpret_cast<void**>(&stmt), OCI_HTYPE_STMT, 0, nullptr);
     OCIStmtPrepare(stmt, conn.err(), reinterpret_cast<const text*>(sql.c_str()),
@@ -635,6 +700,12 @@ ExecResult select_rows(OciConnection& conn, const std::string& sql, InT& input,
 template <scalar_bindable T>
 ExecResult insert_rows(OciConnection& conn, const std::string& sql, std::vector<T>& rows, std::size_t chunk_size) {
     if (rows.empty()) return {ExecStatus::Success, OCI_SUCCESS};
+
+    // Row count only, never the values themselves -- see set_query_logger's
+    // comment in oci_client.h for why the array-bind path doesn't try to
+    // render "the value of a bound variable" the way the single-row
+    // overloads above do.
+    detail::log_query_array(sql, rows.size());
 
     OCIStmt* stmt = nullptr;
     OCIHandleAlloc(conn.env(), reinterpret_cast<void**>(&stmt), OCI_HTYPE_STMT, 0, nullptr);

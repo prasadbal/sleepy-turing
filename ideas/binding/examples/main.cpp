@@ -42,6 +42,13 @@
 //      back correctly through OciClob::text_data. Real insert-then-
 //      select-back round-tripping is verified against a live database
 //      instead -- see examples/live_oracle_lob_demo.cpp.
+//  10. set_query_logger(): once installed, execute()/select_rows() log
+//      their SQL text plus each bound field's name and rendered value
+//      (NULL for an empty optional, quoted for FixedString/OciDate, a
+//      byte count for a LOB rather than its content) as one line per
+//      call -- insert_rows()'s array-bind path logs the SQL text and row
+//      count only, never per-row values (see oci_client.h's
+//      set_query_logger comment for why).
 //
 // Builds against the mock OCI backend (binding/oci_mock.h) since there's no
 // real Oracle client in this environment -- see oci_compat.h.
@@ -258,6 +265,26 @@ int main() {
         for (auto& row : rows) {
             std::cout << "  report_id=" << row.report_id << " body=[" << row.body.text_data << "]\n";
         }
+    }
+
+    std::cout << "--- Demo 10: set_query_logger() ---\n";
+    {
+        std::vector<std::string> logged;
+        binding::set_query_logger([&](std::string_view line) { logged.emplace_back(line); });
+
+        EmployeeUpdate withBonus{201, 3.5};
+        EmployeeUpdate noBonus{202, std::nullopt};
+        binding::execute(conn, "UPDATE employees SET bonus_pct = :bonus_pct WHERE id = :id", withBonus);
+        binding::execute(conn, "UPDATE employees SET bonus_pct = :bonus_pct WHERE id = :id", noBonus);
+
+        PositionInsert with_both{7003, binding::FixedString<16>("RATES_LDN"), binding::OciDate(2026, 9, 7),
+                                  binding::FixedString<8>("IR_1"), binding::OciDate(2030, 1, 1)};
+        binding::execute(conn, "INSERT INTO positions VALUES(:position_id,:desk,:cob_date,:risk_class,:maturity_date)",
+                          with_both);
+
+        for (auto& line : logged) std::cout << "  " << line << "\n";
+
+        binding::set_query_logger(nullptr); // back to the default: no logging
     }
 
     conn.disconnect();

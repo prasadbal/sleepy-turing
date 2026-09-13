@@ -238,6 +238,53 @@ happens. No SQL parsing on this library's part either direction:
 plan, and both `OCIBindByName` and this describe step are just reading
 back what that parse already resolved.
 
+## Query logging
+
+`binding::set_query_logger(logger)` installs a `std::function<void(std::
+string_view)>` called once per statement with the SQL text and (for
+`execute(conn, sql, params)` and `select_rows()`'s input-bound overload)
+every bound field's name and rendered value:
+
+```cpp
+binding::set_query_logger([](std::string_view line) { my_logger.info(line); });
+```
+
+```
+SQL: UPDATE employees SET bonus_pct = :bonus_pct WHERE id = :id | id=201, bonus_pct=3.500000
+```
+
+No logger installed (the default) costs nothing beyond one null check --
+no string is ever built. Values are rendered per field type: `NULL` for
+an empty `std::optional`, quoted for `FixedString<N>`/`OciDate` (`OciDate`
+via its own `to_text()`, the real `OCIDateToText` path, not a hand-rolled
+formatter), and a byte count rather than content for `OciClob`/`OciBlob`
+(`<CLOB, 500 bytes>`) -- logging a 256KB CLOB's actual text on every
+insert would make the log line more expensive than the insert.
+
+`insert_rows()`'s array-bind path logs the SQL text and row count only
+(`<array bind, 1000 rows, values omitted>`), never per-row values --
+"the value of a bound variable" doesn't mean one thing when a chunk can
+be thousands of rows bound at once the way it does for a single-row
+bind, and logging a value per row per field would turn one `insert_rows()`
+call into thousands of log lines.
+
+### Verified against a real database
+
+`examples/live_oracle_query_logging_demo.cpp` checks the two things the
+mock can't: `OciDate` rendering through the real `OCIDateToText` (not the
+mock's own format-model interpreter), and that a 1,000-row `insert_rows()`
+call produces exactly one log line, not 1,000:
+
+```
+SQL: INSERT INTO query_logging_test VALUES(:report_id,:run_date,:body) | report_id=1, run_date='13-SEP-26', body=<CLOB, 500 bytes>
+SQL: INSERT INTO query_logging_bulk VALUES(:id,:value) | <array bind, 1000 rows, values omitted>
+```
+
+All four checks passed: the date rendered correctly, the 500-byte CLOB
+logged as a byte count rather than its content, and the whole run
+(2 DDL statements, 1 bound `execute()`, 1 more DDL, 1 `insert_rows()`
+call for 1,000 rows) produced exactly 5 log lines total -- not 1,004.
+
 ## Running a statement, and why there's no retry loop
 
 `OciConnection::execute(stmt, iters)` runs an already-prepared,
@@ -590,8 +637,9 @@ real database" below for exactly what was checked and how to reproduce it.
 `examples/live_oracle_wide_row_benchmark.cpp`,
 `examples/live_oracle_lob_demo.cpp`,
 `examples/live_oracle_lob_fetch_benchmark.cpp`,
-`examples/live_oracle_optional_fetch_benchmark.cpp`, and
-`examples/live_oracle_output_by_name_demo.cpp` run against a real Oracle
+`examples/live_oracle_optional_fetch_benchmark.cpp`,
+`examples/live_oracle_output_by_name_demo.cpp`, and
+`examples/live_oracle_query_logging_demo.cpp` run against a real Oracle
 instance rather than the mock -- none of them are part of the normal
 CMake build (there's no Oracle client in the default build environment),
 so each has its own compile command in its header comment.

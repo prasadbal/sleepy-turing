@@ -35,9 +35,35 @@
 #include <cstddef>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <type_traits>
 
 namespace binding {
+
+// ----------------------------------------------------------------------------
+// Query logging: opt-in, off by default. Set a logger and every execute()/
+// select_rows() call logs its SQL text plus each bound field's name and
+// value (rendered, not the raw bytes) as one line, e.g.
+//   SQL: UPDATE employees SET bonus_pct = :bonus_pct WHERE id = :id | id=101, bonus_pct=2.5
+// insert_rows()'s array-bind path logs the SQL text and row count only --
+// never per-row values: a chunk can be thousands of rows, and "the value of
+// a bound variable" doesn't mean one thing when there are thousands of
+// them bound at once the way it does for a single-row bind.
+//
+// No logger installed (the default) costs nothing beyond the null check --
+// no string is ever built. Building the params string when a logger *is*
+// installed is not free (one OCIDateToText-equivalent call per OciDate
+// field, string concatenation for every field), which is the right
+// tradeoff for a batch/reporting workload logging every statement, not
+// something to pay by default for callers who never asked for it.
+using QueryLogger = std::function<void(std::string_view line)>;
+
+inline QueryLogger& query_logger() {
+    static QueryLogger logger;
+    return logger;
+}
+
+inline void set_query_logger(QueryLogger logger) { query_logger() = std::move(logger); }
 
 // ----------------------------------------------------------------------------
 // Compile-time OCI external type code for a scalar field. std::optional<U>
