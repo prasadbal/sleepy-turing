@@ -605,10 +605,15 @@ of this file it came from (still in git history):
   but hit a `static_assert` here) -- unrelated to this rewrite, still true.
 - Wiring `Config` (the project's existing TOML-based config class in
   `core/config`) up to any of this -- unrelated to this rewrite, still true.
-- An ad hoc, struct-free positional bind interface (something like
-  `select_rows(conn, sql, results, args...)`, each `args...` element
-  binding at `:1, :2, ...` in pack order) for one-off queries where
-  defining a whole named struct is overkill. Discussed, not built.
+- ~~An ad hoc, struct-free positional bind interface... for one-off
+  queries where defining a whole named struct is overkill. Discussed,
+  not built.~~ Built, in a different shape than first sketched here --
+  see `select()` below. The version actually built binds *output*
+  positionally (each argument is an output reference, column 1 into the
+  first, column 2 into the second, ...), not input: for the "just get me
+  a couple of scalars" case this bullet was really about
+  (`SELECT COUNT(*) FROM t`), the friction was never the `WHERE` clause,
+  it was declaring a struct just to receive the answer.
 
 ## Compiling
 
@@ -638,11 +643,76 @@ real database" below for exactly what was checked and how to reproduce it.
 `examples/live_oracle_lob_demo.cpp`,
 `examples/live_oracle_lob_fetch_benchmark.cpp`,
 `examples/live_oracle_optional_fetch_benchmark.cpp`,
-`examples/live_oracle_output_by_name_demo.cpp`, and
-`examples/live_oracle_query_logging_demo.cpp` run against a real Oracle
-instance rather than the mock -- none of them are part of the normal
-CMake build (there's no Oracle client in the default build environment),
-so each has its own compile command in its header comment.
+`examples/live_oracle_output_by_name_demo.cpp`,
+`examples/live_oracle_query_logging_demo.cpp`, and
+`examples/live_oracle_select_demo.cpp` run against a real Oracle instance
+rather than the mock -- none of them are part of the normal CMake build
+(there's no Oracle client in the default build environment), so each has
+its own compile command in its header comment.
+
+### select(): a struct-free, single-row, positional-output fetch
+
+Every other read path in this file goes through a declared row struct --
+`select_rows<OutT>` needs `OutT`, even for a query that returns exactly
+one column. `select()` doesn't:
+
+```cpp
+long long count;
+auto r = binding::select(conn, "SELECT COUNT(*) FROM t", count);
+```
+
+Each argument is an *output* reference, matched to its column purely by
+position (column 1 into the first argument, column 2 into the second) --
+the mirror image of `select_rows()`'s by-name matching, and a deliberate
+one: for a query this small, the caller already has both the SQL and the
+argument list in view at the same call site, so position isn't the
+silent-failure risk here it was for a general-purpose struct-based API.
+`positional_bindable` narrows the allowed argument types to arithmetic,
+`FixedString<N>`, and `OciDate` -- no `std::optional<U>`, no LOB, for the
+same reason `insert_rows()`'s array-bind path excludes them: no per-value
+NULL indicator or locator lifecycle exists in this path.
+
+The mechanism is different from every other read path here, not just a
+thinner wrapper: `OCIStmtExecute` itself fetches the first row when
+`iters > 0` for a `SELECT` (confirmed against `oracle-free`) -- there's no
+separate `OCIStmtFetch2` call at all, since `select()` only ever wants
+one row. Every other function in this file always uses `iters=0` on
+execute followed by an explicit fetch loop; `select()` is the first (and
+so far only) caller of the `iters=1`-fetches-during-execute path, which
+meant the mock's own `OCIStmtExecute` needed extending -- previously it
+never generated fetch data at all (only `OCIStmtFetch2` did), so it would
+have silently returned `OCI_SUCCESS` with the caller's variables never
+written. Fixed by sharing the same per-row value-generation code between
+`OCIStmtExecute` (when called with `iters > 0` *and* defines already in
+place -- deliberately gated on that second condition, not just
+`iters > 0`, so an ordinary DML `execute()` call, which also passes
+`iters=1` but never defines anything, doesn't spuriously consume the
+mock's shared row cursor) and `OCIStmtFetch2`.
+
+Verified against `oracle-free`, including the two edge cases a "just
+fetch a row" function most needs to get right -- zero matches, and more
+than one:
+
+```
+[OK] COUNT(*) select() succeeded
+[OK] COUNT(*) returned 3
+[OK] id=2 fetched id=2, name=BETA correctly
+[OK] zero-row query still classified Success
+[OK] zero-row query's oci_status is OCI_NO_DATA (100)
+[OK] outputs left untouched when no row matched
+[OK] multi-row query silently took just the first row (id=1, ALPHA)
+[OK] bad table name -> QueryError, not Success
+```
+
+Zero matching rows is not an error -- `result.status` stays `Success`,
+with `result.oci_status == OCI_NO_DATA` (100) the way to tell "ran fine,
+found nothing" apart from "found a row" without adding a new `ExecStatus`
+value just for this one function. A genuine failure (a bad table name)
+still comes back as `QueryError`, never confused with the zero-row case.
+More than one matching row is not an error either -- exactly like
+`OCIStmtFetch2`'s existing "ask for N, get back fewer, no error" behavior
+elsewhere in this file, asking for one row and getting back the first of
+several is just what `iters=1` means, not a shortfall to report on.
 
 ### select_rows() matches columns by name now, not by position
 

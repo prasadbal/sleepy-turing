@@ -49,6 +49,12 @@
 //      call -- insert_rows()'s array-bind path logs the SQL text and row
 //      count only, never per-row values (see oci_client.h's
 //      set_query_logger comment for why).
+//  11. select(): a struct-free, single-row, positional-output fetch --
+//      "SELECT COUNT(*) FROM t" straight into a plain `long long`, no
+//      RowCount-shaped struct declared anywhere. Exercises the mock's
+//      OCIStmtExecute(iters>0) path specifically -- real Oracle fetches a
+//      SELECT's first row as part of execute() itself when iters > 0, no
+//      separate OCIStmtFetch2 call, a code path only this function uses.
 //
 // Builds against the mock OCI backend (binding/oci_mock.h) since there's no
 // real Oracle client in this environment -- see oci_compat.h.
@@ -285,6 +291,18 @@ int main() {
         for (auto& line : logged) std::cout << "  " << line << "\n";
 
         binding::set_query_logger(nullptr); // back to the default: no logging
+    }
+
+    std::cout << "--- Demo 11: select() -- struct-free, positional-output, single-row ---\n";
+    {
+        long long count = 0;
+        auto r = binding::select(conn, "SELECT COUNT(*) FROM trades", count);
+        std::cout << "  status=" << status_name(r.status) << " count=" << count << "\n";
+
+        int id = 0;
+        double notional = 0.0;
+        auto r2 = binding::select(conn, "SELECT trade_id, notional FROM trades WHERE trade_id = 100", id, notional);
+        std::cout << "  status=" << status_name(r2.status) << " id=" << id << " notional=" << notional << "\n";
     }
 
     conn.disconnect();

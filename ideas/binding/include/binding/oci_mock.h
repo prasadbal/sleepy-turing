@@ -483,6 +483,91 @@ inline sword OCIParamGet(const dvoid*, ub4, OCIError*, dvoid**, ub4) {
     return OCI_ERROR;
 }
 
+// Writes one row's worth of synthetic values across every current define
+// in g_defines, at batch slot `fetched` -- shared by OCIStmtFetch2 (the
+// normal case: a prior OCIStmtExecute(iters=0), then one or more explicit
+// fetch calls) and OCIStmtExecute itself when iters > 0 (select()'s case,
+// oci_client.h -- real Oracle fetches that many rows as part of execute
+// for a SELECT, no separate OCIStmtFetch2 call at all). Advances
+// g_fetch_row (the mock's shared row cursor) by exactly one row per call,
+// same as it always has.
+inline void generate_one_mock_row(ub4 fetched) {
+    using namespace binding::mock;
+
+    // Demo behavior (opt-in, see g_simulate_null_last_column): the last
+    // defined column comes back NULL on every other row, so code
+    // driving select() has a real NULL to exercise.
+    const std::size_t null_column = g_defines.empty() ? 0 : g_defines.size() - 1;
+    const bool simulate_null_this_row = g_simulate_null_last_column.load() && (g_fetch_row % 2 == 1);
+
+    for (std::size_t i = 0; i < g_defines.size(); ++i) {
+        const auto& d = g_defines[i];
+        if (!d.ptr) continue;
+
+        auto* row_ptr = static_cast<unsigned char*>(d.ptr) + static_cast<std::size_t>(fetched) * d.pvskip;
+        sb2* ind_ptr = d.indp ? reinterpret_cast<sb2*>(
+            reinterpret_cast<unsigned char*>(d.indp) + static_cast<std::size_t>(fetched) * d.indskip) : nullptr;
+
+        if (simulate_null_this_row && i == null_column) {
+            if (ind_ptr) *ind_ptr = OCI_IND_NULL;
+            continue; // OCI leaves the output buffer alone for a NULL column
+        }
+        if (ind_ptr) *ind_ptr = OCI_IND_NOTNULL;
+
+        if (d.dty == SQLT_INT || d.dty == SQLT_UIN) {
+            // Any integer width, not just sizeof(int): OCI takes the width
+            // from the define's value_sz, so a std::int64_t or
+            // std::uint32_t column is as ordinary as an int one. Writing
+            // only 4-byte values here left a wider column reading back as
+            // zero, which looked like a binder bug rather than a mock gap.
+            const long long v = 100 + g_fetch_row * 10 + static_cast<int>(i);
+            switch (d.size) {
+                case 2: { auto n = static_cast<short>(v);     std::memcpy(row_ptr, &n, sizeof(n)); break; }
+                case 4: { auto n = static_cast<int>(v);       std::memcpy(row_ptr, &n, sizeof(n)); break; }
+                case 8: { auto n = static_cast<long long>(v); std::memcpy(row_ptr, &n, sizeof(n)); break; }
+                default: break;
+            }
+        } else if (d.dty == SQLT_BDOUBLE && d.size == sizeof(double)) {
+            double v = 1.5 * (g_fetch_row + 1) + static_cast<double>(i);
+            std::memcpy(row_ptr, &v, sizeof(v));
+        } else if ((d.dty == SQLT_CHR || d.dty == SQLT_AFC) && d.size > 0) {
+            // A real VARCHAR2 fetch writes unterminated bytes into the
+            // buffer and reports the length separately through rlenp --
+            // mirrored here so FixedString's length_ref() round-trips
+            // the same way it does against a real database.
+            const std::string v = "row" + std::to_string(g_fetch_row) + "_col" + std::to_string(i);
+            const auto n = std::min<std::size_t>(v.size(), static_cast<std::size_t>(d.size));
+            std::memcpy(row_ptr, v.data(), n);
+            if (d.rlenp) {
+                auto* rlen_ptr = reinterpret_cast<ub2*>(
+                    reinterpret_cast<unsigned char*>(d.rlenp) + static_cast<std::size_t>(fetched) * d.rlskip);
+                *rlen_ptr = static_cast<ub2>(n);
+            }
+        } else if ((d.dty == SQLT_CLOB || d.dty == SQLT_BLOB) && d.size == sizeof(OCILobLocator*)) {
+            // row_ptr here points into the standalone vector<OCILobLocator*>
+            // define_one_column allocated (see define_slot_t's LOB
+            // case) -- *not* into the row struct, unlike every other
+            // branch in this loop. Each element is already a real
+            // MockLobDescriptor* from OCIDescriptorAlloc; just set its
+            // content directly, the same way OCILobWrite2 would if the
+            // caller had bound this value instead of fetched it.
+            auto* locator = *reinterpret_cast<OCILobLocator**>(row_ptr);
+            auto* desc = reinterpret_cast<binding::mock::MockLobDescriptor*>(locator);
+            desc->data = "lob_row" + std::to_string(g_fetch_row) + "_col" + std::to_string(i);
+        } else if (d.dty == SQLT_ODT && d.size == sizeof(::OCIDate)) {
+            // Writes the real 7-byte ::OCIDate layout directly -- OciDate
+            // (oci_datetime.h) wraps that struct with no descriptor and
+            // no indirection, so a plain memcpy here is the mock's exact
+            // equivalent of what OCIDefineByPos would actually fill in.
+            ::OCIDate v{};
+            v.OCIDateYYYY = static_cast<sb2>(2020 + g_fetch_row);
+            v.OCIDateMM = static_cast<unsigned char>(1 + (g_fetch_row % 12));
+            v.OCIDateDD = static_cast<unsigned char>(1 + static_cast<int>(i));
+            std::memcpy(row_ptr, &v, sizeof(v));
+        }
+    }
+}
+
 inline sword OCIStmtExecute(OCISvcCtx*, OCIStmt*, OCIError*, ub4 iters, ub4, const dvoid*, dvoid*, ub4) {
     using namespace binding::mock;
     g_execute_calls.fetch_add(1);
@@ -493,6 +578,24 @@ inline sword OCIStmtExecute(OCISvcCtx*, OCIStmt*, OCIError*, ub4 iters, ub4, con
     if (g_mode.load() == FailureMode::DisconnectThenRecover && g_disconnects_remaining.load() > 0) {
         --g_disconnects_remaining;
         return OCI_ERROR; // e.g. ORA-03113 end-of-file on communication channel
+    }
+
+    // iters > 0 with defines already in place is select()'s shape
+    // (oci_client.h): real Oracle fetches that many rows as part of
+    // execute for a SELECT, no separate OCIStmtFetch2 call. An ordinary
+    // DML/DDL execute() also passes iters=1 here, but never has any
+    // defines (DEFINE only ever happens for a SELECT's output columns),
+    // so this is a no-op for that case -- deliberately gated on
+    // g_defines being non-empty, not just iters > 0, so a plain execute()
+    // never advances g_fetch_row or otherwise touches fetch state that
+    // belongs to a completely unrelated select_rows() call.
+    if (iters > 0 && !g_defines.empty()) {
+        ub4 fetched = 0;
+        for (; fetched < iters && g_fetch_row < MOCK_ROW_COUNT; ++fetched, ++g_fetch_row) {
+            generate_one_mock_row(fetched);
+        }
+        g_last_rows_fetched.store(static_cast<int>(fetched));
+        return (g_fetch_row >= MOCK_ROW_COUNT) ? OCI_NO_DATA : OCI_SUCCESS;
     }
     return OCI_SUCCESS;
 }
@@ -508,78 +611,7 @@ inline sword OCIStmtFetch2(OCIStmt*, OCIError*, ub4 nrows, ub2, sb4, ub4) {
     // wrote, valid either way.
     ub4 fetched = 0;
     for (; fetched < nrows && g_fetch_row < MOCK_ROW_COUNT; ++fetched, ++g_fetch_row) {
-        // Demo behavior (opt-in, see g_simulate_null_last_column): the last
-        // defined column comes back NULL on every other row, so code
-        // driving select() has a real NULL to exercise.
-        const std::size_t null_column = g_defines.empty() ? 0 : g_defines.size() - 1;
-        const bool simulate_null_this_row = g_simulate_null_last_column.load() && (g_fetch_row % 2 == 1);
-
-        for (std::size_t i = 0; i < g_defines.size(); ++i) {
-            const auto& d = g_defines[i];
-            if (!d.ptr) continue;
-
-            auto* row_ptr = static_cast<unsigned char*>(d.ptr) + static_cast<std::size_t>(fetched) * d.pvskip;
-            sb2* ind_ptr = d.indp ? reinterpret_cast<sb2*>(
-                reinterpret_cast<unsigned char*>(d.indp) + static_cast<std::size_t>(fetched) * d.indskip) : nullptr;
-
-            if (simulate_null_this_row && i == null_column) {
-                if (ind_ptr) *ind_ptr = OCI_IND_NULL;
-                continue; // OCI leaves the output buffer alone for a NULL column
-            }
-            if (ind_ptr) *ind_ptr = OCI_IND_NOTNULL;
-
-            if (d.dty == SQLT_INT || d.dty == SQLT_UIN) {
-                // Any integer width, not just sizeof(int): OCI takes the width
-                // from the define's value_sz, so a std::int64_t or
-                // std::uint32_t column is as ordinary as an int one. Writing
-                // only 4-byte values here left a wider column reading back as
-                // zero, which looked like a binder bug rather than a mock gap.
-                const long long v = 100 + g_fetch_row * 10 + static_cast<int>(i);
-                switch (d.size) {
-                    case 2: { auto n = static_cast<short>(v);     std::memcpy(row_ptr, &n, sizeof(n)); break; }
-                    case 4: { auto n = static_cast<int>(v);       std::memcpy(row_ptr, &n, sizeof(n)); break; }
-                    case 8: { auto n = static_cast<long long>(v); std::memcpy(row_ptr, &n, sizeof(n)); break; }
-                    default: break;
-                }
-            } else if (d.dty == SQLT_BDOUBLE && d.size == sizeof(double)) {
-                double v = 1.5 * (g_fetch_row + 1) + static_cast<double>(i);
-                std::memcpy(row_ptr, &v, sizeof(v));
-            } else if ((d.dty == SQLT_CHR || d.dty == SQLT_AFC) && d.size > 0) {
-                // A real VARCHAR2 fetch writes unterminated bytes into the
-                // buffer and reports the length separately through rlenp --
-                // mirrored here so FixedString's length_ref() round-trips
-                // the same way it does against a real database.
-                const std::string v = "row" + std::to_string(g_fetch_row) + "_col" + std::to_string(i);
-                const auto n = std::min<std::size_t>(v.size(), static_cast<std::size_t>(d.size));
-                std::memcpy(row_ptr, v.data(), n);
-                if (d.rlenp) {
-                    auto* rlen_ptr = reinterpret_cast<ub2*>(
-                        reinterpret_cast<unsigned char*>(d.rlenp) + static_cast<std::size_t>(fetched) * d.rlskip);
-                    *rlen_ptr = static_cast<ub2>(n);
-                }
-            } else if ((d.dty == SQLT_CLOB || d.dty == SQLT_BLOB) && d.size == sizeof(OCILobLocator*)) {
-                // row_ptr here points into the standalone vector<OCILobLocator*>
-                // define_one_column allocated (see define_slot_t's LOB
-                // case) -- *not* into the row struct, unlike every other
-                // branch in this loop. Each element is already a real
-                // MockLobDescriptor* from OCIDescriptorAlloc; just set its
-                // content directly, the same way OCILobWrite2 would if the
-                // caller had bound this value instead of fetched it.
-                auto* locator = *reinterpret_cast<OCILobLocator**>(row_ptr);
-                auto* desc = reinterpret_cast<binding::mock::MockLobDescriptor*>(locator);
-                desc->data = "lob_row" + std::to_string(g_fetch_row) + "_col" + std::to_string(i);
-            } else if (d.dty == SQLT_ODT && d.size == sizeof(::OCIDate)) {
-                // Writes the real 7-byte ::OCIDate layout directly -- OciDate
-                // (oci_datetime.h) wraps that struct with no descriptor and
-                // no indirection, so a plain memcpy here is the mock's exact
-                // equivalent of what OCIDefineByPos would actually fill in.
-                ::OCIDate v{};
-                v.OCIDateYYYY = static_cast<sb2>(2020 + g_fetch_row);
-                v.OCIDateMM = static_cast<unsigned char>(1 + (g_fetch_row % 12));
-                v.OCIDateDD = static_cast<unsigned char>(1 + static_cast<int>(i));
-                std::memcpy(row_ptr, &v, sizeof(v));
-            }
-        }
+        generate_one_mock_row(fetched);
     }
     g_last_rows_fetched.store(static_cast<int>(fetched));
     return (g_fetch_row >= MOCK_ROW_COUNT) ? OCI_NO_DATA : OCI_SUCCESS;

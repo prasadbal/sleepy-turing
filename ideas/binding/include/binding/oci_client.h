@@ -204,6 +204,45 @@ ExecResult select_rows(OciConnection& conn, const std::string& sql, InT& input,
                         std::size_t prefetch_rows, std::size_t fetch_batch_size,
                         const std::function<void(const OutT* rows, std::size_t count)>& on_batch);
 
+// A field type usable as a bare positional output argument to select()
+// below -- narrower than scalar_bindable's fields: no std::optional<U>
+// and no LOB. An empty optional has no address to define into (the same
+// reason it needs a real staging slot everywhere else in this file);
+// doing that per positional argument is a reasonable future addition,
+// not built here.
+template <typename T>
+concept positional_bindable = std::is_arithmetic_v<T> || is_fixed_string_v<T> || is_oci_date_v<T>;
+
+// select() -- a struct-free, single-row fetch: each argument is an output
+// reference, bound positionally (column 1 -> the first argument, column 2
+// -> the second, ...), no OutT struct declared anywhere. For exactly the
+// case a named struct is overkill for:
+//
+//   long long count;
+//   auto r = binding::select(conn, "SELECT COUNT(*) FROM bench_test", count);
+//
+//   int id; binding::FixedString<16> name;
+//   auto r = binding::select(conn, "SELECT id, name FROM t WHERE x = 1", id, name);
+//
+// Any WHERE-clause criteria are the caller's own literal SQL text -- there
+// is no bind-parameter side to this function at all, unlike select_rows();
+// for a query whose criteria need to come from a C++ value, either splice
+// it into the SQL text yourself (if it's safe to -- an int loop counter,
+// say, never user input) or use select_rows<InT, OutT> instead.
+//
+// Fetches at most one row: `OCIStmtExecute` with iters=1 executes the
+// statement *and* fetches its first row in the same call, no separate
+// OCIStmtFetch2 needed for a single row. If the query matches more than
+// one row, only the first is read; the rest are simply never fetched --
+// not an error, the same way `WHERE ROWNUM = 1`/`FETCH FIRST 1 ROW`
+// would be used to make that explicit in the SQL itself. If it matches
+// zero rows, the arguments are left untouched and `result.oci_status`
+// comes back `OCI_NO_DATA` (100) with `result.status` still `Success` --
+// zero rows is not an error, so check `oci_status`, not `status`, to
+// tell "found a row" apart from "didn't."
+template <positional_bindable... T>
+ExecResult select(OciConnection& conn, const std::string& sql, T&... outputs);
+
 // insert_rows() -- a real Oracle array bind of `rows`, executed in bounded
 // chunks of at most `chunk_size` rows per OCIStmtExecute call (via its own
 // rowoff parameter -- see OciConnection::execute's comment) rather than one

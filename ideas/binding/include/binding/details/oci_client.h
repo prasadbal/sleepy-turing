@@ -463,6 +463,35 @@ void free_lob_columns(define_t<T>& staging, std::index_sequence<I...>) {
     (free_one_column_lobs<I, T>(staging), ...);
 }
 
+// ---- select()'s positional, struct-free single-row define -----------------
+//
+// Each argument defines straight into its own address in the caller's
+// frame -- there's exactly one row, so (unlike define_one_column's
+// array-of-struct batching) there's no stride to tell OCI about and no
+// staging needed: positional_bindable already excludes optional/LOB, the
+// only two cases anything else in this file ever needs staging for.
+
+template <std::size_t I, typename... T>
+void define_one_positional_output(OCIStmt* stmt, OciConnection& conn, std::tuple<T&...>& outs) {
+    using Arg = std::remove_reference_t<std::tuple_element_t<I, std::tuple<T&...>>>;
+    auto& out = std::get<I>(outs);
+    constexpr ub4 position = I + 1;
+    OCIDefine* define_handle = nullptr;
+    if constexpr (is_fixed_string_v<Arg>) {
+        OCIDefineByPos(stmt, &define_handle, conn.err(), position,
+                       out.data(), static_cast<sb4>(Arg::capacity), oci_type_code_v<Arg>,
+                       nullptr, &out.length_ref(), nullptr, OCI_DEFAULT);
+    } else {
+        OCIDefineByPos(stmt, &define_handle, conn.err(), position,
+                       &out, sizeof(Arg), oci_type_code_v<Arg>, nullptr, nullptr, nullptr, OCI_DEFAULT);
+    }
+}
+
+template <typename... T, std::size_t... I>
+void define_positional_outputs(OCIStmt* stmt, OciConnection& conn, std::tuple<T&...>& outs, std::index_sequence<I...>) {
+    (define_one_positional_output<I, T...>(stmt, conn, outs), ...);
+}
+
 // Shared by both select_rows() overloads: defines OutT's columns as one
 // array-of-struct batch, sets prefetch_rows (Oracle's own client-side
 // round-trip batching -- see oci_client.h's select_rows doc comment for why
@@ -693,6 +722,39 @@ ExecResult select_rows(OciConnection& conn, const std::string& sql, InT& input,
 
     const ExecResult result = detail::run_select_fetch_loop<OutT>(conn, stmt, prefetch_rows, fetch_batch_size, on_batch);
     for (OCILobLocator* loc : in_lob_locators) detail::free_temp_lob(conn, loc);
+    OCIHandleFree(stmt, OCI_HTYPE_STMT);
+    return result;
+}
+
+template <positional_bindable... T>
+ExecResult select(OciConnection& conn, const std::string& sql, T&... outputs) {
+    detail::log_query(sql); // no bind side to this function -- see its doc comment in oci_client.h
+    OCIStmt* stmt = nullptr;
+    OCIHandleAlloc(conn.env(), reinterpret_cast<void**>(&stmt), OCI_HTYPE_STMT, 0, nullptr);
+    OCIStmtPrepare(stmt, conn.err(), reinterpret_cast<const text*>(sql.c_str()),
+                   static_cast<ub4>(sql.size()), OCI_NTV_SYNTAX, OCI_DEFAULT);
+
+    std::tuple<T&...> outs(outputs...);
+    detail::define_positional_outputs(stmt, conn, outs, std::index_sequence_for<T...>{});
+
+    // iters=1: for a SELECT, OCIStmtExecute itself fetches that many rows
+    // as part of the same call -- no separate OCIStmtFetch2 needed for
+    // exactly one row. Zero matching rows comes back as OCI_NO_DATA
+    // directly from this call (the same "final/only call carries the
+    // no-data signal itself" behavior documented for OCIStmtFetch2 in
+    // run_select_fetch_loop), not a separate error -- classified as
+    // Success here since finding no row isn't a failure, with oci_status
+    // left at 100 so the caller can tell the two apart.
+    const sword status = OCIStmtExecute(conn.svc(), stmt, conn.err(), 1, 0, nullptr, nullptr, OCI_DEFAULT);
+    ExecResult result;
+    if (status == OCI_SUCCESS || status == OCI_NO_DATA) {
+        result = {ExecStatus::Success, status};
+    } else if (conn.is_disconnect_error()) {
+        result = {ExecStatus::ConnectionLost, status};
+    } else {
+        result = {ExecStatus::QueryError, status};
+    }
+
     OCIHandleFree(stmt, OCI_HTYPE_STMT);
     return result;
 }
