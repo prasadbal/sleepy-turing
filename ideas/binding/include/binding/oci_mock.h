@@ -79,6 +79,7 @@ struct OCIDate { sb2 OCIDateYYYY = 0; unsigned char OCIDateMM = 0, OCIDateDD = 0
 
 // ---- Status codes --------------------------------------------------------
 constexpr sword OCI_SUCCESS = 0;
+constexpr sword OCI_SUCCESS_WITH_INFO = 1;
 constexpr sword OCI_ERROR   = -1;
 constexpr sword OCI_NO_DATA = 100;
 

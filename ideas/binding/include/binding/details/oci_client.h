@@ -742,18 +742,12 @@ ExecResult select(OciConnection& conn, const std::string& sql, T&... outputs) {
     // exactly one row. Zero matching rows comes back as OCI_NO_DATA
     // directly from this call (the same "final/only call carries the
     // no-data signal itself" behavior documented for OCIStmtFetch2 in
-    // run_select_fetch_loop), not a separate error -- classified as
-    // Success here since finding no row isn't a failure, with oci_status
-    // left at 100 so the caller can tell the two apart.
-    const sword status = OCIStmtExecute(conn.svc(), stmt, conn.err(), 1, 0, nullptr, nullptr, OCI_DEFAULT);
-    ExecResult result;
-    if (status == OCI_SUCCESS || status == OCI_NO_DATA) {
-        result = {ExecStatus::Success, status};
-    } else if (conn.is_disconnect_error()) {
-        result = {ExecStatus::ConnectionLost, status};
-    } else {
-        result = {ExecStatus::QueryError, status};
-    }
+    // run_select_fetch_loop), not a separate error -- OciConnection::
+    // execute() itself now classifies OCI_NO_DATA as Success (oci_status
+    // still carries the real 100 so a caller can tell "found data" apart
+    // from "didn't"), so this can just reuse it instead of repeating that
+    // classification locally the way it originally had to.
+    const ExecResult result = conn.execute(stmt, 1);
 
     OCIHandleFree(stmt, OCI_HTYPE_STMT);
     return result;

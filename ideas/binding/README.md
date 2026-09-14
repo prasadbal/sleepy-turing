@@ -290,13 +290,21 @@ call for 1,000 rows) produced exactly 5 log lines total -- not 1,004.
 `OciConnection::execute(stmt, iters)` runs an already-prepared,
 already-bound statement once and classifies the result:
 
-- `Success` -- `OCIStmtExecute` returned `OCI_SUCCESS`.
+- `Success` -- `OCIStmtExecute` returned `OCI_SUCCESS` **or**
+  `OCI_NO_DATA` (a `SELECT`-shaped execute, `iters > 0`, finding zero
+  matching rows -- `select()`'s own mechanism -- is a legitimate answer,
+  not a failure; `oci_status` still carries the real code so a caller can
+  tell "found data" from "didn't" if it needs to). This used to be
+  `OCI_SUCCESS` only, misclassifying a genuinely empty result as
+  `QueryError` -- a real bug, found and fixed while building `select()`;
+  see `docs/oci_statement_lifecycle_notes.md` for the full story and the
+  matching fix in `connect()` for `OCI_SUCCESS_WITH_INFO`.
 - `ConnectionLost` -- it didn't, and `is_disconnect_error()` (reads the
   ORA-code off the error handle via `OCIErrorGet`, checks it against a
   small table of known "session is gone" codes -- ORA-03113, ORA-01012,
   ORA-00028, ...) says the session is gone.
-- `QueryError` -- anything else: bad SQL, a constraint violation, no data
-  found. Retrying this reproduces the exact same failure, so nothing here
+- `QueryError` -- anything else: bad SQL, a constraint violation.
+  Retrying this reproduces the exact same failure, so nothing here
   tries.
 
 That's the entire policy. There is no automatic reconnect, no sleep, no
@@ -330,7 +338,12 @@ status-checked, tearing down via `disconnect()` on the first failure
 instead of continuing on with a handle from a call that never happened.
 `disconnect()` is correspondingly just `OCILogoff` plus freeing the env and
 error handles -- the `OCIServer`/`OCISession` handles `OCILogon2` manages
-internally never need to be held or freed here at all.
+internally never need to be held or freed here at all. `OCILogon2`'s
+status check accepts `OCI_SUCCESS_WITH_INFO` alongside `OCI_SUCCESS` too
+(a real login with a warning attached -- `ORA-28002` password-expiry
+being the practical case -- not a failure); see
+`docs/oci_statement_lifecycle_notes.md` for why treating it as one was a
+real bug, found the same day as select_rows()'s OCI_NO_DATA fix.
 
 `OCIEnvCreate` uses `OCI_DEFAULT`, not `OCI_OBJECT` -- the earlier version
 needed `OCI_OBJECT` for the collection-bind feature's object cache

@@ -33,7 +33,15 @@ inline bool OciConnection::connect() {
         reinterpret_cast<const text*>(password_.c_str()), static_cast<ub4>(password_.size()),
         reinterpret_cast<const text*>(connect_string_.c_str()), static_cast<ub4>(connect_string_.size()),
         OCI_DEFAULT);
-    if (status != OCI_SUCCESS) {
+    // OCI_SUCCESS_WITH_INFO is a real, successful login -- svc_ is fully
+    // usable -- with a warning attached (ORA-28002 "password will expire
+    // in N days" is the practical case), not a failure. Treating it as
+    // one here would make connect() spuriously fail for a perfectly
+    // working session, for no reason but an unattended job never
+    // checking for this code. The warning text itself isn't surfaced
+    // anywhere yet (would need an OCIErrorGet call here, and somewhere
+    // for a caller to read the result) -- not attempted in this pass.
+    if (status != OCI_SUCCESS && status != OCI_SUCCESS_WITH_INFO) {
         disconnect();
         return false;
     }
@@ -77,7 +85,18 @@ inline bool OciConnection::is_disconnect_error() const {
 
 inline ExecResult OciConnection::execute(OCIStmt* stmt, ub4 iters) const {
     const sword status = OCIStmtExecute(svc_, stmt, err_, iters, 0, nullptr, nullptr, OCI_DEFAULT);
-    if (status == OCI_SUCCESS) return {ExecStatus::Success, status};
+    // OCI_NO_DATA only ever comes from a SELECT-shaped execute (iters > 0
+    // fetching as part of execute itself -- see select() in oci_client.h)
+    // finding zero matching rows; it never applies to DML (a zero-row
+    // UPDATE/DELETE is an ordinary OCI_SUCCESS, row count checked
+    // separately). Zero rows found is not a query failure, so it's
+    // folded into Success here -- oci_status still carries the real
+    // value (100), which is how a caller tells "found data" apart from
+    // "didn't" without a dedicated ExecStatus just for this. Also
+    // OCI_SUCCESS_WITH_INFO's real caller today isn't execute() (that's
+    // OCILogon2, see connect()), but it's the same principle: a status
+    // other than exactly OCI_SUCCESS is not automatically a failure.
+    if (status == OCI_SUCCESS || status == OCI_NO_DATA) return {ExecStatus::Success, status};
     if (is_disconnect_error()) return {ExecStatus::ConnectionLost, status};
     return {ExecStatus::QueryError, status};
 }
