@@ -67,8 +67,19 @@ where this was first written up) for the full story.
   `OCIEnvCreate`+`OCILogon2`, `OCIErrorHandle` for the error handle) plus
   `OciConnection::classify(OciCallResult)`, which turns a raw `call_oci`
   result into `Success`/`ConnectionLost`/`QueryError` using this
-  connection's own table of "session is gone" ORA-codes -- `OCI_SUCCESS`,
-  `OCI_SUCCESS_WITH_INFO`, and `OCI_NO_DATA` all classify as `Success`.
+  connection's own table of "session is gone" ORA-codes. The
+  Success/error line is drawn at `status < 0`, not an enumerated list of
+  known-good codes -- `OCI_SUCCESS=0`, `OCI_SUCCESS_WITH_INFO=1`,
+  `OCI_NEED_DATA=99`, and `OCI_NO_DATA=100` are all `>= 0`; the real
+  error codes (`OCI_ERROR=-1`, `OCI_INVALID_HANDLE=-2`,
+  `OCI_STILL_EXECUTING=-3123`) are all negative. That's Oracle's own
+  convention: execute()/fetch() return their status immediately, without
+  a second round trip through `OCIErrorGet`, specifically so the caller
+  doesn't have to make that extra call just to learn "this wasn't a
+  failure, it was end-of-rows/a login warning/etc" -- the sign of the
+  number already says that. `status < 0` reads that convention directly
+  instead of re-deriving it as a per-code allowlist that a status this
+  codebase hasn't specifically seen yet would fall through incorrectly.
 - `include/binding/oci_statement.h` -- `OciStatement`: a statement handle
   with an explicit state enum (`Unprepared -> Prepared -> Executed ->
   Fetching -> EndOfFetch`) and `prepare()`/`bindName()`/`bindNameArray()`/

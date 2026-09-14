@@ -62,7 +62,11 @@ public:
         // (carried over from ideas/binding, same finding applies here).
         // login.error_text carries that warning when present, for
         // whoever wants to surface it; not read here.
-        if (login.status != OCI_SUCCESS && login.status != OCI_SUCCESS_WITH_INFO) {
+        // status < 0 is Oracle's own convention for "this is a real
+        // error" -- see classify() below for the full reasoning; used
+        // here too rather than enumerating OCI_SUCCESS/
+        // OCI_SUCCESS_WITH_INFO by name a second time.
+        if (login.status < 0) {
             disconnect();
             return false;
         }
@@ -87,13 +91,25 @@ public:
     // Classifies a call_oci result using this connection's own knowledge
     // of which ORA-codes mean "the session is gone" -- doesn't re-query
     // OCI, since call.error_code is already sitting there from whichever
-    // call_oci invocation produced it. OCI_SUCCESS, OCI_SUCCESS_WITH_INFO,
-    // and OCI_NO_DATA all classify as Success here -- none of the three
-    // is a query failure (see oci_connection.h's own header comment and
+    // call_oci invocation produced it.
+    //
+    // "Is this actually an error" is just the sign of the status: every
+    // non-error OCI status this codebase deals with (OCI_SUCCESS=0,
+    // OCI_SUCCESS_WITH_INFO=1, OCI_NEED_DATA=99, OCI_NO_DATA=100) is
+    // >= 0, and every real error (OCI_ERROR=-1, OCI_INVALID_HANDLE=-2,
+    // OCI_STILL_EXECUTING=-3123) is negative -- that's Oracle's own
+    // convention, not something enumerated here. `status < 0` is used
+    // instead of an explicit allowlist of the known-good codes so a
+    // status this codebase hasn't specifically seen yet still
+    // classifies correctly without needing to be added to a list (see
     // docs/oci_statement_lifecycle_notes.md for OCI_NO_DATA/
-    // OCI_SUCCESS_WITH_INFO specifically).
+    // OCI_SUCCESS_WITH_INFO specifically). OCI_STILL_EXECUTING should
+    // never actually reach here -- every call in this codebase runs
+    // OCI_DEFAULT (synchronous) mode, never OCI_NONBLOCKING -- but since
+    // it's negative, it would correctly fall through to QueryError below
+    // rather than being silently treated as Success if it ever did.
     ExecStatus classify(const OciCallResult& call) const {
-        if (call.status == OCI_SUCCESS || call.status == OCI_SUCCESS_WITH_INFO || call.status == OCI_NO_DATA) {
+        if (call.status >= 0) {
             return ExecStatus::Success;
         }
         static constexpr sb4 disconnect_codes[] = {
