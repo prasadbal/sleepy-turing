@@ -176,6 +176,30 @@ int main() {
         set_statement_logger(nullptr);
     }
 
+    std::printf("\n--- Demo 10: bindNameArray() -- chunked array-bind insert ---\n");
+    {
+        struct Row { int id; double notional; };
+        std::vector<Row> rows = {{1, 1.5}, {2, 3.0}, {3, 4.5}, {4, 6.0}, {5, 7.5}};
+        constexpr std::size_t chunk_size = 2; // 2+2+1: exercises a partial final chunk
+
+        OciStatement stmt(conn);
+        stmt.prepare("INSERT INTO trades VALUES(:id, :notional)");
+        std::vector<sb2> indicators(chunk_size, OCI_IND_NOTNULL);
+
+        std::size_t chunks_run = 0;
+        for (std::size_t offset = 0; offset < rows.size(); offset += chunk_size) {
+            const std::size_t this_chunk = std::min(chunk_size, rows.size() - offset);
+            stmt.bindNameArray("id", SQLT_INT, &rows[offset].id, sizeof(int), sizeof(Row), indicators.data());
+            stmt.bindNameArray("notional", SQLT_BDOUBLE, &rows[offset].notional, sizeof(double), sizeof(Row),
+                               indicators.data());
+            auto r = stmt.execute(static_cast<ub4>(this_chunk));
+            std::printf("  chunk offset=%zu size=%zu status=%s state=%s\n", offset, this_chunk,
+                        status_name(r.status), stmt.state() == OciStatement::State::Executed ? "Executed" : "other");
+            ++chunks_run;
+        }
+        std::printf("ran %zu chunks over %zu rows, same prepared statement throughout\n", chunks_run, rows.size());
+    }
+
     conn.disconnect();
     return 0;
 }

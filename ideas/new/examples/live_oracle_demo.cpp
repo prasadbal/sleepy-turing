@@ -280,6 +280,56 @@ int main(int argc, char** argv) {
         cleanup.execute(1);
     }
 
+    std::printf("\n--- bindNameArray(): chunked array-bind insert ---\n");
+    {
+        struct Row { int id; double notional; };
+        OciStatement create(conn);
+        create.prepare("CREATE TABLE new_arch_bulk_test (id NUMBER, notional NUMBER)");
+        create.execute(1);
+
+        std::vector<Row> rows;
+        for (int i = 1; i <= 7; ++i) rows.push_back(Row{i, i * 1.5});
+        constexpr std::size_t chunk_size = 3; // 3+3+1: a real partial final chunk
+
+        OciStatement insert(conn);
+        insert.prepare("INSERT INTO new_arch_bulk_test VALUES(:id, :notional)");
+        std::vector<sb2> indicators(chunk_size, OCI_IND_NOTNULL);
+
+        bool all_chunks_ok = true;
+        for (std::size_t offset = 0; offset < rows.size(); offset += chunk_size) {
+            const std::size_t this_chunk = std::min(chunk_size, rows.size() - offset);
+            insert.bindNameArray("id", SQLT_INT, &rows[offset].id, sizeof(int), sizeof(Row), indicators.data());
+            insert.bindNameArray("notional", SQLT_BDOUBLE, &rows[offset].notional, sizeof(double), sizeof(Row),
+                                 indicators.data());
+            auto r = insert.execute(static_cast<ub4>(this_chunk));
+            if (r.status != ExecStatus::Success) all_chunks_ok = false;
+        }
+        check(all_chunks_ok, "all 3 chunks (3+3+1) executed successfully, same prepared statement throughout");
+
+        long long count = 0;
+        OciStatement count_stmt(conn);
+        count_stmt.prepare("SELECT COUNT(*) FROM new_arch_bulk_test");
+        count_stmt.bindOutput(1, SQLT_INT, &count, sizeof(count), nullptr, nullptr);
+        count_stmt.execute(1);
+        check(count == 7, "all 7 rows actually landed in the table, not just 3 or a partial count");
+
+        // Spot-check the row from the LAST chunk (offset=6, chunk of 1) --
+        // exactly the case a stride/rebind bug would get wrong.
+        int last_id = 0;
+        double last_notional = 0.0;
+        OciStatement spot_check(conn);
+        spot_check.prepare("SELECT id, notional FROM new_arch_bulk_test WHERE id = 7");
+        spot_check.bindOutput(1, SQLT_INT, &last_id, sizeof(last_id), nullptr, nullptr);
+        spot_check.bindOutput(2, SQLT_BDOUBLE, &last_notional, sizeof(last_notional), nullptr, nullptr);
+        spot_check.execute(1);
+        check(last_id == 7 && last_notional == 10.5,
+              "row 7 (from the final, partial chunk) has the correct value: id=7, notional=10.5");
+
+        OciStatement cleanup(conn);
+        cleanup.prepare("DROP TABLE new_arch_bulk_test");
+        cleanup.execute(1);
+    }
+
     {
         OciStatement stmt(conn);
         stmt.prepare("DROP TABLE new_arch_test");

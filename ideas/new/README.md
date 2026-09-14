@@ -71,19 +71,30 @@ where this was first written up) for the full story.
   `OCI_SUCCESS_WITH_INFO`, and `OCI_NO_DATA` all classify as `Success`.
 - `include/binding/oci_statement.h` -- `OciStatement`: a statement handle
   with an explicit state enum (`Unprepared -> Prepared -> Executed ->
-  Fetching -> EndOfFetch`) and `prepare()`/`bindName()`/`bindOutput()`/
-  `execute()`/`fetch()` methods, each checking `state()` first and
-  throwing `OciStatementStateError` -- not returning an `ExecResult` --
-  on a call sequence that doesn't make sense, before any OCI call is
-  attempted at all. `bindName()` is by name, type-erased (caller supplies
-  the `SQLT_*` code directly); `bindOutput()` is by position, with an
-  optional `elemSize` for an array-of-struct batch fetch (`sizeof(Row)`,
-  matching `OCIDefineArrayOfStruct`'s own stride parameter), and valid in
-  either the `Prepared` or `Executed` state -- the latter specifically so
-  `describeColumnPosition(name)` (also here) can resolve a column's real
-  name to a position first, which needs `execute()` to have already run
-  (see `docs/oci_statement_lifecycle_notes.md`), before `bindOutput()`
-  uses the position it resolved.
+  Fetching -> EndOfFetch`) and `prepare()`/`bindName()`/`bindNameArray()`/
+  `bindOutput()`/`execute()`/`fetch()`/`describeColumnPosition()` methods,
+  each checking `state()` first and throwing `OciStatementStateError` --
+  not returning an `ExecResult` -- on a call sequence that doesn't make
+  sense, before any OCI call is attempted at all.
+  - `bindName()` is a single-row IN parameter by name, type-erased
+    (caller supplies the `SQLT_*` code directly).
+  - `bindNameArray()` is a chunked array-bind IN parameter -- the
+    `insert_rows()` equivalent -- rebinding fresh per chunk at that
+    chunk's own starting address rather than `OCIStmtExecute`'s own
+    `rowoff` parameter (the same choice `ideas/binding` made, for the
+    same reason: `rowoff` crashed against a real database while building
+    that one).
+  - `bindOutput()` is by position, with an optional `elemSize` for an
+    array-of-struct batch fetch (`sizeof(Row)`, matching
+    `OCIDefineArrayOfStruct`'s own stride parameter).
+  - `bindName()`/`bindNameArray()`/`bindOutput()`/`execute()` are all
+    valid in either the `Prepared` or `Executed` state -- not just
+    `Prepared` -- specifically so two real patterns both work on one
+    prepared statement without ever re-preparing: chunked array-bind
+    insert (bind, execute, rebind the next chunk, execute again) and
+    by-name output matching (`describeColumnPosition()`, next, needs
+    `execute()` to have already run before a name can resolve to a
+    position, so `bindOutput()` has to be callable *after* execute() too).
 - `include/binding/oci_log.h` -- `set_statement_logger(logger)`: opt-in,
   off by default. `OciStatement::execute()` logs the SQL text plus every
   `bindName()`'d value (rendered via `render_typed_value()`, which
@@ -100,10 +111,10 @@ where this was first written up) for the full story.
   `OCILobLocator*` directly, the same separation `ideas/binding` already
   has via free functions (`make_temp_lob`/`free_temp_lob`/
   `read_lob_bytes`) -- this is that same idea as an object instead.
-- `examples/demo.cpp` -- mock-based, 9 demos covering connect, plain
+- `examples/demo.cpp` -- mock-based, 10 demos covering connect, plain
   execute, the state-check exception, `bindName()`, a single-row fetch,
-  a batch fetch loop, the `OCI_NO_DATA` zero-row case, `OCILob`, and
-  `set_statement_logger()`.
+  a batch fetch loop, the `OCI_NO_DATA` zero-row case, `OCILob`,
+  `set_statement_logger()`, and `bindNameArray()`.
 - `examples/live_oracle_demo.cpp` -- the same shapes, verified against a
   real database. Not part of any CMake build; compile directly (see the
   file's own header comment).
@@ -119,13 +130,19 @@ No reflection layer at all -- every field is bound/defined one call at a
 time, by the caller, with an explicit OCI type code. `ideas/binding`'s
 whole value proposition (`boost::pfr` walking a plain C++ struct's fields
 automatically) isn't reproduced here; this is the layer something like
-that would be rebuilt on top of. No array-bind insert (`ideas/binding`'s
-`insert_rows()`) -- `bindName()`'s single-value-per-call shape doesn't
-have an array-of-struct counterpart yet the way `bindOutput()` does via
-`elemSize`. By-name output matching (`describeColumnPosition()`) and
-query logging (`set_statement_logger()`) were both added after the first
-pass -- see "Testing against a real database" below for their real
-verification.
+that would be rebuilt on top of, not a gap in this one -- a reflection
+layer built on top of `OciStatement` would call `bindName()`/
+`bindNameArray()`/`bindOutput()` per field the same way `ideas/binding`'s
+`bind_one_param`/`define_one_column` call raw OCI functions today.
+
+Array-bind insert (`bindNameArray()`), by-name output matching
+(`describeColumnPosition()`), and query logging
+(`set_statement_logger()`) were all added after the initial pass -- see
+"Testing against a real database" below for each one's real
+verification. At this point every capability `ideas/binding` has at the
+scalar-bind/fetch level has a type-erased counterpart here; what's
+different is the layer above it (reflection vs. explicit type codes),
+not the set of things OCI operations this architecture can do.
 
 ## Testing against a real database
 
@@ -224,3 +241,27 @@ to bound the read (`std::string(name_buf, name_len)`), not
 `std::strlen`/null-termination -- a `SQLT_CHR` fetch is explicit-length,
 not null-terminated, exactly as documented everywhere else in this
 codebase and `ideas/binding` both.
+
+### `bindNameArray()`: chunked array-bind insert
+
+7 rows, chunk size 3 (`3+3+1` -- a genuine partial final chunk), one
+`OCIStmtPrepare` call, three `bindNameArray()`+`execute()` cycles on the
+same `OciStatement`, never re-preparing:
+
+```
+[OK] all 3 chunks (3+3+1) executed successfully, same prepared statement throughout
+[OK] all 7 rows actually landed in the table, not just 3 or a partial count
+[OK] row 7 (from the final, partial chunk) has the correct value: id=7, notional=10.5
+```
+
+No crash, no wrong values, on the first attempt -- worth calling out
+specifically because `ideas/binding`'s own array-bind insert did crash
+the first time it was tried against a real database (using
+`OCIStmtExecute`'s own `rowoff` parameter to reuse a single bind across
+chunks, rather than rebinding fresh per chunk). `bindNameArray()` here
+was written knowing that finding already, rebinding at each chunk's own
+starting address from the start rather than rediscovering the same
+crash the hard way a second time. The spot-check on row 7 specifically
+exercises the case a stride or rebind-offset mistake would get wrong --
+the last row of the last, partial chunk, furthest from the "happens to
+work because the first chunk always starts at offset 0" case.

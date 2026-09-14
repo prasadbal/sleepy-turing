@@ -6,10 +6,18 @@
 // them -- using a handle in a state it wasn't actually in).
 //
 //   Unprepared --prepare()--> Prepared --execute()--> Executed --fetch()--> Fetching --fetch()--> ... EndOfFetch
-//                                 |                        |
-//                             bindName()/bindOutput()   (iters>0 with zero
-//                             only valid here            matching rows goes
-//                                                         straight to EndOfFetch)
+//                                 |                    ^    |
+//                             bindName()/bindOutput()  |  (iters>0 with zero
+//                             valid in either           |  matching rows goes
+//                             Prepared or Executed ------  straight to EndOfFetch)
+//
+// The Prepared<->Executed cycle (bind, execute, rebind, execute again,
+// never re-preparing) is deliberate, not a loophole: a chunked
+// bindNameArray() insert (see below) runs exactly that loop, the same
+// "one OCIStmtPrepare, then bind+execute per chunk" shape
+// ideas/binding's insert_rows() uses. bindOutput() is allowed there too,
+// for the opposite reason -- describeColumnPosition() needs execute()
+// to have already run before a name can resolve to a position.
 //
 // Using a method in a state it doesn't support throws
 // OciStatementStateError rather than making the underlying OCI call at
@@ -71,7 +79,11 @@ public:
     // C++ type; there's no reflection layer here to infer it.
     OciCallResult bindName(const std::string& field_name, ub2 data_type, void* data, sb4 len,
                            void* indicator = nullptr) {
-        require_state(State::Prepared, "bindName");
+        if (state_ != State::Prepared && state_ != State::Executed) {
+            throw OciStatementStateError(
+                "OciStatement::bindName(): statement is " + state_name(state_) +
+                ", expected Prepared or Executed");
+        }
         if (statement_logger()) {
             const bool is_null = indicator && *static_cast<const sb2*>(indicator) == OCI_IND_NULL;
             if (!params_log_.empty()) params_log_ += ", ";
@@ -84,6 +96,43 @@ public:
                         data, len, data_type, indicator,
                         static_cast<ub2*>(nullptr), static_cast<ub2*>(nullptr),
                         static_cast<ub4>(0), static_cast<ub4*>(nullptr), static_cast<ub4>(OCI_DEFAULT));
+    }
+
+    // A chunked array bind: `first_element` is the address of the
+    // *first* row's value in this chunk (not row 0 of the whole
+    // vector -- callers advance this themselves between chunks, the
+    // same "rebind fresh per chunk, pointed at that chunk's own start"
+    // pattern ideas/binding's insert_rows() uses, not OCIStmtExecute's
+    // own rowoff parameter -- see docs/oci_statement_lifecycle_notes.md
+    // and ideas/binding's README for why rowoff specifically crashed
+    // against a real database and isn't used anywhere in this codebase
+    // either). `stride` is the byte distance from one row's value to the
+    // next (`sizeof(RowStruct)` for an array-of-struct layout).
+    // `indicators` must be a real, caller-owned array of `count`
+    // `sb2` values (typically all `OCI_IND_NOTNULL`) that outlives the
+    // following execute() call -- a null indicator pointer crashed
+    // against a real database for an array bind specifically (safe for
+    // bindName()'s single-row case, safe for bindOutput()'s array
+    // fetch, not safe here), confirmed while building ideas/binding.
+    OciCallResult bindNameArray(const std::string& field_name, ub2 data_type, void* first_element,
+                                sb4 elem_size, sb4 stride, sb2* indicators) {
+        if (state_ != State::Prepared && state_ != State::Executed) {
+            throw OciStatementStateError(
+                "OciStatement::bindNameArray(): statement is " + state_name(state_) +
+                ", expected Prepared or Executed");
+        }
+        const std::string placeholder = ":" + field_name;
+        OCIBind* bind_handle = nullptr;
+        OciCallResult result = call_oci(OCIBindByName, handle_.get(), &bind_handle, conn_.err(),
+                                        reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
+                                        first_element, elem_size, data_type, indicators,
+                                        static_cast<ub2*>(nullptr), static_cast<ub2*>(nullptr),
+                                        static_cast<ub4>(0), static_cast<ub4*>(nullptr), static_cast<ub4>(OCI_DEFAULT));
+        if (bind_handle) {
+            OCIBindArrayOfStruct(bind_handle, conn_.err(), static_cast<ub4>(stride),
+                                 static_cast<ub4>(sizeof(sb2)), 0, 0);
+        }
+        return result;
     }
 
     // Output column, by position. elemSize > 0 additionally calls
@@ -165,7 +214,11 @@ public:
     // to EndOfFetch, classified Success -- not a failure, see
     // OciConnection::classify.
     ExecResult execute(ub4 iters = 0) {
-        require_state(State::Prepared, "execute");
+        if (state_ != State::Prepared && state_ != State::Executed) {
+            throw OciStatementStateError(
+                "OciStatement::execute(): statement is " + state_name(state_) +
+                ", expected Prepared or Executed");
+        }
         if (StatementLogger& logger = statement_logger(); logger) {
             logger(params_log_.empty() ? ("SQL: " + sql_) : ("SQL: " + sql_ + " | " + params_log_));
         }
