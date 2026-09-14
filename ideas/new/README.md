@@ -115,14 +115,17 @@ where this was first written up) for the full story.
     by-name output matching (`describeColumnPosition()`, next, needs
     `execute()` to have already run before a name can resolve to a
     position, so `bindOutput()` has to be callable *after* execute() too).
-  - `fetch()`/`describeColumnPosition()` are also valid in `EndOfFetch`,
-    not just `Executed` -- a real, worth-recording finding: with
+  - `fetch()`/`describeColumnPosition()`/`bindOutput()` are also valid in
+    `EndOfFetch`, not just `Executed` -- a real, worth-recording finding,
+    confirmed at all three call sites separately: with
     `set_prefetch_rows()` set above the real row count, real Oracle
     reports `OCI_ATTR_STMT_STATE == END_OF_FETCH` immediately after
-    `execute()`, before this class's own `fetch()` has ever run, because
-    the server has nothing more to send even though the client hasn't
-    drained its own prefetch cache into the caller's bind buffers yet.
-    See `docs/oci_statement_lifecycle_notes.md` for the real crash this
+    `execute()` -- sometimes before `fetch()` has ever run, sometimes
+    (a genuinely small result set) before `bindOutput()` has even had a
+    chance to define an output column at all -- because the server has
+    nothing more to send even though the client hasn't drained its own
+    prefetch cache into the caller's bind buffers yet. See
+    `docs/oci_statement_lifecycle_notes.md` for both real crashes this
     produced and the fix (a batch loop must stop on the individual
     `fetch()` call's own `OCI_NO_DATA`, not on `state() == EndOfFetch`).
 - `include/binding/oci_log.h` -- `set_statement_logger(logger)`: opt-in,
@@ -135,19 +138,52 @@ where this was first written up) for the full story.
 - `include/binding/oci_lob.h` -- `OCILob`: the LOB *locator* lifecycle
   (`OCIDescriptorAlloc`, `OCILobCreateTemporary`/`OCILobWrite2` on the way
   in, `OCILobGetLength2`/`OCILobRead2` on the way out, all the frees)
-  as its own owned object, not the user-facing value type. A value type
-  wrapping a plain `std::string`/`vector<unsigned char>` (`ideas/binding`'s
-  `OciClob`/`OciBlob`) would sit on top of this and never touch an
-  `OCILobLocator*` directly, the same separation `ideas/binding` already
-  has via free functions (`make_temp_lob`/`free_temp_lob`/
-  `read_lob_bytes`) -- this is that same idea as an object instead.
+  as its own owned object, plus `OciClob`/`OciBlob`, the user-facing
+  value types on top of it (a plain `std::string`/`vector<unsigned char>`
+  wrapper, ported unchanged from `ideas/binding`'s own `oci_lob.h`) that
+  never touch an `OCILobLocator*` directly. `oci_client.h`'s reflection
+  layer is what actually constructs an `OCILob` (transiently, once per
+  bind or once per fetched row) and copies bytes in and out of these --
+  see that file's own comment for how that staging works.
+- `include/binding/oci_fixed_string.h`, `oci_datetime.h` -- `FixedString<N>`
+  and `OciDate`, ported unchanged from `ideas/binding` (both are already
+  self-contained, needing only `oci_compat.h`/`oci_connection.h`).
+- `include/binding/oci_client.h` (+ `details/oci_client.h`) -- the
+  reflection layer `ideas/binding` has (`execute()`/`select_rows()`/
+  `select()`/`insert_rows()`, each walking a plain struct via
+  `boost::pfr`), rebuilt to drive `OciStatement` instead of raw OCI
+  calls. Two things fall out of that for free rather than needing their
+  own machinery here: query logging (every `bindName()` call already
+  logs itself when `set_statement_logger()` is installed) and the
+  `EndOfFetch`-tolerant lifecycle (inherited straight from
+  `OciStatement`). A LOB field's staging slot is an `OCILob` -- or a
+  `std::vector<OCILob>`, one per batch row, on the fetch side, with
+  `elemSize = sizeof(OCILob)` as the array-of-struct stride, since every
+  element of that vector lays its own locator out at the same relative
+  offset -- so this file's own bind/define/apply code only ever calls
+  `create_temporary()`/`write()`/`read()` on it and never touches
+  `OCIDescriptorAlloc`/`OCILobWrite2`/`OCILobRead2`/`OCILobFreeTemporary`
+  itself. The apply loop that copies a fetched batch's optional/LOB
+  staging values into the caller's row struct is skipped entirely (not
+  just a per-field no-op) via `needs_apply_loop_v<T>`, a compile-time
+  check of whether `T`'s staging tuple is all `std::monostate` -- true
+  for the common case of a plain-scalar row type, which never needs a
+  post-fetch copy since every field already landed directly in the
+  batch via `bindOutput()`.
 - `examples/demo.cpp` -- mock-based, 10 demos covering connect, plain
   execute, the state-check exception, `bindName()`, a single-row fetch,
   a batch fetch loop, the `OCI_NO_DATA` zero-row case, `OCILob`,
   `set_statement_logger()`, and `bindNameArray()`.
-- `examples/live_oracle_demo.cpp` -- the same shapes, verified against a
-  real database. Not part of any CMake build; compile directly (see the
-  file's own header comment).
+- `examples/demo_client.cpp` -- mock-based, exercises `oci_client.h`'s
+  four functions directly: `execute()` (plain and with bind params,
+  including an optional field), `select_rows()` (plain-scalar row with
+  the apply loop elided, and an optional-field row with it engaged),
+  `select()`, `insert_rows()`, and an `OciClob` field on both the bind
+  and fetch sides.
+- `examples/live_oracle_demo.cpp`, `live_oracle_client_demo.cpp` -- the
+  same shapes (`OciStatement` directly, and `oci_client.h` respectively),
+  verified against a real database. Not part of any CMake build; compile
+  directly (see each file's own header comment).
 - `docs/oci_statement_lifecycle_notes.md` -- copied from `ideas/binding`:
   the six OCI status codes and why there are that many rather than one
   generic failure code, the statement lifecycle state machine, the
@@ -156,23 +192,18 @@ where this was first written up) for the full story.
 
 ## What this doesn't have (yet)
 
-No reflection layer at all -- every field is bound/defined one call at a
-time, by the caller, with an explicit OCI type code. `ideas/binding`'s
-whole value proposition (`boost::pfr` walking a plain C++ struct's fields
-automatically) isn't reproduced here; this is the layer something like
-that would be rebuilt on top of, not a gap in this one -- a reflection
-layer built on top of `OciStatement` would call `bindName()`/
-`bindNameArray()`/`bindOutput()` per field the same way `ideas/binding`'s
-`bind_one_param`/`define_one_column` call raw OCI functions today.
-
-Array-bind insert (`bindNameArray()`), by-name output matching
-(`describeColumnPosition()`), and query logging
-(`set_statement_logger()`) were all added after the initial pass -- see
-"Testing against a real database" below for each one's real
-verification. At this point every capability `ideas/binding` has at the
-scalar-bind/fetch level has a type-erased counterpart here; what's
-different is the layer above it (reflection vs. explicit type codes),
-not the set of things OCI operations this architecture can do.
+Nothing left unbuilt at the scope `ideas/binding` covers: array-bind
+insert (`bindNameArray()`/`insert_rows()`), by-name output matching
+(`describeColumnPosition()`), query logging (`set_statement_logger()`),
+and the reflection layer itself (`oci_client.h`) were all added after
+the initial pass -- see "Testing against a real database" below for
+each one's real verification. What's different from `ideas/binding` is
+only the layer this one's reflection functions are built on
+(`OciStatement`'s state-checked, `call_oci`-backed primitives, vs. raw
+OCI calls there directly) and the LOB staging mechanism (an owned
+`OCILob` object vs. a raw locator plus hand-rolled alloc/free
+functions) -- not the set of OCI operations either architecture can
+actually do.
 
 ## Testing against a real database
 
@@ -295,3 +326,42 @@ crash the hard way a second time. The spot-check on row 7 specifically
 exercises the case a stride or rebind-offset mistake would get wrong --
 the last row of the last, partial chunk, furthest from the "happens to
 work because the first chunk always starts at offset 0" case.
+
+### `oci_client.h`: the reflection layer, end to end
+
+`examples/live_oracle_client_demo.cpp` exercises all four functions
+together against a real table -- named binds with a nullable field,
+by-name output matching with a deliberately non-declared column order,
+`select()`, a chunked `FixedString<N>` array-bind insert, and an
+`OciClob` field on both the bind and fetch sides:
+
+```
+[OK] insert row 1 (notional=2.5) succeeded
+[OK] insert row 2 (notional=NULL) succeeded
+[OK] select_rows() succeeded
+[OK] collected exactly 2 rows
+[OK] row 1: id=1, notional=2.5, name=Alpha (by-name matching, non-declared column order)
+[OK] row 2: notional correctly round-tripped as NULL (nullopt), not a stale value
+[OK] SELECT COUNT(*) via select() == 2
+[OK] insert_rows() (3+3+1 chunks) succeeded
+[OK] row count is 9 (2 earlier + 7 bulk)
+[OK] last row of the partial final chunk (id=16) has the correct FixedString + scalar value
+[OK] LOB insert via execute() succeeded
+[OK] LOB select_rows() succeeded
+[OK] LOB content round-tripped byte-for-byte through a real OCILob-backed locator
+```
+
+Building this surfaced one more real, genuine finding, not just a
+mechanical port: `bindOutput()` needed the same `EndOfFetch` relaxation
+`fetch()`/`describeColumnPosition()` already had, for a reason specific
+to this layer's own call order. `select_rows()`'s column-name resolution
+requires `execute()` to run *before* `bindOutput()` can be called (see
+the state-machine section above), and with a small real result set plus
+`prefetch_rows` set above the actual row count, `execute(0)` alone was
+enough to already flip `OCI_ATTR_STMT_STATE` to `END_OF_FETCH` --
+*before* a single output column had been defined. `bindOutput()` threw
+`OciStatementStateError` the first time this ran against a live
+database; relaxing it to also accept `EndOfFetch` (same as the other
+two) fixed it. See `docs/oci_statement_lifecycle_notes.md` for the full
+writeup -- this is now confirmed at three separate call sites, not a
+one-off.

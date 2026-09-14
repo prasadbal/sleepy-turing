@@ -18,6 +18,8 @@
 #include "binding/oci_connection.h"
 
 #include <string>
+#include <type_traits>
+#include <vector>
 
 namespace binding {
 
@@ -98,5 +100,33 @@ private:
     OCILobLocator* locator_ = nullptr;
     bool temporary_ = false;
 };
+
+// The user-facing value types this header's own comment above said would
+// eventually sit on top of OCILob: a plain std::string/vector wrapper
+// with no OCI-specific member at all, usable as an ordinary struct field
+// with no connection needed to declare one -- oci_client.h's reflection
+// layer is what actually constructs an OCILob (which does need a
+// connection) transiently, once per bind or once per fetched row, and
+// copies bytes in or out of these. Ported unchanged from ideas/binding's
+// own oci_lob.h; see that file's header comment for the fuller rationale
+// (nullable LOB fields and insert_rows()-style array-bind aren't wired in
+// for a LOB field there either, and the same restrictions apply here).
+class OciClob {
+public:
+    OciClob() = default;
+    explicit OciClob(std::string data) : text_data(std::move(data)) {}
+    std::string text_data;
+};
+
+class OciBlob {
+public:
+    OciBlob() = default;
+    explicit OciBlob(std::vector<unsigned char> data) : binary_data(std::move(data)) {}
+    std::vector<unsigned char> binary_data;
+};
+
+template <typename T> inline constexpr bool is_oci_clob_v = std::is_same_v<T, OciClob>;
+template <typename T> inline constexpr bool is_oci_blob_v = std::is_same_v<T, OciBlob>;
+template <typename T> inline constexpr bool is_oci_lob_v = is_oci_clob_v<T> || is_oci_blob_v<T>;
 
 } // namespace binding

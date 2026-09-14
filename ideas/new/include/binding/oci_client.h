@@ -1,0 +1,195 @@
+#pragma once
+// The reflection layer ideas/binding has (oci_client.h there) and
+// ideas/new was missing until now: execute()/select_rows()/select()/
+// insert_rows(), each walking a plain C++ struct via boost::pfr the same
+// way ideas/binding's do. The difference is what they're built on top
+// of -- ideas/binding's version talks to raw OCI calls directly; this
+// one drives binding::OciStatement (oci_statement.h), so it gets that
+// class's state checking, call_oci-based error retrieval, and the
+// OCI_ATTR_STMT_STATE-driven lifecycle for free, all in one place,
+// instead of duplicating any of it here.
+//
+// LOB handling is the one place the field-level *type* story is
+// identical to ideas/binding (OciClob/OciBlob, plain std::string/vector
+// value types -- see oci_lob.h) but the *plumbing* underneath it isn't:
+// ideas/binding hand-rolls a locator's allocate/write-or-read/free
+// lifecycle inline in bind_one_param/define_one_column/apply_one_column
+// (details/oci_client.h there). Here, that lifecycle is OCILob's own
+// job -- the staging slot for a LOB field is an OCILob object (or a
+// std::vector<OCILob>, one per batch row, on the fetch side), and this
+// file's own bind/define/apply code just calls its create_temporary()/
+// write()/read() methods and lets its destructor free the locator, never
+// touching OCIDescriptorAlloc/OCILobWrite2/OCILobRead2/
+// OCILobFreeTemporary directly itself.
+//
+// Same deliberately narrow scope as ideas/binding's version: arithmetic
+// fields, FixedString<N>, OciDate, OciClob/OciBlob, each optionally
+// wrapped in std::optional<U> to mark it nullable -- except OciClob/
+// OciBlob themselves (not nullable yet, same reason as ideas/binding:
+// see oci_lob.h). LOB fields don't participate in insert_rows()'s
+// array-bind path either, for the same reason as there: no fixed-stride
+// buffer for a locator's per-value lifecycle to stride over.
+//
+// No retry: every entry point runs once and returns an ExecResult.
+// A ConnectionLost result is the caller's cue to reconnect and call the
+// same entry point again -- nothing here does that automatically.
+//
+// Implementation in details/oci_client.h.
+#include "binding/oci_datetime.h"
+#include "binding/oci_fixed_string.h"
+#include "binding/oci_lob.h"
+#include "binding/oci_statement.h"
+
+#include <boost/pfr.hpp>
+#include <cstddef>
+#include <functional>
+#include <optional>
+#include <string>
+#include <type_traits>
+#include <vector>
+
+namespace binding {
+
+// ----------------------------------------------------------------------------
+// optional_value_t<U>: void if U isn't std::optional<something>, else the
+// wrapped type -- boost::pfr walks plain structs, so this file needs its
+// own small trait rather than pulling in ideas/binding's reflect.h.
+// ----------------------------------------------------------------------------
+template <typename U> struct optional_value { using type = void; };
+template <typename U> struct optional_value<std::optional<U>> { using type = U; };
+template <typename U> using optional_value_t = typename optional_value<U>::type;
+template <typename U> inline constexpr bool is_optional_v = !std::is_void_v<optional_value_t<U>>;
+
+// ----------------------------------------------------------------------------
+// Compile-time OCI external type code for a scalar field. std::optional<U>
+// takes U's type code -- the indicator, not the type code, is what tells
+// OCI a value is NULL.
+// ----------------------------------------------------------------------------
+template <typename T> struct OciTypeBinder {
+    static_assert(sizeof(T) == 0,
+                  "binding: no OCI type code for this field type -- oci_client.h only supports "
+                  "arithmetic fields (or optional<arithmetic> for a nullable one)");
+};
+template <> struct OciTypeBinder<short>              { static constexpr ub2 type_code = SQLT_INT; };
+template <> struct OciTypeBinder<int>                { static constexpr ub2 type_code = SQLT_INT; };
+template <> struct OciTypeBinder<long>               { static constexpr ub2 type_code = SQLT_INT; };
+template <> struct OciTypeBinder<long long>          { static constexpr ub2 type_code = SQLT_INT; };
+template <> struct OciTypeBinder<unsigned short>     { static constexpr ub2 type_code = SQLT_UIN; };
+template <> struct OciTypeBinder<unsigned int>       { static constexpr ub2 type_code = SQLT_UIN; };
+template <> struct OciTypeBinder<unsigned long>      { static constexpr ub2 type_code = SQLT_UIN; };
+template <> struct OciTypeBinder<unsigned long long> { static constexpr ub2 type_code = SQLT_UIN; };
+template <> struct OciTypeBinder<float>              { static constexpr ub2 type_code = SQLT_BFLOAT; };
+template <> struct OciTypeBinder<double>             { static constexpr ub2 type_code = SQLT_BDOUBLE; };
+template <std::size_t N> struct OciTypeBinder<FixedString<N>> { static constexpr ub2 type_code = SQLT_CHR; };
+template <> struct OciTypeBinder<OciDate> { static constexpr ub2 type_code = SQLT_ODT; };
+template <> struct OciTypeBinder<OciClob> { static constexpr ub2 type_code = SQLT_CLOB; };
+template <> struct OciTypeBinder<OciBlob> { static constexpr ub2 type_code = SQLT_BLOB; };
+
+template <typename T> struct oci_type_code_of { static constexpr ub2 value = OciTypeBinder<T>::type_code; };
+template <typename U> struct oci_type_code_of<std::optional<U>> { static constexpr ub2 value = OciTypeBinder<U>::type_code; };
+template <typename T> inline constexpr ub2 oci_type_code_v = oci_type_code_of<std::remove_cv_t<T>>::value;
+
+// ----------------------------------------------------------------------------
+// A struct usable as a bind-parameter or result-row type here: every field
+// is arithmetic, FixedString<N>, OciDate, OciClob/OciBlob, or
+// std::optional<U> of the first three to mark it nullable. Checked directly
+// against boost::pfr's own tuple_element_t rather than a shared field-
+// walker helper (ideas/binding's reflect.h, MSVC-safe struct_field_auditor)
+// -- not pulled in here since nothing else in ideas/new needs it yet.
+// ----------------------------------------------------------------------------
+namespace detail {
+template <typename U>
+inline constexpr bool is_scalar_bindable_field_v =
+    std::is_arithmetic_v<optional_value_t<U>> || std::is_arithmetic_v<U> ||
+    is_fixed_string_v<optional_value_t<U>> || is_fixed_string_v<U> ||
+    is_oci_date_v<optional_value_t<U>> || is_oci_date_v<U> ||
+    is_oci_lob_v<U>; // deliberately not is_oci_lob_v<optional_value_t<U>> too -- see oci_client.h's file
+                      // comment and oci_lob.h: a nullable LOB isn't wired in yet.
+
+template <typename T, std::size_t... I>
+constexpr bool scalar_bindable_impl(std::index_sequence<I...>) {
+    return (is_scalar_bindable_field_v<boost::pfr::tuple_element_t<I, T>> && ...);
+}
+} // namespace detail
+
+template <typename T>
+concept scalar_bindable = requires { boost::pfr::tuple_size_v<T>; } &&
+    detail::scalar_bindable_impl<T>(std::make_index_sequence<boost::pfr::tuple_size_v<T>>{});
+
+// ----------------------------------------------------------------------------
+// execute() -- no bind parameters. DDL, or DML that's fully literal in the
+// text. No fetch: a statement of this shape returns no rows.
+// ----------------------------------------------------------------------------
+ExecResult execute(OciConnection& conn, const std::string& sql);
+
+// execute() with a bind-parameter struct -- DML with named parameters
+// (":field_name", bound by the field's own compiler-derived name, any order,
+// any number of times it appears in the text). A field declared
+// std::optional<U> binds SQL NULL when empty. Logged automatically via
+// OciStatement's own set_statement_logger() when one is installed -- every
+// bindName() call this makes logs its own value, so there's no separate
+// query-logging machinery in this file the way ideas/binding needs.
+template <scalar_bindable T>
+ExecResult execute(OciConnection& conn, const std::string& sql, T& params);
+
+// ----------------------------------------------------------------------------
+// select_rows() -- runs a query and fetches its rows in batches, calling
+// `on_batch` once per batch with a pointer to (up to) fetch_batch_size rows
+// and how many of them are actually valid (the last batch of a result set is
+// usually partial). Columns are matched to OutT's fields *by name*, via
+// OciStatement::describeColumnPosition() (falling back to declaration order
+// when the backend can't describe at all -- true of the mock, never true of
+// a real Oracle result set with at least one column). A field with no
+// matching column name is a QueryError, not a silent fetch of whatever
+// happened to be at some position.
+//
+// prefetch_rows and fetch_batch_size are two separate numbers for the same
+// reason as ideas/binding: prefetch_rows is OciStatement::set_prefetch_rows
+// (Oracle's own client-side round-trip batching); fetch_batch_size is how
+// many rows this code asks for per OciStatement::fetch() call.
+template <scalar_bindable OutT>
+ExecResult select_rows(OciConnection& conn, const std::string& sql,
+                        std::size_t prefetch_rows, std::size_t fetch_batch_size,
+                        const std::function<void(const OutT* rows, std::size_t count)>& on_batch);
+
+// Same as above, but also binds `input`'s fields as named IN parameters
+// first (e.g. a WHERE clause) -- the read-side counterpart to
+// execute(conn, sql, params).
+template <scalar_bindable InT, scalar_bindable OutT>
+ExecResult select_rows(OciConnection& conn, const std::string& sql, InT& input,
+                        std::size_t prefetch_rows, std::size_t fetch_batch_size,
+                        const std::function<void(const OutT* rows, std::size_t count)>& on_batch);
+
+// A field type usable as a bare positional output argument to select()
+// below -- no std::optional<U> and no LOB, same restriction and same
+// reason as ideas/binding: an empty optional has no address to define
+// into, and a LOB needs its own locator lifecycle, not a raw address.
+template <typename T>
+concept positional_bindable = std::is_arithmetic_v<T> || is_fixed_string_v<T> || is_oci_date_v<T>;
+
+// select() -- a struct-free, single-row fetch: each argument is an output
+// reference, bound positionally. See ideas/binding's oci_client.h for the
+// full rationale (identical here) -- e.g.
+//   long long count;
+//   auto r = binding::select(conn, "SELECT COUNT(*) FROM t", count);
+template <positional_bindable... T>
+ExecResult select(OciConnection& conn, const std::string& sql, T&... outputs);
+
+// insert_rows() -- a real Oracle array bind of `rows`, executed in bounded
+// chunks of at most `chunk_size` rows per OciStatement::execute() call,
+// rebinding fresh per chunk via OciStatement::bindNameArray() (never
+// OCIStmtExecute's own rowoff parameter -- see ideas/binding's own README
+// and docs/oci_statement_lifecycle_notes.md for why that crashed against a
+// real database and isn't used anywhere in this codebase either).
+//
+// Scope: only a plain (non-optional) arithmetic, FixedString<N>, or OciDate
+// field binds this way -- an optional<U> or OciClob/OciBlob field
+// static_asserts here, same reasons as ideas/binding: no per-row NULL
+// indicator in this path, and no fixed-stride buffer for a LOB locator's
+// lifecycle to stride over.
+template <scalar_bindable T>
+ExecResult insert_rows(OciConnection& conn, const std::string& sql, std::vector<T>& rows, std::size_t chunk_size);
+
+} // namespace binding
+
+#include "binding/details/oci_client.h"

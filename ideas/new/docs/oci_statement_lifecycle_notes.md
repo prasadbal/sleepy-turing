@@ -96,12 +96,20 @@ out of sequence produces an opaque OCI error rather than a clear "you
 called this too early" from the code that actually knows better.
 
 ```
-Unprepared --prepare()--> Prepared --execute()--> Executed --fetch()--> Fetching --fetch()--> ... --> EndOfFetch
-                              |                        |
-                          bind/define              (iters>0: may go
-                          only valid here          straight to EndOfFetch
-                                                    if zero rows matched)
+Unprepared --prepare()--> Prepared --execute()--> Executed --fetch()--> Executed --fetch()--> ... --> EndOfFetch
+                              |                        |                                                  |
+                          bind/define              (iters>0: may go                          fetch()/bindOutput()/
+                          only valid here          straight to EndOfFetch                   describeColumnPosition()
+                                                    if zero rows matched,                     all still valid here
+                                                    or even during a real                    (see below -- OCI's own
+                                                    prefetching execute()                       END_OF_FETCH means
+                                                    with no rows drained                      "server done", not
+                                                    into a caller buffer                      "handle done")
+                                                    yet -- see below)
 ```
+(`ideas/new` specifically -- this diagram used to show a separate
+"Fetching" state distinct from "Executed"; real `OCI_ATTR_STMT_STATE`
+never reports one, so it was dropped. See below.)
 
 Concretely, from what this codebase learned building it:
 
@@ -174,6 +182,31 @@ back the last data, exactly as documented above for the non-prefetching
 case) -- a statement-level fact about the server is not the same thing as
 a single call's own outcome, and only the latter tells a batch loop
 whether to ask again.
+
+**The same early-`EndOfFetch` phenomenon can happen even earlier than
+that -- during `execute(0)` itself, before a single output column has
+even been defined yet.** `bindOutput()` originally only accepted
+`Prepared`/`Executed`, on the assumption that defines always happen
+before `state()` could possibly reach `EndOfFetch`. That assumption
+breaks for exactly the ordering `select_rows()`'s own by-name matching
+requires: column names/positions aren't resolvable until *after*
+`execute()` (see the bullet above), so `bindOutput()` necessarily runs
+*after* `execute(0)` -- and if `set_prefetch_rows()` is set higher than
+the real row count, `execute(0)` can already report `END_OF_FETCH`
+before that later `bindOutput()` call has any chance to run first.
+Confirmed for real with a genuinely small (2-row) real table and
+`prefetch_rows=10`: `bindOutput()` threw `OciStatementStateError`
+(`"statement is EndOfFetch, expected Prepared or Executed"`) the moment
+`ideas/new`'s reflection layer (`oci_client.h`, built on top of
+`OciStatement`, mirroring `ideas/binding`'s own reflection layer) tried
+to define its output columns. Fixed the same way as `fetch()` and
+`describeColumnPosition()`: `bindOutput()` now also accepts `EndOfFetch`.
+The general lesson, now confirmed at three different call sites
+(`fetch()`, `describeColumnPosition()`, `bindOutput()`): `EndOfFetch`
+means "the server says it's done," not "there's nothing left this
+handle can be asked to do" -- any method whose job is legitimately about
+draining or describing what's already there, rather than starting a new
+round of work, should tolerate it.
 
 A state-checking wrapper (an `OciStatement`-shaped class, or the
 equivalent in any other codebase) earns its keep by converting these

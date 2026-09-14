@@ -130,8 +130,16 @@ public:
     // against a real database for an array bind specifically (safe for
     // bindName()'s single-row case, safe for bindOutput()'s array
     // fetch, not safe here), confirmed while building ideas/binding.
+    //
+    // alenp/alskip are for a variable-length field within a fixed-size
+    // buffer -- a FixedString<N> row, whose real content length lives in
+    // its own length_ref(), one whole row apart from the next row's (the
+    // same alskip = sizeof(RowStruct) ideas/binding's own array-bind path
+    // uses). Left at their defaults (nullptr/0) for a field whose bind
+    // size already equals its real length, every other field type here.
     OciCallResult bindNameArray(const std::string& field_name, ub2 data_type, void* first_element,
-                                sb4 elem_size, sb4 stride, sb2* indicators) {
+                                sb4 elem_size, sb4 stride, sb2* indicators,
+                                ub2* alenp = nullptr, ub4 alskip = 0) {
         if (state_ != State::Prepared && state_ != State::Executed) {
             throw OciStatementStateError(
                 "OciStatement::bindNameArray(): statement is " + state_name(state_) +
@@ -142,11 +150,11 @@ public:
         OciCallResult result = call_oci(OCIBindByName, handle_.get(), &bind_handle, conn_.err(),
                                         reinterpret_cast<const text*>(placeholder.c_str()), static_cast<sb4>(placeholder.size()),
                                         first_element, elem_size, data_type, indicators,
-                                        static_cast<ub2*>(nullptr), static_cast<ub2*>(nullptr),
+                                        alenp, static_cast<ub2*>(nullptr),
                                         static_cast<ub4>(0), static_cast<ub4*>(nullptr), static_cast<ub4>(OCI_DEFAULT));
         if (bind_handle) {
             OCIBindArrayOfStruct(bind_handle, conn_.err(), static_cast<ub4>(stride),
-                                 static_cast<ub4>(sizeof(sb2)), 0, 0);
+                                 static_cast<ub4>(sizeof(sb2)), static_cast<ub4>(alskip), 0);
         }
         return result;
     }
@@ -156,12 +164,25 @@ public:
     // -- pass sizeof(RowType) for an array-of-struct batch fetch, leave
     // it 0 (the default) for a single-row define, where no stride is
     // needed at all.
+    //
+    // Also valid in EndOfFetch, not just Prepared/Executed -- a real
+    // finding, not a theoretical one: with prefetch_rows set higher than
+    // the real row count, real Oracle can report OCI_ATTR_STMT_STATE ==
+    // END_OF_FETCH from execute(0) itself, before this class's own
+    // bindOutput() has even been called once to set up the output
+    // columns -- prefetch runs during execute() regardless of iters, so
+    // a small result set can already be "done" as far as the server is
+    // concerned before a caller has defined anywhere to put the data.
+    // Confirmed by a real select_rows()-shaped caller in
+    // ideas/new/examples/live_oracle_client_demo.cpp throwing here the
+    // first time this ran against a live database with only 2 real rows
+    // and prefetch_rows=10 -- see docs/oci_statement_lifecycle_notes.md.
     OciCallResult bindOutput(std::size_t pos, ub2 data_type, void* data, sb4 len,
                              ub2* outsize, void* indicator, sb4 elemSize = 0) {
-        if (state_ != State::Prepared && state_ != State::Executed) {
+        if (state_ != State::Prepared && state_ != State::Executed && state_ != State::EndOfFetch) {
             throw OciStatementStateError(
                 "OciStatement::bindOutput(): statement is " + state_name(state_) +
-                ", expected Prepared or Executed");
+                ", expected Prepared, Executed, or EndOfFetch");
         }
         OCIDefine* define_handle = nullptr;
         OciCallResult result = call_oci(OCIDefineByPos, handle_.get(), &define_handle, conn_.err(),
