@@ -119,7 +119,12 @@ int main() {
                 if (fetch_result.status != ExecStatus::Success) break;
                 const ub4 n = stmt.rows_fetched();
                 for (ub4 i = 0; i < n; ++i) collected.push_back(batch[i]);
-                if (stmt.state() == OciStatement::State::EndOfFetch) break;
+                // The fetch CALL's own status is the real stopping signal --
+                // not stmt.state(), which (against a real database with
+                // prefetching enabled) can already read EndOfFetch before
+                // every prefetched row has actually been drained by fetch()
+                // yet. See docs/oci_statement_lifecycle_notes.md.
+                if (fetch_result.call.status == OCI_NO_DATA) break;
             }
         }
         std::printf("rows collected=%zu\n", collected.size());

@@ -82,11 +82,20 @@ where this was first written up) for the full story.
   codebase hasn't specifically seen yet would fall through incorrectly.
 - `include/binding/oci_statement.h` -- `OciStatement`: a statement handle
   with an explicit state enum (`Unprepared -> Prepared -> Executed ->
-  Fetching -> EndOfFetch`) and `prepare()`/`bindName()`/`bindNameArray()`/
+  EndOfFetch`) and `prepare()`/`bindName()`/`bindNameArray()`/
   `bindOutput()`/`execute()`/`fetch()`/`describeColumnPosition()` methods,
   each checking `state()` first and throwing `OciStatementStateError` --
   not returning an `ExecResult` -- on a call sequence that doesn't make
   sense, before any OCI call is attempted at all.
+  - `Executed`/`EndOfFetch` are read directly from real OCI's own
+    `OCIAttrGet(OCI_ATTR_STMT_STATE)` after every `execute()`/`fetch()`
+    call, not re-derived from the call's return status -- OCI already
+    knows the handle's actual state; asking it is more honest than
+    guessing the same answer a second time. `Unprepared`/`Prepared`
+    still have to be tracked here, since OCI reports the same
+    `INITIALIZED` value for both. There's no separate "mid-batch-fetch"
+    state distinct from `Executed` either, matching what
+    `OCI_ATTR_STMT_STATE` itself reports (only three values exist).
   - `bindName()` is a single-row IN parameter by name, type-erased
     (caller supplies the `SQLT_*` code directly).
   - `bindNameArray()` is a chunked array-bind IN parameter -- the
@@ -106,6 +115,16 @@ where this was first written up) for the full story.
     by-name output matching (`describeColumnPosition()`, next, needs
     `execute()` to have already run before a name can resolve to a
     position, so `bindOutput()` has to be callable *after* execute() too).
+  - `fetch()`/`describeColumnPosition()` are also valid in `EndOfFetch`,
+    not just `Executed` -- a real, worth-recording finding: with
+    `set_prefetch_rows()` set above the real row count, real Oracle
+    reports `OCI_ATTR_STMT_STATE == END_OF_FETCH` immediately after
+    `execute()`, before this class's own `fetch()` has ever run, because
+    the server has nothing more to send even though the client hasn't
+    drained its own prefetch cache into the caller's bind buffers yet.
+    See `docs/oci_statement_lifecycle_notes.md` for the real crash this
+    produced and the fix (a batch loop must stop on the individual
+    `fetch()` call's own `OCI_NO_DATA`, not on `state() == EndOfFetch`).
 - `include/binding/oci_log.h` -- `set_statement_logger(logger)`: opt-in,
   off by default. `OciStatement::execute()` logs the SQL text plus every
   `bindName()`'d value (rendered via `render_typed_value()`, which

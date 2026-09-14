@@ -5,11 +5,18 @@
 // through this (ORA-24437 "statement handle not prepared" chief among
 // them -- using a handle in a state it wasn't actually in).
 //
-//   Unprepared --prepare()--> Prepared --execute()--> Executed --fetch()--> Fetching --fetch()--> ... EndOfFetch
+//   Unprepared --prepare()--> Prepared --execute()--> Executed --fetch()--> Executed --fetch()--> ... EndOfFetch
 //                                 |                    ^    |
 //                             bindName()/bindOutput()  |  (iters>0 with zero
 //                             valid in either           |  matching rows goes
 //                             Prepared or Executed ------  straight to EndOfFetch)
+//
+// Executed covers both "just executed, ready to fetch" and "mid-batch-
+// fetch-loop, more rows still available" -- real OCI doesn't distinguish
+// those two either. OCI_ATTR_STMT_STATE (see below) only ever reports
+// three values -- INITIALIZED, EXECUTED, END_OF_FETCH -- so Executed here
+// is the honest reflection of that, not a state this class invented and
+// then collapsed.
 //
 // The Prepared<->Executed cycle (bind, execute, rebind, execute again,
 // never re-preparing) is deliberate, not a loophole: a chunked
@@ -59,7 +66,16 @@ public:
 
 class OciStatement {
 public:
-    enum class State { Unprepared, Prepared, Executed, Fetching, EndOfFetch };
+    // Unprepared/Prepared are tracked here, not by OCI -- OCI_ATTR_STMT_STATE
+    // reports the same INITIALIZED value both before prepare() and after
+    // it, up until the first execute(), so there's no attribute to read
+    // that distinction from. Executed/EndOfFetch, in contrast, are read
+    // directly from OCI_ATTR_STMT_STATE after every execute()/fetch()
+    // call (see sync_state_from_oci() below) rather than re-derived from
+    // the call's own return status -- OCI already knows the handle's real
+    // state; asking it directly is more honest than inferring the same
+    // answer a second time from OCI_NO_DATA.
+    enum class State { Unprepared, Prepared, Executed, EndOfFetch };
 
     explicit OciStatement(OciConnection& conn) : conn_(conn), handle_(conn.env()) {}
 
@@ -182,7 +198,7 @@ public:
     // reason (see docs/oci_statement_lifecycle_notes.md and
     // ideas/binding's own oci_mock.h).
     ub4 describeColumnPosition(const std::string& column_name) const {
-        if (state_ != State::Executed && state_ != State::Fetching) {
+        if (state_ != State::Executed && state_ != State::EndOfFetch) {
             throw OciStatementStateError(
                 "OciStatement::describeColumnPosition(): statement is " + state_name(state_) +
                 ", expected Executed -- call execute() first");
@@ -226,20 +242,34 @@ public:
                                             iters, static_cast<ub4>(0),
                                             nullptr, nullptr,
                                             static_cast<ub4>(OCI_DEFAULT));
-        state_ = (call.status == OCI_NO_DATA) ? State::EndOfFetch : State::Executed;
+        sync_state_from_oci();
         return {conn_.classify(call), call};
     }
 
+    // Deliberately valid in EndOfFetch too, not just Executed: with
+    // set_prefetch_rows() set higher than the real row count, real Oracle
+    // reports OCI_ATTR_STMT_STATE == END_OF_FETCH immediately after
+    // execute() -- before this class's own fetch() has ever run -- once
+    // the server-side cursor has no more rows to send. That's a
+    // statement-level fact about the SERVER, not about whether this
+    // class has drained its own prefetch buffer into the caller's bind
+    // variables yet; the prefetched rows still need at least one real
+    // fetch() call to actually land in them. Confirmed against a real
+    // database (see docs/oci_statement_lifecycle_notes.md): a fetch()
+    // called while already EndOfFetch is exactly what a prefetching
+    // batch-fetch loop's very next iteration does, and it works -- it
+    // either returns real rows still sitting in the prefetch cache, or
+    // OCI_NO_DATA with zero new rows if the cache was already drained.
     ExecResult fetch(ub4 nrows) {
-        if (state_ != State::Executed && state_ != State::Fetching) {
+        if (state_ != State::Executed && state_ != State::EndOfFetch) {
             throw OciStatementStateError(
                 "OciStatement::fetch(): statement is " + state_name(state_) +
-                ", expected Executed or Fetching -- call execute() first");
+                ", expected Executed or EndOfFetch -- call execute() first");
         }
         const OciCallResult call = call_oci(OCIStmtFetch2, handle_.get(), conn_.err(),
                                             nrows, static_cast<ub2>(OCI_FETCH_NEXT),
                                             static_cast<sb4>(0), static_cast<ub4>(OCI_DEFAULT));
-        state_ = (call.status == OCI_NO_DATA) ? State::EndOfFetch : State::Fetching;
+        sync_state_from_oci();
         return {conn_.classify(call), call};
     }
 
@@ -266,6 +296,24 @@ private:
         }
     }
 
+    // Reads OCI's own OCI_ATTR_STMT_STATE and folds it into state_,
+    // called after every execute()/fetch(). OCI only ever reports
+    // INITIALIZED/EXECUTED/END_OF_FETCH; INITIALIZED is left unmapped
+    // here on purpose -- it shouldn't occur after a call that already
+    // required Prepared/Executed/Executed-only to run at all, and if it
+    // somehow did, silently forcing state_ back to Prepared would hide
+    // a real problem more than it would help.
+    void sync_state_from_oci() {
+        ub4 oci_state = 0;
+        ub4 size = sizeof(oci_state);
+        OCIAttrGet(handle_.get(), OCI_HTYPE_STMT, &oci_state, &size, OCI_ATTR_STMT_STATE, conn_.err());
+        if (oci_state == OCI_STMT_STATE_EXECUTED) {
+            state_ = State::Executed;
+        } else if (oci_state == OCI_STMT_STATE_END_OF_FETCH) {
+            state_ = State::EndOfFetch;
+        }
+    }
+
     static std::string uppercased(std::string_view sv) {
         std::string result(sv);
         for (char& c : result) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
@@ -277,7 +325,6 @@ private:
             case State::Unprepared: return "Unprepared";
             case State::Prepared:   return "Prepared";
             case State::Executed:   return "Executed";
-            case State::Fetching:   return "Fetching";
             case State::EndOfFetch: return "EndOfFetch";
         }
         return "?";

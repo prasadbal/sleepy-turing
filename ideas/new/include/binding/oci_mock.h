@@ -80,6 +80,10 @@ struct OCIDate { sb2 OCIDateYYYY = 0; unsigned char OCIDateMM = 0, OCIDateDD = 0
 #define OCI_DTYPE_PARAM        53  // a parameter descriptor from OCIParamGet
 #define OCI_ATTR_PARAM_COUNT   18  // number of columns in the select list
 #define OCI_ATTR_NAME          4   // the name of the column/argument
+#define OCI_ATTR_STMT_STATE    182 // real oci.h value -- confirmed against instantclient19's sdk/include/oci.h
+#define OCI_STMT_STATE_INITIALIZED  0x0001
+#define OCI_STMT_STATE_EXECUTED     0x0002
+#define OCI_STMT_STATE_END_OF_FETCH 0x0003
 
 // ---- Status codes --------------------------------------------------------
 constexpr sword OCI_SUCCESS = 0;
@@ -136,6 +140,14 @@ inline std::vector<MockDefine> g_defines;
 inline int g_fetch_row = 0;
 inline constexpr int MOCK_ROW_COUNT = 3;
 inline std::atomic<int> g_last_rows_fetched{0}; // OCI_ATTR_ROWS_FETCHED after the last OCIStmtFetch2
+
+// Mirrors real OCI's own OCI_ATTR_STMT_STATE -- a single global here
+// rather than genuinely per-handle, same simplification every other
+// piece of mock state in this file already makes (g_fetch_row, g_defines,
+// etc.): every demo uses one statement/cursor at a time, so a shared
+// global reproduces the real attribute's call-shape without needing an
+// actual per-handle registry.
+inline std::atomic<int> g_stmt_state{OCI_STMT_STATE_INITIALIZED};
 
 // Lets a demo inspect what indicator value the last execute()'s bind calls
 // set for each bind position -- 0 = OCI_IND_NOTNULL, -1 = OCI_IND_NULL.
@@ -397,6 +409,7 @@ inline sword OCIStmtPrepare(OCIStmt*, OCIError*, const text*, ub4, ub4, ub4) {
     binding::mock::g_defines.clear();
     binding::mock::g_fetch_row = 0;
     binding::mock::g_last_bind_indicators.clear();
+    binding::mock::g_stmt_state.store(OCI_STMT_STATE_INITIALIZED);
     return OCI_SUCCESS;
 }
 
@@ -479,6 +492,9 @@ inline sword OCIAttrGet(const dvoid*, ub4, dvoid* attributep, ub4* sizep, ub4 at
         // reports. Present for signature completeness only.
         *static_cast<text**>(attributep) = nullptr;
         if (sizep) *sizep = 0;
+    } else if (attrtype == OCI_ATTR_STMT_STATE && attributep) {
+        *static_cast<ub4*>(attributep) = static_cast<ub4>(binding::mock::g_stmt_state.load());
+        if (sizep) *sizep = sizeof(ub4);
     }
     return OCI_SUCCESS;
 }
@@ -600,8 +616,11 @@ inline sword OCIStmtExecute(OCISvcCtx*, OCIStmt*, OCIError*, ub4 iters, ub4, con
             generate_one_mock_row(fetched);
         }
         g_last_rows_fetched.store(static_cast<int>(fetched));
-        return (g_fetch_row >= MOCK_ROW_COUNT) ? OCI_NO_DATA : OCI_SUCCESS;
+        const bool end_of_fetch = g_fetch_row >= MOCK_ROW_COUNT;
+        g_stmt_state.store(end_of_fetch ? OCI_STMT_STATE_END_OF_FETCH : OCI_STMT_STATE_EXECUTED);
+        return end_of_fetch ? OCI_NO_DATA : OCI_SUCCESS;
     }
+    g_stmt_state.store(OCI_STMT_STATE_EXECUTED);
     return OCI_SUCCESS;
 }
 
@@ -619,7 +638,9 @@ inline sword OCIStmtFetch2(OCIStmt*, OCIError*, ub4 nrows, ub2, sb4, ub4) {
         generate_one_mock_row(fetched);
     }
     g_last_rows_fetched.store(static_cast<int>(fetched));
-    return (g_fetch_row >= MOCK_ROW_COUNT) ? OCI_NO_DATA : OCI_SUCCESS;
+    const bool end_of_fetch = g_fetch_row >= MOCK_ROW_COUNT;
+    g_stmt_state.store(end_of_fetch ? OCI_STMT_STATE_END_OF_FETCH : OCI_STMT_STATE_EXECUTED);
+    return end_of_fetch ? OCI_NO_DATA : OCI_SUCCESS;
 }
 
 inline sword OCIErrorGet(dvoid*, ub4, text*, sb4* errcodep, text* bufp, ub4 bufsiz, ub4) {

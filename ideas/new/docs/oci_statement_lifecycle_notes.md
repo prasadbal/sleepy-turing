@@ -117,11 +117,63 @@ Concretely, from what this codebase learned building it:
   this README). Position-only defines don't have this restriction --
   they've always been valid before execute, which is why the earlier,
   purely positional design never had to think about this ordering at all.
-- **A statement that's reached `EndOfFetch` can't be fetched again** the
-  way you'd expect a "past the end" iterator not to be dereferenced --
+- **A statement that's reached `EndOfFetch` can't be *executed* again**
+  the way you'd expect a "past the end" iterator not to be dereferenced --
   going back to `Prepared` (for a new execute) means either a fresh
   `prepare()` or, for a cached statement, releasing and re-acquiring it
-  (see `OCIStmtPrepare2`/`OCIStmtRelease` below).
+  (see `OCIStmtPrepare2`/`OCIStmtRelease` below). `fetch()` is a different
+  story -- see the `OCI_ATTR_STMT_STATE` finding immediately below, which
+  corrects an earlier, wrong assumption in this same bullet that
+  `EndOfFetch` also meant "can't be fetched again."
+
+### `OCI_ATTR_STMT_STATE` exists, and revealed a real bug when `ideas/new` started reading it
+
+Real OCI tracks a statement handle's own execute/fetch state itself, via
+`OCIAttrGet(..., OCI_ATTR_STMT_STATE, ...)` (attribute `182`, confirmed
+against Instant Client 19.32's own `oci.h`). It only ever reports three
+values: `OCI_STMT_STATE_INITIALIZED` (`1`), `OCI_STMT_STATE_EXECUTED`
+(`2`), `OCI_STMT_STATE_END_OF_FETCH` (`3`) -- notably no separate
+"prepared but not yet executed" value (that's `INITIALIZED` too, same as
+a freshly allocated handle -- OCI doesn't track "has `prepare()` been
+called" as its own state at all) and no separate "mid-batch-fetch-loop"
+value distinct from `EXECUTED`.
+
+`ideas/new`'s `OciStatement` originally hand-derived its own
+`Executed`/`Fetching`/`EndOfFetch` states from each call's *return
+status* (`OCI_NO_DATA` vs not) rather than asking OCI directly. Switching
+`execute()`/`fetch()` to read `OCI_ATTR_STMT_STATE` after every call
+instead (asking OCI what state the handle is actually in, rather than
+re-deriving the same answer a second time from the status code) is more
+honest -- and immediately surfaced a real, previously-latent bug the
+hand-derived version had been masking:
+
+**With `set_prefetch_rows()` set higher than the real row count, real
+Oracle reports `OCI_ATTR_STMT_STATE == END_OF_FETCH` immediately after
+`execute()`, before a single `fetch()` call has been made.** The server
+has told the client everything it has (that's what "end of fetch" means
+from the server's point of view), but the rows are sitting in the
+client-side prefetch cache, not yet in the caller's own bind/define
+buffers -- that only happens when `fetch()` is actually called. So
+`fetch()` has to remain valid while `state() == EndOfFetch`, not just
+`Executed`, or a real prefetching batch loop crashes on its very first
+`fetch()` call, immediately after a genuinely successful `execute()`, on
+a live database.
+
+Confirmed by `ideas/new/examples/live_oracle_demo.cpp`'s own batch-fetch
+test (`set_prefetch_rows(100)` over 3 real rows, batch size 2): it threw
+`OciStatementStateError` the moment `OCI_ATTR_STMT_STATE` was wired in
+directly, precisely because `fetch()` still only accepted `Executed`.
+Relaxing `fetch()` (and `describeColumnPosition()`, for the same reason)
+to accept `Executed` **or** `EndOfFetch` fixed it -- and exposed a second,
+related bug in the *test itself*: its loop used `stmt.state() ==
+EndOfFetch` as the signal to stop fetching, which is now provably the
+wrong signal (state can already say `EndOfFetch` while real, undrained
+rows remain). The correct stopping signal is the individual `fetch()`
+call's own return status (`OCI_NO_DATA` on the call that actually hands
+back the last data, exactly as documented above for the non-prefetching
+case) -- a statement-level fact about the server is not the same thing as
+a single call's own outcome, and only the latter tells a batch loop
+whether to ask again.
 
 A state-checking wrapper (an `OciStatement`-shaped class, or the
 equivalent in any other codebase) earns its keep by converting these

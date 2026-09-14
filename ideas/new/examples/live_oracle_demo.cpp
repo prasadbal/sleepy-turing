@@ -121,7 +121,16 @@ int main(int argc, char** argv) {
                 if (fetch_result.status != ExecStatus::Success) break;
                 const ub4 n = stmt.rows_fetched();
                 for (ub4 i = 0; i < n; ++i) collected.push_back(batch[i]);
-                if (stmt.state() == OciStatement::State::EndOfFetch) break;
+                // The fetch CALL's own status is the real stopping signal,
+                // not stmt.state(): with set_prefetch_rows() set above the
+                // real row count, real Oracle reports OCI_ATTR_STMT_STATE
+                // == END_OF_FETCH immediately after execute(), before this
+                // loop's first fetch() call has run at all -- it means the
+                // server has nothing more to send, not that this class has
+                // drained everything already buffered client-side. Found
+                // by this exact test crashing/under-collecting before this
+                // fix -- see docs/oci_statement_lifecycle_notes.md.
+                if (fetch_result.call.status == OCI_NO_DATA) break;
             }
         }
         check(collected.size() == 3, "collected all 3 rows across multiple fetch() calls");
