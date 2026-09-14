@@ -78,7 +78,19 @@ where this was first written up) for the full story.
   attempted at all. `bindName()` is by name, type-erased (caller supplies
   the `SQLT_*` code directly); `bindOutput()` is by position, with an
   optional `elemSize` for an array-of-struct batch fetch (`sizeof(Row)`,
-  matching `OCIDefineArrayOfStruct`'s own stride parameter).
+  matching `OCIDefineArrayOfStruct`'s own stride parameter), and valid in
+  either the `Prepared` or `Executed` state -- the latter specifically so
+  `describeColumnPosition(name)` (also here) can resolve a column's real
+  name to a position first, which needs `execute()` to have already run
+  (see `docs/oci_statement_lifecycle_notes.md`), before `bindOutput()`
+  uses the position it resolved.
+- `include/binding/oci_log.h` -- `set_statement_logger(logger)`: opt-in,
+  off by default. `OciStatement::execute()` logs the SQL text plus every
+  `bindName()`'d value (rendered via `render_typed_value()`, which
+  switches on the *runtime* `SQLT_*` code -- there's no C++ type to
+  dispatch on on this type-erased layer -- covering integer widths,
+  float/double, a character buffer, and `OciDate` via a real
+  `OCIDateToText` call) as one line per `execute()` call.
 - `include/binding/oci_lob.h` -- `OCILob`: the LOB *locator* lifecycle
   (`OCIDescriptorAlloc`, `OCILobCreateTemporary`/`OCILobWrite2` on the way
   in, `OCILobGetLength2`/`OCILobRead2` on the way out, all the frees)
@@ -88,9 +100,10 @@ where this was first written up) for the full story.
   `OCILobLocator*` directly, the same separation `ideas/binding` already
   has via free functions (`make_temp_lob`/`free_temp_lob`/
   `read_lob_bytes`) -- this is that same idea as an object instead.
-- `examples/demo.cpp` -- mock-based, 8 demos covering connect, plain
+- `examples/demo.cpp` -- mock-based, 9 demos covering connect, plain
   execute, the state-check exception, `bindName()`, a single-row fetch,
-  a batch fetch loop, the `OCI_NO_DATA` zero-row case, and `OCILob`.
+  a batch fetch loop, the `OCI_NO_DATA` zero-row case, `OCILob`, and
+  `set_statement_logger()`.
 - `examples/live_oracle_demo.cpp` -- the same shapes, verified against a
   real database. Not part of any CMake build; compile directly (see the
   file's own header comment).
@@ -106,15 +119,13 @@ No reflection layer at all -- every field is bound/defined one call at a
 time, by the caller, with an explicit OCI type code. `ideas/binding`'s
 whole value proposition (`boost::pfr` walking a plain C++ struct's fields
 automatically) isn't reproduced here; this is the layer something like
-that would be rebuilt on top of. No by-name output column matching (that
-needs `OCIParamGet`/`OCI_ATTR_NAME`, described in
-`docs/oci_statement_lifecycle_notes.md`, layered on top of `bindOutput()`
--- not done here). No array-bind insert (`ideas/binding`'s
-`insert_rows()`). No query logging. All of these are straightforward to
-add on top of `OciStatement` once its own shape is settled; none were
-built in this first pass, which focused on getting the handle lifecycle,
-error retrieval, and state checking right and verified against a real
-database first.
+that would be rebuilt on top of. No array-bind insert (`ideas/binding`'s
+`insert_rows()`) -- `bindName()`'s single-value-per-call shape doesn't
+have an array-of-struct counterpart yet the way `bindOutput()` does via
+`elemSize`. By-name output matching (`describeColumnPosition()`) and
+query logging (`set_statement_logger()`) were both added after the first
+pass -- see "Testing against a real database" below for their real
+verification.
 
 ## Testing against a real database
 
@@ -169,3 +180,47 @@ way a bare, uncast `nullptr` (whose type is `std::nullptr_t`, implicitly
 convertible to *any* pointer type) does. Fixed by removing those casts;
 worth remembering for any future `call_oci` call site passing a null
 pointer argument -- pass it bare, not pre-cast to `void*`/`dvoid*`.
+
+### `set_statement_logger()`: real `OciDateToText` rendering
+
+```
+[OK] exactly one log line for the INSERT
+    SQL: INSERT INTO new_arch_log_test VALUES(:id, :cob_date) | id=1, cob_date='13-SEP-26'
+[OK] id rendered correctly
+[OK] OciDate rendered via a real OCIDateToText call, not a placeholder
+```
+
+`render_typed_value()`'s `SQLT_ODT` branch calls the real `OCIDateToText`
+-- confirmed producing an actual formatted date (`'13-SEP-26'`), not a
+raw `::OCIDate` struct dump, against a real database.
+
+### `describeColumnPosition()`: by-name matching, reversed order + extra column
+
+The same adversarial shape `ideas/binding`'s own by-name matching was
+proven against: a table `(id, middle_extra, name)`, queried in that
+column order, with output variables bound in the *opposite* order (name
+first, id second) via names resolved through `describeColumnPosition()`
+rather than assumed from declaration order:
+
+```
+[OK] select execute() succeeded
+[OK] describeColumnPosition("name") resolved to real position 3
+[OK] describeColumnPosition("id") resolved to real position 1
+[OK] fetch() after post-execute bindOutput() succeeded
+[OK] id=7, name=SEVEN correct despite reversed bind order + extra middle column
+[OK] a column name with no match returns 0, not a wrong guess
+```
+
+A real, worth-recording mistake surfaced building this test, not in
+`OciStatement` itself: the first attempt passed `nullptr` for the
+`SQLT_CHR` (`VARCHAR2`) column's `outsize` (`rlenp`) parameter, and
+Oracle responded by blank-padding the entire 16-byte buffer ("SEVEN"
+followed by 11 trailing spaces) instead of writing just the 5 real bytes
+and leaving the rest alone. `ideas/binding` always passes a real
+`length_ref()` for exactly this reason (see `FixedString<N>`'s own
+comments); this test hadn't been carrying that forward until it broke
+this same way here. Fixed by passing a real `ub2 name_len` and using it
+to bound the read (`std::string(name_buf, name_len)`), not
+`std::strlen`/null-termination -- a `SQLT_CHR` fetch is explicit-length,
+not null-terminated, exactly as documented everywhere else in this
+codebase and `ideas/binding` both.

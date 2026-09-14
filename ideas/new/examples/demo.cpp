@@ -29,6 +29,7 @@
 
 #include "binding/oci_connection.h"
 #include "binding/oci_lob.h"
+#include "binding/oci_log.h"
 #include "binding/oci_statement.h"
 
 using namespace binding;
@@ -149,6 +150,30 @@ int main() {
         const std::string readback = lob.read(/*is_char_lob=*/true);
         std::printf("wrote %zu bytes, read back: [%s] (match=%s)\n",
                     value.size(), readback.c_str(), readback == value ? "true" : "false");
+    }
+
+    std::printf("\n--- Demo 9: set_statement_logger() ---\n");
+    {
+        std::vector<std::string> logged;
+        set_statement_logger([&](std::string_view line) { logged.emplace_back(line); });
+
+        OciStatement stmt(conn);
+        stmt.prepare("UPDATE trades SET notional = :notional WHERE trade_id = :trade_id");
+        int trade_id = 100;
+        double notional = 42.5;
+        sb2 null_indicator = OCI_IND_NULL;
+        stmt.bindName("notional", SQLT_BDOUBLE, &notional, sizeof(notional));
+        stmt.bindName("trade_id", SQLT_INT, &trade_id, sizeof(trade_id));
+        stmt.execute(1);
+
+        OciStatement stmt2(conn);
+        stmt2.prepare("UPDATE trades SET notional = :notional WHERE trade_id = :trade_id");
+        stmt2.bindName("notional", SQLT_BDOUBLE, &notional, sizeof(notional), &null_indicator);
+        stmt2.bindName("trade_id", SQLT_INT, &trade_id, sizeof(trade_id));
+        stmt2.execute(1);
+
+        for (auto& line : logged) std::printf("  %s\n", line.c_str());
+        set_statement_logger(nullptr);
     }
 
     conn.disconnect();

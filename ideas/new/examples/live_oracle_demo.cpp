@@ -15,11 +15,13 @@
 //   LD_LIBRARY_PATH=<INSTANT_CLIENT> ./live_oracle_demo_new <connect_string> <username> <password>
 
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
 #include "binding/oci_connection.h"
 #include "binding/oci_lob.h"
+#include "binding/oci_log.h"
 #include "binding/oci_statement.h"
 
 using namespace binding;
@@ -186,6 +188,95 @@ int main(int argc, char** argv) {
 
         OciStatement cleanup(conn);
         cleanup.prepare("DROP TABLE new_arch_lob_test");
+        cleanup.execute(1);
+    }
+
+    std::printf("\n--- set_statement_logger(): real OciDateToText rendering ---\n");
+    {
+        OciStatement create(conn);
+        create.prepare("CREATE TABLE new_arch_log_test (id NUMBER, cob_date DATE)");
+        create.execute(1);
+
+        std::vector<std::string> logged;
+        set_statement_logger([&](std::string_view line) { logged.emplace_back(line); });
+
+        OciStatement stmt(conn);
+        stmt.prepare("INSERT INTO new_arch_log_test VALUES(:id, :cob_date)");
+        int id = 1;
+        ::OCIDate cob_date{};
+        OCIDateFromText(conn.err(), reinterpret_cast<const text*>("13-SEP-26"), 9,
+                        reinterpret_cast<const text*>("DD-MON-RR"), 9, nullptr, 0, &cob_date);
+        stmt.bindName("id", SQLT_INT, &id, sizeof(id));
+        stmt.bindName("cob_date", SQLT_ODT, &cob_date, sizeof(cob_date));
+        stmt.execute(1);
+
+        set_statement_logger(nullptr);
+        check(logged.size() == 1, "exactly one log line for the INSERT");
+        if (!logged.empty()) {
+            std::printf("    %s\n", logged[0].c_str());
+            check(logged[0].find("id=1") != std::string::npos, "id rendered correctly");
+            check(logged[0].find("cob_date='13-SEP-26'") != std::string::npos,
+                  "OciDate rendered via a real OCIDateToText call, not a placeholder");
+        }
+
+        OciStatement cleanup(conn);
+        cleanup.prepare("DROP TABLE new_arch_log_test");
+        cleanup.execute(1);
+    }
+
+    std::printf("\n--- describeColumnPosition(): by-name matching, reversed order + extra column ---\n");
+    {
+        OciStatement create(conn);
+        create.prepare("CREATE TABLE new_arch_byname_test (id NUMBER, middle_extra NUMBER, name VARCHAR2(16))");
+        create.execute(1);
+        {
+            OciStatement insert(conn);
+            insert.prepare("INSERT INTO new_arch_byname_test VALUES(:id, :middle_extra, :name)");
+            int id = 7;
+            int extra = 999;
+            char name_buf[17] = "SEVEN";
+            insert.bindName("id", SQLT_INT, &id, sizeof(id));
+            insert.bindName("middle_extra", SQLT_INT, &extra, sizeof(extra));
+            insert.bindName("name", SQLT_CHR, name_buf, static_cast<sb4>(std::strlen(name_buf)));
+            insert.execute(1);
+        }
+
+        // Query column order: id, middle_extra, name -- deliberately NOT
+        // the order these get bound to output variables below, plus an
+        // extra column (middle_extra) the caller doesn't even want.
+        OciStatement select(conn);
+        select.prepare("SELECT id, middle_extra, name FROM new_arch_byname_test WHERE id = 7");
+        auto exec_result = select.execute(0); // iters=0: resolves describe info, no rows yet
+        check(exec_result.status == ExecStatus::Success, "select execute() succeeded");
+
+        // Bound in the OPPOSITE order from the SELECT list -- name first,
+        // id second -- resolved purely by name, not position. name_len
+        // is a real rlenp target (not nullptr): SQLT_CHR (VARCHAR2)
+        // needs it to report the actual content length -- without it,
+        // Oracle blank-pads the whole buffer to its declared size
+        // instead of writing just the real value and leaving the rest
+        // alone (confirmed here: omitting it the first time round
+        // produced "SEVEN" + 11 trailing spaces, not "SEVEN\0...").
+        char name_buf[17] = {};
+        ub2 name_len = 0;
+        int id = 0;
+        ub4 name_pos = select.describeColumnPosition("name");
+        ub4 id_pos = select.describeColumnPosition("id");
+        check(name_pos == 3, "describeColumnPosition(\"name\") resolved to real position 3");
+        check(id_pos == 1, "describeColumnPosition(\"id\") resolved to real position 1");
+        select.bindOutput(name_pos, SQLT_CHR, name_buf, sizeof(name_buf) - 1, &name_len, nullptr);
+        select.bindOutput(id_pos, SQLT_INT, &id, sizeof(id), nullptr, nullptr);
+
+        auto fetch_result = select.fetch(1);
+        check(fetch_result.status == ExecStatus::Success, "fetch() after post-execute bindOutput() succeeded");
+        check(id == 7 && std::string(name_buf, name_len) == "SEVEN",
+              "id=7, name=SEVEN correct despite reversed bind order + extra middle column");
+
+        ub4 missing_pos = select.describeColumnPosition("totally_made_up_column");
+        check(missing_pos == 0, "a column name with no match returns 0, not a wrong guess");
+
+        OciStatement cleanup(conn);
+        cleanup.prepare("DROP TABLE new_arch_byname_test");
         cleanup.execute(1);
     }
 

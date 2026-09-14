@@ -36,7 +36,9 @@
 #include "binding/oci_call.h"
 #include "binding/oci_connection.h"
 #include "binding/oci_handle_guard.h"
+#include "binding/oci_log.h"
 
+#include <cctype>
 #include <stdexcept>
 #include <string>
 
@@ -59,6 +61,8 @@ public:
                  reinterpret_cast<const text*>(sql.c_str()), static_cast<ub4>(sql.size()),
                  static_cast<ub4>(OCI_NTV_SYNTAX), static_cast<ub4>(OCI_DEFAULT));
         state_ = State::Prepared;
+        sql_ = sql;
+        params_log_.clear();
     }
 
     // Input parameter, by name. data_type is the raw OCI external type
@@ -68,6 +72,11 @@ public:
     OciCallResult bindName(const std::string& field_name, ub2 data_type, void* data, sb4 len,
                            void* indicator = nullptr) {
         require_state(State::Prepared, "bindName");
+        if (statement_logger()) {
+            const bool is_null = indicator && *static_cast<const sb2*>(indicator) == OCI_IND_NULL;
+            if (!params_log_.empty()) params_log_ += ", ";
+            params_log_ += field_name + "=" + (is_null ? "NULL" : render_typed_value(conn_, data_type, data, len));
+        }
         const std::string placeholder = ":" + field_name;
         OCIBind* bind_handle = nullptr;
         return call_oci(OCIBindByName, handle_.get(), &bind_handle, conn_.err(),
@@ -84,7 +93,11 @@ public:
     // needed at all.
     OciCallResult bindOutput(std::size_t pos, ub2 data_type, void* data, sb4 len,
                              ub2* outsize, void* indicator, sb4 elemSize = 0) {
-        require_state(State::Prepared, "bindOutput");
+        if (state_ != State::Prepared && state_ != State::Executed) {
+            throw OciStatementStateError(
+                "OciStatement::bindOutput(): statement is " + state_name(state_) +
+                ", expected Prepared or Executed");
+        }
         OCIDefine* define_handle = nullptr;
         OciCallResult result = call_oci(OCIDefineByPos, handle_.get(), &define_handle, conn_.err(),
                                         static_cast<ub4>(pos), data, len, data_type,
@@ -102,6 +115,47 @@ public:
         OCIAttrSet(handle_.get(), OCI_HTYPE_STMT, &rows, 0, OCI_ATTR_PREFETCH_ROWS, conn_.err());
     }
 
+    // Resolves a column's real, fully-resolved name (through any CTE/
+    // subquery/UNION/expression alias) to its 1-based OCIDefineByPos
+    // position, via OCIParamGet/OCIAttrGet(OCI_ATTR_NAME) -- the same
+    // mechanism ideas/binding's select_rows() uses for by-name matching,
+    // here exposed directly rather than hidden behind reflection. Only
+    // valid after execute() -- see docs/oci_statement_lifecycle_notes.md
+    // for why describe info isn't available any earlier, confirmed
+    // empirically against a real database while building that feature.
+    // Returns 0 if no column matches (case-insensitively) -- callers
+    // should treat that as an error, not silently bind position 0. Also
+    // returns 0 uniformly against a backend that can't describe columns
+    // at all (the mock, which has no notion of a query's actual column
+    // names) -- there's no way to distinguish "genuinely no such column"
+    // from "this backend can't tell me" from the return value alone; the
+    // mock is documented as a call-shape simulator for exactly this
+    // reason (see docs/oci_statement_lifecycle_notes.md and
+    // ideas/binding's own oci_mock.h).
+    ub4 describeColumnPosition(const std::string& column_name) const {
+        if (state_ != State::Executed && state_ != State::Fetching) {
+            throw OciStatementStateError(
+                "OciStatement::describeColumnPosition(): statement is " + state_name(state_) +
+                ", expected Executed -- call execute() first");
+        }
+        ub4 column_count = 0;
+        ub4 attr_size = sizeof(column_count);
+        OCIAttrGet(handle_.get(), OCI_HTYPE_STMT, &column_count, &attr_size, OCI_ATTR_PARAM_COUNT, conn_.err());
+
+        const std::string target = uppercased(column_name);
+        for (ub4 pos = 1; pos <= column_count; ++pos) {
+            void* parmdp = nullptr;
+            OCIParamGet(handle_.get(), OCI_HTYPE_STMT, conn_.err(), &parmdp, pos);
+            text* name_ptr = nullptr;
+            ub4 name_len = 0;
+            OCIAttrGet(parmdp, OCI_DTYPE_PARAM, &name_ptr, &name_len, OCI_ATTR_NAME, conn_.err());
+            const std::string name(reinterpret_cast<const char*>(name_ptr), name_len);
+            OCIDescriptorFree(parmdp, OCI_DTYPE_PARAM);
+            if (uppercased(name) == target) return pos;
+        }
+        return 0;
+    }
+
     // iters=0 for a query you're about to fetch from in a loop (also
     // what actually resolves any DESCRIBE information, if a caller
     // layers name-based column matching on top of this -- see
@@ -112,6 +166,9 @@ public:
     // OciConnection::classify.
     ExecResult execute(ub4 iters = 0) {
         require_state(State::Prepared, "execute");
+        if (StatementLogger& logger = statement_logger(); logger) {
+            logger(params_log_.empty() ? ("SQL: " + sql_) : ("SQL: " + sql_ + " | " + params_log_));
+        }
         const OciCallResult call = call_oci(OCIStmtExecute, conn_.svc(), handle_.get(), conn_.err(),
                                             iters, static_cast<ub4>(0),
                                             nullptr, nullptr,
@@ -156,6 +213,12 @@ private:
         }
     }
 
+    static std::string uppercased(std::string_view sv) {
+        std::string result(sv);
+        for (char& c : result) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        return result;
+    }
+
     static std::string state_name(State s) {
         switch (s) {
             case State::Unprepared: return "Unprepared";
@@ -170,6 +233,8 @@ private:
     OciConnection& conn_;
     OCIStmtHandle handle_;
     State state_ = State::Unprepared;
+    std::string sql_;
+    std::string params_log_;
 };
 
 } // namespace binding
