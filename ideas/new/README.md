@@ -215,6 +215,14 @@ where this was first written up) for the full story.
   `select_generic()` respectively), verified against a real database.
   Not part of any CMake build; compile directly (see each file's own
   header comment).
+- `examples/live_oracle_empty_table_demo.cpp` -- a genuinely empty table
+  (zero rows, not just zero *matching* rows) reaches `EndOfFetch` during
+  `execute(0)` itself, guaranteed rather than conditional on
+  `prefetch_rows` -- the same mechanism as the prefetch-overrun finding
+  above, just impossible to avoid instead of only likely. Verifies every
+  entry point that could be affected (`select_generic()`, `select_rows`,
+  `select`, and `OciStatement` directly) handles it cleanly with no
+  exception and no garbage output.
 - `docs/oci_statement_lifecycle_notes.md` -- copied from `ideas/binding`:
   the six OCI status codes and why there are that many rather than one
   generic failure code, the statement lifecycle state machine, the
