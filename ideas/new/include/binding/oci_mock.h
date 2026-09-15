@@ -80,6 +80,8 @@ struct OCIDate { sb2 OCIDateYYYY = 0; unsigned char OCIDateMM = 0, OCIDateDD = 0
 #define OCI_DTYPE_PARAM        53  // a parameter descriptor from OCIParamGet
 #define OCI_ATTR_PARAM_COUNT   18  // number of columns in the select list
 #define OCI_ATTR_NAME          4   // the name of the column/argument
+#define OCI_ATTR_DATA_SIZE     1   // maximum size of the data (real oci.h value)
+#define OCI_ATTR_DATA_TYPE     2   // the SQL type of the column/argument (real oci.h value)
 #define OCI_ATTR_STMT_STATE    182 // real oci.h value -- confirmed against instantclient19's sdk/include/oci.h
 #define OCI_STMT_STATE_INITIALIZED  0x0001
 #define OCI_STMT_STATE_EXECUTED     0x0002
@@ -98,6 +100,8 @@ constexpr sb2 OCI_IND_NULL    = -1;
 // ---- External type constants ----------------------------------------------
 constexpr ub2 SQLT_INT     = 3;
 constexpr ub2 SQLT_UIN     = 68;
+constexpr ub2 SQLT_NUM     = 2;   // Oracle's native NUMBER type -- select_generic() describes a
+                                  // NUMBER column as this, unconverted (oci_client.h)
 constexpr ub2 SQLT_CHR     = 1;   // VARCHAR2: explicit length, no null terminator
 constexpr ub2 SQLT_AFC     = 96;  // CHAR: blank-padded to the column width
 constexpr ub2 SQLT_STR     = 5;

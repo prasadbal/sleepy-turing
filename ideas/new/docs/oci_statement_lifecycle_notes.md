@@ -208,6 +208,53 @@ handle can be asked to do" -- any method whose job is legitimately about
 draining or describing what's already there, rather than starting a new
 round of work, should tolerate it.
 
+### `bindOutput()`'s `rlskip` was silently wrong for anything but a row struct
+
+`bindOutput(pos, data_type, data, len, outsize, indicator, elemSize)`
+originally hardcoded the `outsize`/`rlenp` array's own row-to-row stride
+(`rlskip`, `OCIDefineArrayOfStruct`'s fourth argument) to be the same as
+`elemSize`, the *value*'s stride (`pvskip`). That happens to be correct
+for every caller before `select_generic()`: `FixedString<N>`'s
+`length_ref()` lives inside the same per-row struct as the value itself,
+one whole struct apart from the next row's -- the same distance as the
+value.
+
+`select_generic()` (`oci_client.h`) broke that assumption on its first
+real run: it reports each column's fetched length into its own,
+separate `vector<ub2>`, tightly packed one entry per row -- a stride of
+`sizeof(ub2)` (2 bytes), nothing to do with the column's own per-row
+byte width (`elemSize`, which for a `VARCHAR2(16)` column is 16). With
+the old hardcoding, `bindOutput()` told OCI to look for each row's
+length 16 bytes apart in a buffer that only had a `ub2` every 2 bytes --
+silently reading garbage/adjacent memory as "the real length" instead of
+throwing or erroring, which would have shown up downstream as wrong
+string lengths (or a crash, if it walked far enough to read
+unmapped memory for a larger batch) with no OCI error at all to explain
+why.
+
+Caught by inspection while writing `select_generic()`, before it was
+ever run with the bug in place -- not by observing wrong output and
+tracing it back: reasoning through what address `bindOutput()`'s
+hardcoded `rlskip = elemSize` would actually compute for a
+tightly-packed `vector<ub2>` (row 1's length landing 16 bytes past row
+0's, inside a buffer that only holds a `ub2` every 2 bytes) made the
+mismatch obvious before any test ran. `bindOutput()` now takes an
+optional `rlskip` parameter, defaulting to `0` (meaning "same as
+`elemSize`," preserving every existing caller's behavior exactly), with
+`select_generic()` the one caller that passes a real, different value
+(`sizeof(ub2)`). Confirmed correct against a real database afterward
+with a `VARCHAR2(16)` column holding `"Alpha"` (5 real characters) and
+`"BB"` (2) in the same batch -- both came back with their correct,
+different lengths. Worth recording anyway, because this class of bug
+(a stride parameter silently wrong for a caller shaped differently from
+whichever caller it was first written against) doesn't announce itself
+with a crash or an OCI error -- it just quietly reads the wrong bytes,
+consistently enough to look plausible. The general lesson: any
+`OCIDefineArrayOfStruct` stride parameter needs its own, independently
+reasoned value -- assuming two of them are always equal because they
+happened to be equal for the first caller is exactly the kind of
+assumption a second, structurally different caller can silently break.
+
 A state-checking wrapper (an `OciStatement`-shaped class, or the
 equivalent in any other codebase) earns its keep by converting these
 ordering rules from "an opaque `ORA-#####` from OCI, sometimes with no

@@ -175,6 +175,45 @@ concept positional_bindable = std::is_arithmetic_v<T> || is_fixed_string_v<T> ||
 template <positional_bindable... T>
 ExecResult select(OciConnection& conn, const std::string& sql, T&... outputs);
 
+// ----------------------------------------------------------------------------
+// select_generic() -- no struct, no reflection, no type mapping at all:
+// describes `sql`'s result columns via OciStatement::describeColumns()
+// and defines each one using its own described OCI type and size,
+// completely unconverted (a NUMBER column stays SQLT_NUM, raw
+// Oracle-internal bytes; a VARCHAR2/CHAR column stays SQLT_CHR/SQLT_AFC,
+// raw bytes plus a real per-row content length). For a caller that
+// doesn't know a row shape ahead of time, or wants to measure this
+// layer's raw fetch throughput without any decode/convert step between
+// OCI and the callback -- select_rows<T>() decodes into real C++ types
+// as it goes; this hands back exactly what Oracle described, nothing
+// more.
+//
+// LOB columns (SQLT_CLOB/SQLT_BLOB) are not supported: a locator is not
+// a flat byte buffer the way every other described type here is. A
+// query that selects one returns QueryError immediately, before any
+// fetch is attempted, rather than defining garbage -- use
+// select_rows<T>() with an OciClob/OciBlob field for a LOB column
+// instead.
+struct GenericBatch {
+    const std::vector<ColumnInfo>& columns;
+    std::size_t row_count;
+    // One entry per column: raw bytes for up to fetch_batch_size rows,
+    // each row exactly columns[i].data_size bytes apart (tightly packed,
+    // one buffer per column -- not an array of a shared row struct).
+    const std::vector<std::vector<unsigned char>>& column_data;
+    // One entry per column, one sb2 per row (OCI_IND_NULL/OCI_IND_NOTNULL).
+    const std::vector<std::vector<sb2>>& indicators;
+    // One entry per column, one ub2 per row -- only meaningful for a
+    // SQLT_CHR/SQLT_AFC column (the real fetched length; that data isn't
+    // null-terminated). 0 and unused for every other column type.
+    const std::vector<std::vector<ub2>>& lengths;
+};
+using GenericBatchCallback = std::function<void(const GenericBatch&)>;
+
+ExecResult select_generic(OciConnection& conn, const std::string& sql,
+                          std::size_t prefetch_rows, std::size_t fetch_batch_size,
+                          const GenericBatchCallback& on_batch);
+
 // insert_rows() -- a real Oracle array bind of `rows`, executed in bounded
 // chunks of at most `chunk_size` rows per OciStatement::execute() call,
 // rebinding fresh per chunk via OciStatement::bindNameArray() (never

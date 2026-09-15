@@ -387,6 +387,68 @@ inline ExecResult execute(OciConnection& conn, const std::string& sql) {
     return stmt.execute(1);
 }
 
+inline ExecResult select_generic(OciConnection& conn, const std::string& sql,
+                                 std::size_t prefetch_rows, std::size_t fetch_batch_size,
+                                 const GenericBatchCallback& on_batch) {
+    OciStatement stmt(conn);
+    stmt.prepare(sql);
+    stmt.set_prefetch_rows(static_cast<ub4>(prefetch_rows));
+
+    // iters=0: nothing to fetch up front, but this is also what resolves
+    // describeColumns()'s own information -- see
+    // docs/oci_statement_lifecycle_notes.md for why that has to happen
+    // after execute(), not before it.
+    ExecResult result = stmt.execute(0);
+    if (result.status != ExecStatus::Success) return result;
+
+    const std::vector<ColumnInfo> columns = stmt.describeColumns();
+    for (const auto& col : columns) {
+        if (col.oracle_type == SQLT_CLOB || col.oracle_type == SQLT_BLOB) {
+            return {ExecStatus::QueryError,
+                    OciCallResult{OCI_ERROR, 0,
+                        "select_generic: column '" + col.name + "' is a LOB -- a locator isn't a "
+                        "flat byte buffer the way every other described type here is; use "
+                        "select_rows<T>() with an OciClob/OciBlob field for a LOB column instead"}};
+        }
+    }
+
+    std::vector<std::vector<unsigned char>> column_data(columns.size());
+    std::vector<std::vector<sb2>> indicators(columns.size());
+    std::vector<std::vector<ub2>> lengths(columns.size());
+
+    for (std::size_t i = 0; i < columns.size(); ++i) {
+        const ColumnInfo& col = columns[i];
+        const bool is_text = (col.oracle_type == SQLT_CHR || col.oracle_type == SQLT_AFC);
+        const ub4 size = col.data_size > 0 ? col.data_size : 1;
+        column_data[i].assign(fetch_batch_size * size, 0);
+        indicators[i].assign(fetch_batch_size, OCI_IND_NOTNULL);
+        lengths[i].assign(fetch_batch_size, 0);
+        // rlskip = sizeof(ub2): lengths[i] is its own tightly-packed
+        // vector<ub2>, one entry per row -- a different stride from
+        // pvskip's `size` (the column's own per-row byte width), which
+        // is exactly why bindOutput() needed a real, separate rlskip
+        // parameter rather than reusing elemSize for it (see its own
+        // comment in oci_statement.h).
+        stmt.bindOutput(col.position, col.oracle_type, column_data[i].data(), static_cast<sb4>(size),
+                        is_text ? lengths[i].data() : nullptr, indicators[i].data(),
+                        static_cast<sb4>(size), static_cast<ub4>(sizeof(ub2)));
+    }
+
+    for (;;) {
+        const ExecResult fetch_result = stmt.fetch(static_cast<ub4>(fetch_batch_size));
+        if (fetch_result.status != ExecStatus::Success) { result = fetch_result; break; }
+
+        const ub4 rows_fetched = stmt.rows_fetched();
+        const GenericBatch batch{columns, rows_fetched, column_data, indicators, lengths};
+        on_batch(batch);
+
+        // The fetch call's own status is the real stopping signal, not
+        // stmt.state() -- see docs/oci_statement_lifecycle_notes.md.
+        if (fetch_result.call.status == OCI_NO_DATA) { result = fetch_result; break; }
+    }
+    return result;
+}
+
 template <scalar_bindable T>
 ExecResult execute(OciConnection& conn, const std::string& sql, T& params) {
     OciStatement stmt(conn);

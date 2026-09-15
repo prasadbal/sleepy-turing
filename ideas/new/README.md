@@ -83,7 +83,8 @@ where this was first written up) for the full story.
 - `include/binding/oci_statement.h` -- `OciStatement`: a statement handle
   with an explicit state enum (`Unprepared -> Prepared -> Executed ->
   EndOfFetch`) and `prepare()`/`bindName()`/`bindNameArray()`/
-  `bindOutput()`/`execute()`/`fetch()`/`describeColumnPosition()` methods,
+  `bindOutput()`/`execute()`/`fetch()`/`describeColumnPosition()`/
+  `describeColumns()` methods,
   each checking `state()` first and throwing `OciStatementStateError` --
   not returning an `ExecResult` -- on a call sequence that doesn't make
   sense, before any OCI call is attempted at all.
@@ -106,7 +107,20 @@ where this was first written up) for the full story.
     that one).
   - `bindOutput()` is by position, with an optional `elemSize` for an
     array-of-struct batch fetch (`sizeof(Row)`, matching
-    `OCIDefineArrayOfStruct`'s own stride parameter).
+    `OCIDefineArrayOfStruct`'s own stride parameter) and an optional
+    `rlskip`, the separate stride for the `outsize`/`rlenp` array --
+    left at `0` (meaning "same as `elemSize`") for the common case where
+    the reported length lives inside the same per-row struct as the
+    value itself (`FixedString<N>::length_ref()`), but overridable when
+    it doesn't: `select_generic()` (`oci_client.h`, below) reports every
+    row's length into its own tightly-packed `vector<ub2>`, a different
+    stride from the column's own per-row byte width, and that mismatch
+    was a real bug caught before it shipped (a `VARCHAR2` column's real
+    fetched lengths landed at the wrong stride and read back wrong).
+  - `describeColumns()` is `describeColumnPosition()`'s sibling: every
+    column's real name, position, native OCI type code, and size in one
+    `OCIParamGet` pass, for a caller that doesn't want to declare a row
+    struct at all -- `select_generic()` is what actually uses it.
   - `bindName()`/`bindNameArray()`/`bindOutput()`/`execute()` are all
     valid in either the `Prepared` or `Executed` state -- not just
     `Prepared` -- specifically so two real patterns both work on one
@@ -170,20 +184,37 @@ where this was first written up) for the full story.
   for the common case of a plain-scalar row type, which never needs a
   post-fetch copy since every field already landed directly in the
   batch via `bindOutput()`.
+
+  `select_generic()`, same file, is the no-struct-at-all counterpart:
+  describes a query's columns via `describeColumns()` and defines every
+  one of them using its own described OCI type and size, completely
+  unconverted -- a `NUMBER` column stays `SQLT_NUM`, raw Oracle-internal
+  bytes; a `VARCHAR2`/`CHAR` column stays `SQLT_CHR`/`SQLT_AFC`, raw
+  bytes plus a real per-row length. No `boost::pfr`, no row type declared
+  anywhere -- for a caller that doesn't know a row shape ahead of time,
+  or wants to measure this layer's raw fetch throughput with no
+  decode/convert step at all between OCI and the callback (`select_rows`
+  decodes into real C++ types as it goes; this hands back exactly what
+  Oracle described). A `SQLT_CLOB`/`SQLT_BLOB` column is rejected with a
+  clear `QueryError` before any fetch is attempted -- a locator isn't a
+  flat byte buffer the way every other described type here is.
 - `examples/demo.cpp` -- mock-based, 10 demos covering connect, plain
   execute, the state-check exception, `bindName()`, a single-row fetch,
   a batch fetch loop, the `OCI_NO_DATA` zero-row case, `OCILob`,
   `set_statement_logger()`, and `bindNameArray()`.
 - `examples/demo_client.cpp` -- mock-based, exercises `oci_client.h`'s
-  four functions directly: `execute()` (plain and with bind params,
-  including an optional field), `select_rows()` (plain-scalar row with
-  the apply loop elided, and an optional-field row with it engaged),
-  `select()`, `insert_rows()`, and an `OciClob` field on both the bind
-  and fetch sides.
-- `examples/live_oracle_demo.cpp`, `live_oracle_client_demo.cpp` -- the
-  same shapes (`OciStatement` directly, and `oci_client.h` respectively),
-  verified against a real database. Not part of any CMake build; compile
-  directly (see each file's own header comment).
+  four struct-based functions directly: `execute()` (plain and with bind
+  params, including an optional field), `select_rows()` (plain-scalar
+  row with the apply loop elided, and an optional-field row with it
+  engaged), `select()`, `insert_rows()`, and an `OciClob` field on both
+  the bind and fetch sides. (`select_generic()` needs a real describable
+  backend -- see `live_oracle_generic_demo.cpp` below, not this file.)
+- `examples/live_oracle_demo.cpp`, `live_oracle_client_demo.cpp`,
+  `live_oracle_generic_demo.cpp` -- the same shapes (`OciStatement`
+  directly, `oci_client.h`'s struct-based functions, and
+  `select_generic()` respectively), verified against a real database.
+  Not part of any CMake build; compile directly (see each file's own
+  header comment).
 - `docs/oci_statement_lifecycle_notes.md` -- copied from `ideas/binding`:
   the six OCI status codes and why there are that many rather than one
   generic failure code, the statement lifecycle state machine, the

@@ -56,8 +56,22 @@
 #include <cctype>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace binding {
+
+// One result-set column's real, described metadata -- name, 1-based
+// OCIDefineByPos position, the OCI type code Oracle itself reports for
+// the column's *native* storage (SQLT_NUM for a NUMBER column, not
+// whatever external type a caller might define it as -- see
+// OciStatement::describeColumns()'s own comment), and its maximum size
+// in bytes (OCI_ATTR_DATA_SIZE).
+struct ColumnInfo {
+    std::string name;
+    ub4 position = 0;
+    ub2 oracle_type = 0;
+    ub4 data_size = 0;
+};
 
 class OciStatementStateError : public std::logic_error {
 public:
@@ -177,8 +191,18 @@ public:
     // ideas/new/examples/live_oracle_client_demo.cpp throwing here the
     // first time this ran against a live database with only 2 real rows
     // and prefetch_rows=10 -- see docs/oci_statement_lifecycle_notes.md.
+    // rlskip is the stride between one row's outsize/rlenp entry and the
+    // next -- left at 0 (the default) to mean "same as elemSize," which
+    // is correct whenever outsize lives inside the same per-row struct
+    // as the value itself (FixedString<N>::length_ref(), one whole row
+    // apart, same as pvskip) -- true of every caller before
+    // select_generic() (details/oci_client.h). select_generic() passes a
+    // real, different rlskip because its length array is its own
+    // tightly-packed vector<ub2>, not embedded in a stride-elemSize
+    // struct -- sizeof(ub2), not elemSize, is the real distance from one
+    // row's reported length to the next there.
     OciCallResult bindOutput(std::size_t pos, ub2 data_type, void* data, sb4 len,
-                             ub2* outsize, void* indicator, sb4 elemSize = 0) {
+                             ub2* outsize, void* indicator, sb4 elemSize = 0, ub4 rlskip = 0) {
         if (state_ != State::Prepared && state_ != State::Executed && state_ != State::EndOfFetch) {
             throw OciStatementStateError(
                 "OciStatement::bindOutput(): statement is " + state_name(state_) +
@@ -191,7 +215,7 @@ public:
         if (elemSize > 0 && define_handle) {
             OCIDefineArrayOfStruct(define_handle, conn_.err(),
                                    static_cast<ub4>(elemSize), static_cast<ub4>(sizeof(sb2)),
-                                   static_cast<ub4>(elemSize), 0);
+                                   rlskip > 0 ? rlskip : static_cast<ub4>(elemSize), 0);
         }
         return result;
     }
@@ -240,6 +264,63 @@ public:
             if (uppercased(name) == target) return pos;
         }
         return 0;
+    }
+
+    // Every column's real, described metadata in one pass -- for a
+    // caller that doesn't know (or doesn't want to declare) a row struct
+    // ahead of time, e.g. a generic "run arbitrary SQL and see what's
+    // there" tool, or select_generic() below. Same OCIParamGet loop and
+    // same restrictions as describeColumnPosition() (only valid after
+    // execute(), returns an empty vector against a backend that can't
+    // describe at all -- the mock's OCI_ATTR_PARAM_COUNT always reports
+    // 0), just returning everything about every column instead of one
+    // position for one named column.
+    //
+    // oracle_type is the column's *native* SQLT_* code as Oracle itself
+    // describes it -- SQLT_NUM for a NUMBER column, not SQLT_INT/
+    // SQLT_BDOUBLE the way a caller binding it explicitly would choose.
+    // Defining a column using its own described type/size, unconverted,
+    // is exactly what select_generic() does below -- the fastest
+    // possible generic fetch path, since there is no representation
+    // change between what Oracle hands back and what a caller receives.
+    std::vector<ColumnInfo> describeColumns() const {
+        if (state_ != State::Executed && state_ != State::EndOfFetch) {
+            throw OciStatementStateError(
+                "OciStatement::describeColumns(): statement is " + state_name(state_) +
+                ", expected Executed -- call execute() first");
+        }
+        ub4 column_count = 0;
+        ub4 attr_size = sizeof(column_count);
+        OCIAttrGet(handle_.get(), OCI_HTYPE_STMT, &column_count, &attr_size, OCI_ATTR_PARAM_COUNT, conn_.err());
+
+        std::vector<ColumnInfo> columns;
+        columns.reserve(column_count);
+        for (ub4 pos = 1; pos <= column_count; ++pos) {
+            void* parmdp = nullptr;
+            OCIParamGet(handle_.get(), OCI_HTYPE_STMT, conn_.err(), &parmdp, pos);
+
+            ColumnInfo col;
+            col.position = pos;
+
+            text* name_ptr = nullptr;
+            ub4 name_len = 0;
+            OCIAttrGet(parmdp, OCI_DTYPE_PARAM, &name_ptr, &name_len, OCI_ATTR_NAME, conn_.err());
+            col.name.assign(reinterpret_cast<const char*>(name_ptr), name_len);
+
+            ub2 data_type = 0;
+            attr_size = sizeof(data_type);
+            OCIAttrGet(parmdp, OCI_DTYPE_PARAM, &data_type, &attr_size, OCI_ATTR_DATA_TYPE, conn_.err());
+            col.oracle_type = data_type;
+
+            ub2 data_size = 0;
+            attr_size = sizeof(data_size);
+            OCIAttrGet(parmdp, OCI_DTYPE_PARAM, &data_size, &attr_size, OCI_ATTR_DATA_SIZE, conn_.err());
+            col.data_size = data_size;
+
+            OCIDescriptorFree(parmdp, OCI_DTYPE_PARAM);
+            columns.push_back(std::move(col));
+        }
+        return columns;
     }
 
     // iters=0 for a query you're about to fetch from in a loop (also
