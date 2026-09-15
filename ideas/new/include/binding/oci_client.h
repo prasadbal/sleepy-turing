@@ -101,7 +101,14 @@ namespace detail {
 template <typename U>
 inline constexpr bool is_scalar_bindable_field_v =
     std::is_arithmetic_v<optional_value_t<U>> || std::is_arithmetic_v<U> ||
-    is_fixed_string_v<optional_value_t<U>> || is_fixed_string_v<U> ||
+    is_fixed_string_v<U> || // deliberately not is_fixed_string_v<optional_value_t<U>> too -- see
+                             // details/oci_client.h's bind_one_param/define_one_column: a plain
+                             // FixedString<N> is never wrapped in std::optional<> here. Oracle
+                             // can't store an empty VARCHAR2/CHAR distinct from NULL, so a plain
+                             // FixedString<N> field is already nullable via its own length()==0 --
+                             // std::optional<FixedString<N>> would be a second, redundant way to
+                             // say the same thing (nullopt vs. an empty string), so it's excluded
+                             // the same way is_oci_lob_v<optional_value_t<U>> is excluded below.
     is_oci_date_v<optional_value_t<U>> || is_oci_date_v<U> ||
     is_oci_lob_v<U>; // deliberately not is_oci_lob_v<optional_value_t<U>> too -- see oci_client.h's file
                       // comment and oci_lob.h: a nullable LOB isn't wired in yet.

@@ -62,20 +62,27 @@ void bind_one_param(OciStatement& stmt, OciConnection& conn, T& params, std::str
         stmt.bindName(std::string(name), oci_type_code_v<FieldT>, slot->locator_address(),
                       static_cast<sb4>(sizeof(OCILobLocator*)));
     } else if constexpr (is_optional_v<FieldT>) {
-        using ElemT = optional_value_t<FieldT>;
+        // Never a FixedString<N> element here -- is_scalar_bindable_field_v
+        // (oci_client.h) excludes std::optional<FixedString<N>> entirely,
+        // so ElemT is always arithmetic or OciDate, both plain
+        // fixed-size values with no length/indicator distinction of
+        // their own to worry about.
         auto& stage = std::get<I>(staging);
         if (field) { stage = *field; indicators[I] = OCI_IND_NOTNULL; }
         else       { stage = {};     indicators[I] = OCI_IND_NULL; }
-        if constexpr (is_fixed_string_v<ElemT>) {
-            stmt.bindName(std::string(name), oci_type_code_v<FieldT>, stage.data(),
-                          static_cast<sb4>(stage.length()), &indicators[I]);
-        } else {
-            stmt.bindName(std::string(name), oci_type_code_v<FieldT>, &stage, sizeof(stage), &indicators[I]);
-        }
+        stmt.bindName(std::string(name), oci_type_code_v<FieldT>, &stage, sizeof(stage), &indicators[I]);
     } else if constexpr (is_fixed_string_v<FieldT>) {
-        indicators[I] = OCI_IND_NOTNULL;
+        // Oracle itself can't store an empty VARCHAR2/CHAR value --
+        // inserting '' always lands as NULL, regardless of what the
+        // client bound. Binding a zero-length FixedString<N> as an
+        // explicit NULL makes that visible in the type instead of
+        // relying on the engine's own implicit conversion: a plain,
+        // non-optional FixedString<N> already means "may be empty" to
+        // a caller, so there's no separate "may be absent" state left
+        // for std::optional<FixedString<N>> to add.
+        indicators[I] = (field.length() == 0) ? OCI_IND_NULL : OCI_IND_NOTNULL;
         stmt.bindName(std::string(name), oci_type_code_v<FieldT>, field.data(),
-                      static_cast<sb4>(field.length()));
+                      static_cast<sb4>(field.length()), &indicators[I]);
     } else {
         indicators[I] = OCI_IND_NOTNULL;
         stmt.bindName(std::string(name), oci_type_code_v<FieldT>, &field, sizeof(field));
@@ -161,19 +168,15 @@ void define_one_column(OciStatement& stmt, OciConnection& conn, std::vector<T>& 
     using FieldT = boost::pfr::tuple_element_t<I, T>;
 
     if constexpr (is_optional_v<FieldT>) {
+        // Never a FixedString<N> element here -- same exclusion as
+        // bind_one_param's matching comment above.
         using ElemT = optional_value_t<FieldT>;
         auto& ind = indicators[I];
         ind.assign(batch.size(), OCI_IND_NOTNULL);
         auto& stage = std::get<I>(staging);
         stage.assign(batch.size(), ElemT{});
-        if constexpr (is_fixed_string_v<ElemT>) {
-            stmt.bindOutput(position, oci_type_code_v<FieldT>, stage[0].data(),
-                            static_cast<sb4>(ElemT::capacity), &stage[0].length_ref(), ind.data(),
-                            static_cast<sb4>(sizeof(ElemT)));
-        } else {
-            stmt.bindOutput(position, oci_type_code_v<FieldT>, stage.data(), sizeof(ElemT),
-                            nullptr, ind.data(), static_cast<sb4>(sizeof(ElemT)));
-        }
+        stmt.bindOutput(position, oci_type_code_v<FieldT>, stage.data(), sizeof(ElemT),
+                        nullptr, ind.data(), static_cast<sb4>(sizeof(ElemT)));
     } else if constexpr (is_oci_lob_v<FieldT>) {
         auto& ind = indicators[I];
         ind.assign(batch.size(), OCI_IND_NOTNULL);
@@ -185,9 +188,20 @@ void define_one_column(OciStatement& stmt, OciConnection& conn, std::vector<T>& 
                         static_cast<sb4>(sizeof(OCILobLocator*)), nullptr, ind.data(),
                         static_cast<sb4>(sizeof(OCILob)));
     } else if constexpr (is_fixed_string_v<FieldT>) {
+        // A real indicator, not nullptr, even though this field isn't
+        // std::optional<FixedString<N>> -- Oracle can't store an empty
+        // VARCHAR2/CHAR value (it's always NULL on the way back too), so
+        // a plain FixedString<N> column can genuinely come back NULL with
+        // no optional<> wrapper involved at all. Without a real
+        // indicator here, a NULL row would silently keep whatever the
+        // batch buffer already held from a previous row -- see
+        // apply_one_column's matching branch below, which is what
+        // actually clears it back to empty.
+        auto& ind = indicators[I];
+        ind.assign(batch.size(), OCI_IND_NOTNULL);
         auto& first = boost::pfr::get<I>(batch[0]);
         stmt.bindOutput(position, oci_type_code_v<FieldT>, first.data(),
-                        static_cast<sb4>(FieldT::capacity), &first.length_ref(), nullptr,
+                        static_cast<sb4>(FieldT::capacity), &first.length_ref(), ind.data(),
                         static_cast<sb4>(sizeof(T)));
     } else {
         stmt.bindOutput(position, oci_type_code_v<FieldT>, &boost::pfr::get<I>(batch[0]),
@@ -224,20 +238,38 @@ void apply_one_column(std::vector<T>& batch, std::size_t row,
             if constexpr (is_oci_clob_v<FieldT>) field.text_data = bytes;
             else field.binary_data.assign(bytes.begin(), bytes.end());
         }
+    } else if constexpr (is_fixed_string_v<FieldT>) {
+        // A plain (non-optional) FixedString<N> field never has a
+        // staging slot -- its value already landed directly in
+        // batch[row] via bindOutput(), same as before. What's new is
+        // clearing it back to empty on NULL: without this, a NULL row
+        // would keep whatever a previous row (or the buffer's initial
+        // zero-fill) left in the same reused batch slot. Explicit
+        // clear(), not relying on Oracle to have zeroed length_ref()
+        // itself on a NULL fetch.
+        if (indicators[I][row] == OCI_IND_NULL) {
+            boost::pfr::get<I>(batch[row]).clear();
+        }
     }
 }
 
 // Skips entirely -- not just a no-op per field, the whole index_sequence
-// fold -- when T has no field this actually needs to do anything for
-// (every apply_one_column<I> call would be a no-op): a plain-scalar row
-// type (the common case: no optional, no LOB field at all) never needs a
-// post-fetch copy, since every field already landed directly in
-// batch[row] via bindOutput(). define_t<T> being all-std::monostate is
-// exactly that condition, checked once at compile time rather than
-// re-checked per field per row inside the loop this is called from.
+// fold -- when T has no field apply_one_column<I> would actually do
+// anything for: a plain-scalar row type (the common case: no optional,
+// no LOB, no FixedString<N> field at all) never needs a post-fetch copy,
+// since every field already landed directly in batch[row] via
+// bindOutput(). Checked once at compile time per field type rather than
+// inferred from define_t<T>'s own staging shape -- a plain FixedString<N>
+// field needs apply_one_column's NULL-clearing branch above but has no
+// staging slot of its own (its define_slot_t is std::monostate, same as
+// a plain scalar), so "does define_t<T> have a real slot for this field"
+// stopped being the same question as "does this field need apply()."
+template <typename FieldT>
+inline constexpr bool field_needs_apply_v = is_optional_v<FieldT> || is_oci_lob_v<FieldT> || is_fixed_string_v<FieldT>;
+
 template <typename T, std::size_t... I>
 constexpr bool needs_apply_loop_impl(std::index_sequence<I...>) {
-    return (!std::is_same_v<std::tuple_element_t<I, define_t<T>>, std::monostate> || ...);
+    return (field_needs_apply_v<boost::pfr::tuple_element_t<I, T>> || ...);
 }
 template <typename T>
 inline constexpr bool needs_apply_loop_v =
@@ -252,21 +284,46 @@ void apply_columns(std::vector<T>& batch, std::size_t row,
 
 // ---- select()'s positional, struct-free single-row define -----------------
 template <std::size_t I, typename... T>
-void define_one_positional_output(OciStatement& stmt, std::tuple<T&...>& outs) {
+void define_one_positional_output(OciStatement& stmt, std::tuple<T&...>& outs, std::vector<sb2>& indicators) {
     using Arg = std::remove_reference_t<std::tuple_element_t<I, std::tuple<T&...>>>;
     auto& out = std::get<I>(outs);
     constexpr ub4 position = I + 1;
     if constexpr (is_fixed_string_v<Arg>) {
+        // A real indicator here too, same reason as define_one_column's
+        // plain FixedString<N> branch: Oracle can't store/return an
+        // empty VARCHAR2/CHAR distinct from NULL, so this can come back
+        // NULL with no std::optional<FixedString<N>> involved at all --
+        // apply_positional_outputs below clears it back to empty rather
+        // than leaving whatever the caller's own buffer held before the
+        // call.
         stmt.bindOutput(position, oci_type_code_v<Arg>, out.data(), static_cast<sb4>(Arg::capacity),
-                        &out.length_ref(), nullptr);
+                        &out.length_ref(), &indicators[I]);
     } else {
         stmt.bindOutput(position, oci_type_code_v<Arg>, &out, sizeof(Arg), nullptr, nullptr);
     }
 }
 
 template <typename... T, std::size_t... I>
-void define_positional_outputs(OciStatement& stmt, std::tuple<T&...>& outs, std::index_sequence<I...>) {
-    (define_one_positional_output<I, T...>(stmt, outs), ...);
+void define_positional_outputs(OciStatement& stmt, std::tuple<T&...>& outs, std::vector<sb2>& indicators,
+                               std::index_sequence<I...>) {
+    (define_one_positional_output<I, T...>(stmt, outs, indicators), ...);
+}
+
+// After execute(1), clears any FixedString<N> positional output whose
+// indicator came back NULL -- see define_one_positional_output's comment.
+// A no-op for every other argument type (arithmetic/OciDate can't be
+// NULL through this path -- see positional_bindable's own restriction).
+template <std::size_t I, typename... T>
+void apply_one_positional_output(std::tuple<T&...>& outs, const std::vector<sb2>& indicators) {
+    using Arg = std::remove_reference_t<std::tuple_element_t<I, std::tuple<T&...>>>;
+    if constexpr (is_fixed_string_v<Arg>) {
+        if (indicators[I] == OCI_IND_NULL) std::get<I>(outs).clear();
+    }
+}
+
+template <typename... T, std::size_t... I>
+void apply_positional_outputs(std::tuple<T&...>& outs, const std::vector<sb2>& indicators, std::index_sequence<I...>) {
+    (apply_one_positional_output<I, T...>(outs, indicators), ...);
 }
 
 // Shared by both select_rows() overloads: defines OutT's columns as one
@@ -490,13 +547,23 @@ ExecResult select(OciConnection& conn, const std::string& sql, T&... outputs) {
     stmt.prepare(sql);
 
     std::tuple<T&...> outs(outputs...);
-    detail::define_positional_outputs(stmt, outs, std::index_sequence_for<T...>{});
+    std::vector<sb2> indicators(sizeof...(T), OCI_IND_NOTNULL);
+    detail::define_positional_outputs(stmt, outs, indicators, std::index_sequence_for<T...>{});
 
     // iters=1: for a SELECT, execute() itself fetches that many rows as
     // part of the same call -- no separate fetch() needed for exactly one
     // row. Zero matching rows comes back as OCI_NO_DATA directly from
-    // this call, classified Success (see docs/oci_statement_lifecycle_notes.md).
-    return stmt.execute(1);
+    // this call, classified Success (see docs/oci_statement_lifecycle_notes.md)
+    // -- and with no row actually fetched, indicators is never written to
+    // by OCI at all, so apply_positional_outputs only runs when a row
+    // genuinely came back (oci_status != OCI_NO_DATA), matching this
+    // function's own documented "arguments left untouched on zero rows"
+    // contract.
+    const ExecResult result = stmt.execute(1);
+    if (result.call.status != OCI_NO_DATA) {
+        detail::apply_positional_outputs(outs, indicators, std::index_sequence_for<T...>{});
+    }
+    return result;
 }
 
 template <scalar_bindable T>

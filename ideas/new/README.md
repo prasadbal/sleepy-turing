@@ -404,3 +404,59 @@ database; relaxing it to also accept `EndOfFetch` (same as the other
 two) fixed it. See `docs/oci_statement_lifecycle_notes.md` for the full
 writeup -- this is now confirmed at three separate call sites, not a
 one-off.
+
+### A plain `FixedString<N>` field is never `std::optional`, because Oracle already treats empty and NULL as the same thing
+
+Oracle's SQL engine can't store an empty `VARCHAR2`/`CHAR` value distinct
+from `NULL` -- inserting `''` always lands as `NULL`, and a query that
+matches a NULL column can't be told apart client-side from one that
+matched a genuinely empty string. `execute<T>()`/`select_rows<T>()`/
+`select<T...>()` all lean into that instead of fighting it: a plain
+(non-`optional`) `FixedString<N>` field binds a zero-length value as an
+explicit `NULL`, and fetches a `NULL` column back as `view().empty()`.
+`std::optional<FixedString<N>>` is rejected outright by `scalar_bindable`
+(`is_scalar_bindable_field_v` in `oci_client.h` deliberately checks
+`is_fixed_string_v<U>` only, not `is_fixed_string_v<optional_value_t<U>>`
+-- the same exclusion `is_oci_lob_v` already has, for the same reason):
+allowing it would mean two different ways to say the same thing (`{}` vs.
+an empty string) for one field, which is worse than just not allowing
+it. This mirrors how a LOB field is handled -- never wrapped in
+`optional<>`, its own presence/absence encoded some other way (a real
+indicator, always present, checked instead of inferred) -- rather than
+being a special case invented just for `FixedString<N>`.
+
+This closed a real, previously-latent gap, not just a nicety: a plain
+`FixedString<N>` output column used to define with **no indicator at
+all** (matching `ideas/binding`'s own comment on the same point -- "an
+unexpected NULL there silently leaves that row's slot holding whatever
+the batch buffer already had"). `select_rows()`'s array-of-struct batch
+fetch reuses the same one-row (or N-row) buffer across every
+`fetch()` call, so a NULL row landing in a slot a *previous* fetch call
+had already filled with real content would silently keep that stale
+value -- a real correctness bug, not a theoretical one.
+`examples/live_oracle_client_demo.cpp` verifies this exact scenario
+against a real database: row 202 (real content: `"Real"`) is fetched
+first into a one-row batch buffer (`fetch_batch_size = 1`, so the same
+buffer is genuinely reused call to call), then row 201 (a real SQL
+`NULL`) is fetched into that same buffer on the next call --
+
+```
+[OK] row 202 (fetched first) has its real content
+[OK] row 201 (SQL NULL, fetched second into the SAME reused buffer) is empty, not stale 'Real'
+[OK] row 200 (empty-string bind) fetched back as empty, not garbage
+```
+
+-- confirming the fix actually clears the field rather than merely
+happening to pass because a freshly-constructed buffer starts zeroed
+anyway. The same fix applies to `select()`'s positional `FixedString<N>`
+outputs (a real indicator now, cleared back to empty on NULL, and left
+untouched -- not even indicator-checked -- when the query matches zero
+rows at all, matching this function's existing "arguments untouched on
+`OCI_NO_DATA`" contract).
+
+Not extended to `insert_rows()`'s array-bind path: a per-row NULL there
+would need a per-row indicator computed from each row's own content
+length, not the single blanket `OCI_IND_NOTNULL` fill that path uses
+today (see its own file comment for why array-bind indicators can't be
+`nullptr` at all). Left as a known, narrower follow-up rather than
+bundled in here.
