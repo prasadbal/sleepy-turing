@@ -43,8 +43,20 @@ public:
     OciConnection(const OciConnection&) = delete;
     OciConnection& operator=(const OciConnection&) = delete;
 
+    // OCI_THREADED: this env (and every handle under it -- err_, svc_, every
+    // OciStatement built from this connection) will only ever be touched by
+    // the thread that calls connect(). That is a real requirement, not a
+    // hint: an OciConnection is never shared across threads (see the class
+    // comment above), so its OCIEnv must be created with the mode that
+    // tells Oracle to expect that, or a multi-threaded caller -- one
+    // OciConnection per thread, never shared, exactly how
+    // server_stats_demo's threaded mode uses this -- has unspecified
+    // behavior. Cannot be exercised against the mock (it ignores the mode
+    // flag entirely); reasoned from OCI's documented contract, not tested
+    // against a real multi-threaded Oracle session -- verify against a
+    // real client before relying on it.
     bool connect() {
-        if (OCIEnvCreate(&env_, OCI_DEFAULT, nullptr, nullptr, nullptr, nullptr, 0, nullptr) != OCI_SUCCESS) {
+        if (OCIEnvCreate(&env_, OCI_THREADED, nullptr, nullptr, nullptr, nullptr, 0, nullptr) != OCI_SUCCESS) {
             env_ = nullptr;
             return false;
         }

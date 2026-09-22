@@ -58,6 +58,8 @@ struct OCIDate { sb2 OCIDateYYYY = 0; unsigned char OCIDateMM = 0, OCIDateDD = 0
 // Values are internal to this mock -- they only need to be self-consistent,
 // since the mock and the real <oci.h> are never compiled together.
 #define OCI_DEFAULT       0
+#define OCI_THREADED      0x1 // env-create mode: this OCIEnv (and everything under it) will only ever be
+                               // touched by the one thread that created it -- see OciConnection::connect()
 #define OCI_OBJECT        0x2 // env-create mode needed for OCIType/OCIObjectNew/OCICollAppend (oci_collection_bind.h)
 #define OCI_HTYPE_ENV     1
 #define OCI_HTYPE_ERROR   2
@@ -119,10 +121,20 @@ namespace marketlib::db::oracle::mock {
 // of the opaque "fail every Nth call" trick the first draft of this used.
 enum class FailureMode { None, DisconnectThenRecover, ExecErrorAlways };
 
-inline std::atomic<FailureMode> g_mode{FailureMode::None};
-inline std::atomic<int> g_disconnects_remaining{0};
-inline std::atomic<int> g_execute_calls{0};
-inline std::atomic<int> g_last_iters{0}; // the `iters` OCIStmtExecute was last called with
+// thread_local, not merely inline: real OCI requires an OCIEnv created
+// OCI_THREADED to only ever be touched by the thread that created it (see
+// OciConnection::connect()), and this project's threading model is one
+// OciConnection per thread, never shared. Plain globals here would make
+// this mock diverge from that model -- two threads racing on g_fetch_row,
+// for instance -- for a case the real thing was never going to allow
+// anyway. thread_local reproduces the real per-thread-isolation guarantee
+// exactly, which is also what makes it possible to actually test the
+// threaded orchestration code (server_stats_demo's threaded mode) against
+// this mock instead of only reasoning about it.
+inline thread_local std::atomic<FailureMode> g_mode{FailureMode::None};
+inline thread_local std::atomic<int> g_disconnects_remaining{0};
+inline thread_local std::atomic<int> g_execute_calls{0};
+inline thread_local std::atomic<int> g_last_iters{0}; // the `iters` OCIStmtExecute was last called with
 
 inline void set_mode(FailureMode mode, int disconnect_count = 1) {
     g_mode = mode;
@@ -130,16 +142,15 @@ inline void set_mode(FailureMode mode, int disconnect_count = 1) {
 }
 
 // Every SQL text passed to OCIStmtPrepare, in order -- lets a test check which
-// statements a call actually issued. Plain globals, not atomics: like the rest
-// of this mock's state, one thread at a time.
-inline std::vector<std::string> g_sql_log;
+// statements a call actually issued.
+inline thread_local std::vector<std::string> g_sql_log;
 // When non-empty, executing a statement whose text contains this substring
 // fails with ORA-00942 (table or view does not exist), which is what a missing
 // grant on a V$ view looks like. Everything else keeps working, so a test can
 // exercise "one part of a report is unavailable, the rest is fine".
-inline std::string g_fail_on_sql;
-inline int g_fail_on_sql_code = 942; // ORA number reported instead, e.g. 2003 = invalid USERENV parameter
-inline bool g_last_execute_failed_on_sql = false;
+inline thread_local std::string g_fail_on_sql;
+inline thread_local int g_fail_on_sql_code = 942; // ORA number reported instead, e.g. 2003 = invalid USERENV parameter
+inline thread_local bool g_last_execute_failed_on_sql = false;
 inline void reset_sql_hooks() {
     g_sql_log.clear();
     g_fail_on_sql.clear();
@@ -159,22 +170,20 @@ struct MockDefine {
     // FixedString::length_ref() is what gets passed here.
     ub2* rlenp = nullptr; ub4 rlskip = 0;
 };
-inline std::vector<MockDefine> g_defines;
-inline int g_fetch_row = 0;
+inline thread_local std::vector<MockDefine> g_defines;
+inline thread_local int g_fetch_row = 0;
 inline constexpr int MOCK_ROW_COUNT = 3;
-inline std::atomic<int> g_last_rows_fetched{0}; // OCI_ATTR_ROWS_FETCHED after the last OCIStmtFetch2
+inline thread_local std::atomic<int> g_last_rows_fetched{0}; // OCI_ATTR_ROWS_FETCHED after the last OCIStmtFetch2
 
-// Mirrors real OCI's own OCI_ATTR_STMT_STATE -- a single global here
-// rather than genuinely per-handle, same simplification every other
-// piece of mock state in this file already makes (g_fetch_row, g_defines,
-// etc.): every demo uses one statement/cursor at a time, so a shared
-// global reproduces the real attribute's call-shape without needing an
-// actual per-handle registry.
-inline std::atomic<int> g_stmt_state{OCI_STMT_STATE_INITIALIZED};
+// Mirrors real OCI's own OCI_ATTR_STMT_STATE -- one instance per thread
+// rather than genuinely per-handle (every demo/test uses one statement/
+// cursor at a time per thread), same simplification every other piece of
+// mock state in this file already makes (g_fetch_row, g_defines, etc.).
+inline thread_local std::atomic<int> g_stmt_state{OCI_STMT_STATE_INITIALIZED};
 
 // Lets a demo inspect what indicator value the last execute()'s bind calls
 // set for each bind position -- 0 = OCI_IND_NOTNULL, -1 = OCI_IND_NULL.
-inline std::vector<sb2> g_last_bind_indicators;
+inline thread_local std::vector<sb2> g_last_bind_indicators;
 
 // Opt-in: when enabled, OCIStmtFetch2 (below) simulates a NULL on the *last*
 // defined column of every other fetched row, so query()'s NULL handling has
@@ -182,7 +191,7 @@ inline std::vector<sb2> g_last_bind_indicators;
 // nullable field has nowhere to put a simulated NULL (the column would just
 // silently keep the previous row's stale value), so only turn this on for a
 // query whose row type actually has an std::optional field in that position.
-inline std::atomic<bool> g_simulate_null_last_column{false};
+inline thread_local std::atomic<bool> g_simulate_null_last_column{false};
 inline void set_simulate_null_last_column(bool enabled) { g_simulate_null_last_column = enabled; }
 
 // ----------------------------------------------------------------------------

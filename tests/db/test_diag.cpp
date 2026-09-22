@@ -55,6 +55,40 @@ SessionStats stats_of(std::initializer_list<NamedValue> v, std::string sql_id = 
 } // namespace
 
 // ---------------------------------------------------------------------------
+// ServerInfo's name-lookup accessors (num_cpus(), sga_max_bytes(), ...): pure
+// logic on synthetic NamedValue lists, independent of the mock. The mock
+// can never exercise these for real -- it synthesizes "row0_col0" for every
+// column name whatever the SQL selects, so it can't produce a list containing
+// a real key like "NUM_CPUS" to look up. Only a real Oracle run (diag_demo)
+// checks the SQL is right; this only checks the lookup-by-name logic itself.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("ServerInfo accessors: find the right value by name when it's present", "[diag]") {
+    ServerInfo info;
+    info.os_stats = {{"NUM_CPUS", 16}, {"NUM_CPU_CORES", 8}, {"PHYSICAL_MEMORY_BYTES", 68719476736}}; // 64 GiB
+    info.sga = {{"Maximum SGA Size", 17179869184}}; // 16 GiB
+    info.pga = {{"total PGA allocated", 2147483648}}; // 2 GiB
+    info.parameters = {{"cpu_count", "16"}, {"pga_aggregate_target", "8192M"}};
+
+    REQUIRE(info.num_cpus().has_value());
+    CHECK(*info.num_cpus() == 16);
+    REQUIRE(info.num_cpu_cores().has_value());
+    CHECK(*info.num_cpu_cores() == 8);
+    REQUIRE(info.physical_memory_bytes().has_value());
+    CHECK(*info.physical_memory_bytes() == 68719476736.0);
+    REQUIRE(info.sga_max_bytes().has_value());
+    CHECK(*info.sga_max_bytes() == 17179869184.0);
+    REQUIRE(info.pga_allocated_bytes().has_value());
+    CHECK(*info.pga_allocated_bytes() == 2147483648.0);
+
+    // A name that isn't present, and a name that's a prefix/suffix of a real
+    // one, are both correctly absent -- not a partial/fuzzy match.
+    CHECK_FALSE(find_value(info.os_stats, "NUM_CPU").has_value());
+    CHECK_FALSE(find_value(info.os_stats, "NUM_CPUS_EXTRA").has_value());
+    CHECK_FALSE(find_value(info.sga, "Maximum SGA").has_value());
+}
+
+// ---------------------------------------------------------------------------
 // server_info
 // ---------------------------------------------------------------------------
 

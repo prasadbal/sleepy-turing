@@ -62,6 +62,7 @@ foreach(example
         demo
         demo_client
         diag_demo
+        server_stats_demo
         live_oracle_demo
         live_oracle_client_demo
         live_oracle_empty_table_demo
@@ -69,3 +70,10 @@ foreach(example
     add_executable(db_${example} examples/${example}.cpp)
     target_link_libraries(db_${example} PRIVATE core_db)
 endforeach()
+
+# server_stats_demo runs one std::jthread per server -- needs the platform
+# threading library; core_db itself doesn't (nothing else here threads).
+if(UNIX AND NOT APPLE)
+    find_package(Threads REQUIRED)
+    target_link_libraries(db_server_stats_demo PRIVATE Threads::Threads)
+endif()
