@@ -63,6 +63,7 @@ foreach(example
         demo_client
         diag_demo
         server_stats_demo
+        query_descriptor_demo
         live_oracle_demo
         live_oracle_client_demo
         live_oracle_empty_table_demo
