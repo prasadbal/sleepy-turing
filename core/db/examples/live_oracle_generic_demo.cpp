@@ -3,17 +3,18 @@
 // conversion -- oci_client.h). Prints exactly what Oracle describes and
 // hands back, unconverted.
 //
-//   g++ -std=c++20 -O2 -I <repo>/ideas/new/include -I <INSTANT_CLIENT>/sdk/include \
-//       -I <BOOST_ROOT> examples/live_oracle_generic_demo.cpp \
-//       -L <INSTANT_CLIENT> -lclntsh -o live_oracle_generic_demo
-//   LD_LIBRARY_PATH=<INSTANT_CLIENT> ./live_oracle_generic_demo <connect_string> <user> <password>
+// Builds as the db_live_oracle_generic_demo target; needs a real Oracle client
+// configured (see live_oracle_demo.cpp for the cmake -D options), then:
+//
+//   cmake --build build/linux-release --target db_live_oracle_generic_demo
+//   LD_LIBRARY_PATH=<INSTANT_CLIENT> build/linux-release/core/db/db_live_oracle_generic_demo <connect_string> <user> <password>
 #include <cstdio>
 #include <cstring>
 
-#include "binding/oci_client.h"
-#include "binding/oci_connection.h"
+#include <db/oracle/oci_client.h>
+#include <db/oracle/oci_connection.h>
 
-using namespace binding;
+using namespace marketlib::db::oracle;
 
 namespace {
 int g_failures = 0;

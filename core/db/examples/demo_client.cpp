@@ -4,10 +4,10 @@
 #include <optional>
 #include <vector>
 
-#include "binding/oci_client.h"
-#include "binding/oci_connection.h"
+#include <db/oracle/oci_client.h>
+#include <db/oracle/oci_connection.h>
 
-using namespace binding;
+using namespace marketlib::db::oracle;
 
 int main() {
     OciConnection conn("mockdb", "user", "pass");

@@ -7,8 +7,8 @@
 // including both would collide.
 #if __has_include(<oci.h>)
     #include <oci.h>
-    #define BINDING_HAS_REAL_OCI 1
+    #define MARKETLIB_DB_HAS_REAL_OCI 1
 #else
-    #include "binding/oci_mock.h"
-    #define BINDING_HAS_REAL_OCI 0
+    #include <db/oracle/oci_mock.h>
+    #define MARKETLIB_DB_HAS_REAL_OCI 0
 #endif

@@ -1,8 +1,7 @@
-// Demo for the new call_oci/OciHandleGuard/OciStatement architecture
-// (ideas/new) -- built against the mock OCI backend (binding/oci_mock.h,
-// shared with ideas/binding) since there's no real Oracle client in this
-// environment. See examples/live_oracle_demo.cpp for the real-database
-// verification.
+// Demo for the call_oci/OciHandleGuard/OciStatement architecture -- built
+// against the mock OCI backend (db/oracle/oci_mock.h) unless a real Oracle
+// client is configured (see core/db/README.md). See live_oracle_demo.cpp for
+// the real-database verification.
 //
 //   1. connect/disconnect using OCIHandleGuard-managed handles.
 //   2. execute() with no bind -- DDL/literal DML.
@@ -27,12 +26,12 @@
 #include <string>
 #include <vector>
 
-#include "binding/oci_connection.h"
-#include "binding/oci_lob.h"
-#include "binding/oci_log.h"
-#include "binding/oci_statement.h"
+#include <db/oracle/oci_connection.h>
+#include <db/oracle/oci_lob.h>
+#include <db/oracle/oci_log.h>
+#include <db/oracle/oci_statement.h>
 
-using namespace binding;
+using namespace marketlib::db::oracle;
 
 namespace {
 const char* status_name(ExecStatus s) {
@@ -138,12 +137,12 @@ int main() {
         stmt.prepare("SELECT trade_id FROM empty_table");
         int trade_id = -1;
         stmt.bindOutput(1, SQLT_INT, &trade_id, sizeof(trade_id), nullptr, nullptr);
-        binding::mock::g_fetch_row = binding::mock::MOCK_ROW_COUNT; // simulate an already-exhausted result set
+        marketlib::db::oracle::mock::g_fetch_row = marketlib::db::oracle::mock::MOCK_ROW_COUNT; // simulate an already-exhausted result set
         auto r = stmt.execute(1);
         std::printf("status=%s oci_status=%d (OCI_NO_DATA=%d) state=%s\n\n",
                     status_name(r.status), r.call.status, OCI_NO_DATA,
                     stmt.state() == OciStatement::State::EndOfFetch ? "EndOfFetch" : "other");
-        binding::mock::g_fetch_row = 0; // reset for anything running after this demo
+        marketlib::db::oracle::mock::g_fetch_row = 0; // reset for anything running after this demo
     }
 
     std::printf("--- Demo 8: OCILob -- create temporary, write, read back ---\n");

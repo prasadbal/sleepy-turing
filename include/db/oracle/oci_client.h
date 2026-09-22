@@ -1,10 +1,10 @@
 #pragma once
 // The reflection layer ideas/binding has (oci_client.h there) and
-// ideas/new was missing until now: execute()/select_rows()/select()/
+// db/oracle was missing until now: execute()/select_rows()/select()/
 // insert_rows(), each walking a plain C++ struct via boost::pfr the same
 // way ideas/binding's do. The difference is what they're built on top
 // of -- ideas/binding's version talks to raw OCI calls directly; this
-// one drives binding::OciStatement (oci_statement.h), so it gets that
+// one drives marketlib::db::oracle::OciStatement (oci_statement.h), so it gets that
 // class's state checking, call_oci-based error retrieval, and the
 // OCI_ATTR_STMT_STATE-driven lifecycle for free, all in one place,
 // instead of duplicating any of it here.
@@ -35,10 +35,10 @@
 // same entry point again -- nothing here does that automatically.
 //
 // Implementation in details/oci_client.h.
-#include "binding/oci_datetime.h"
-#include "binding/oci_fixed_string.h"
-#include "binding/oci_lob.h"
-#include "binding/oci_statement.h"
+#include <db/oracle/oci_datetime.h>
+#include <db/oracle/oci_fixed_string.h>
+#include <db/oracle/oci_lob.h>
+#include <db/oracle/oci_statement.h>
 
 #include <boost/pfr.hpp>
 #include <cstddef>
@@ -48,7 +48,7 @@
 #include <type_traits>
 #include <vector>
 
-namespace binding {
+namespace marketlib::db::oracle {
 
 // ----------------------------------------------------------------------------
 // optional_value_t<U>: void if U isn't std::optional<something>, else the
@@ -67,7 +67,7 @@ template <typename U> inline constexpr bool is_optional_v = !std::is_void_v<opti
 // ----------------------------------------------------------------------------
 template <typename T> struct OciTypeBinder {
     static_assert(sizeof(T) == 0,
-                  "binding: no OCI type code for this field type -- oci_client.h only supports "
+                  "db: no OCI type code for this field type -- oci_client.h only supports "
                   "arithmetic fields (or optional<arithmetic> for a nullable one)");
 };
 template <> struct OciTypeBinder<short>              { static constexpr ub2 type_code = SQLT_INT; };
@@ -95,7 +95,7 @@ template <typename T> inline constexpr ub2 oci_type_code_v = oci_type_code_of<st
 // std::optional<U> of the first three to mark it nullable. Checked directly
 // against boost::pfr's own tuple_element_t rather than a shared field-
 // walker helper (ideas/binding's reflect.h, MSVC-safe struct_field_auditor)
-// -- not pulled in here since nothing else in ideas/new needs it yet.
+// -- not pulled in here since nothing else in db/oracle needs it yet.
 // ----------------------------------------------------------------------------
 namespace detail {
 template <typename U>
@@ -178,7 +178,7 @@ concept positional_bindable = std::is_arithmetic_v<T> || is_fixed_string_v<T> ||
 // reference, bound positionally. See ideas/binding's oci_client.h for the
 // full rationale (identical here) -- e.g.
 //   long long count;
-//   auto r = binding::select(conn, "SELECT COUNT(*) FROM t", count);
+//   auto r = marketlib::db::oracle::select(conn, "SELECT COUNT(*) FROM t", count);
 template <positional_bindable... T>
 ExecResult select(OciConnection& conn, const std::string& sql, T&... outputs);
 
@@ -236,6 +236,6 @@ ExecResult select_generic(OciConnection& conn, const std::string& sql,
 template <scalar_bindable T>
 ExecResult insert_rows(OciConnection& conn, const std::string& sql, std::vector<T>& rows, std::size_t chunk_size);
 
-} // namespace binding
+} // namespace marketlib::db::oracle
 
-#include "binding/details/oci_client.h"
+#include <db/oracle/details/oci_client.h>

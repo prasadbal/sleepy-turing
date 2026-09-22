@@ -5,7 +5,7 @@
 // OciStatement instead of raw OCI calls; LOB staging is OCILob objects,
 // not raw OCILobLocator* plus hand-rolled alloc/free). Not meant to be
 // included directly.
-#include "binding/oci_client.h"
+#include <db/oracle/oci_client.h>
 
 #include <algorithm>
 #include <optional>
@@ -15,7 +15,7 @@
 #include <variant>
 #include <vector>
 
-namespace binding {
+namespace marketlib::db::oracle {
 namespace detail {
 
 // ---- IN: bind a struct's fields by name ------------------------------------
@@ -588,4 +588,4 @@ ExecResult insert_rows(OciConnection& conn, const std::string& sql, std::vector<
     return result;
 }
 
-} // namespace binding
+} // namespace marketlib::db::oracle

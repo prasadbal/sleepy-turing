@@ -1,44 +1,35 @@
-// Real-database verification for the new call_oci/OciHandleGuard/
-// OciStatement/OCILob architecture (ideas/new) -- the mock-based
-// examples/demo.cpp exercises the same call shapes, but only a real
-// database proves the actual OCI semantics this design depends on:
-// iters>0 fetching during execute, OCI_NO_DATA on a genuinely empty
-// result, state violations being caught before a real (confusing)
-// ORA-##### ever has a chance to occur, and a real LOB round-trip.
+// Real-database verification for the call_oci/OciHandleGuard/OciStatement/
+// OCILob architecture -- the mock-based demo.cpp exercises the same call
+// shapes, but only a real database proves the actual OCI semantics this
+// design depends on: iters>0 fetching during execute, OCI_NO_DATA on a
+// genuinely empty result, state violations being caught before a real
+// (confusing) ORA-##### ever has a chance to occur, and a real LOB
+// round-trip.
 //
-// Not part of any CMake build; compile directly:
+// Builds as the db_live_oracle_demo target. Against the OCI mock it compiles
+// but cannot do anything useful -- configure with a real Oracle client first:
 //
-//   g++ -std=c++20 -O2 -I <repo>/ideas/new/include -I <INSTANT_CLIENT>/sdk/include \
-//       ideas/new/examples/live_oracle_demo.cpp \
-//       -L <INSTANT_CLIENT> -Wl,-rpath-link,<INSTANT_CLIENT> -Wl,-rpath,<INSTANT_CLIENT> \
-//       -lclntsh -o live_oracle_demo_new
-//   LD_LIBRARY_PATH=<INSTANT_CLIENT> ./live_oracle_demo_new <connect_string> <username> <password>
+//   cmake --preset linux-release -DORACLE_OCI_INCLUDE_DIR=<INSTANT_CLIENT>/sdk/include -DORACLE_OCI_LIBRARY=<INSTANT_CLIENT>/libclntsh.so
+//   cmake --build build/linux-release --target db_live_oracle_demo
+//   LD_LIBRARY_PATH=<INSTANT_CLIENT> build/linux-release/core/db/db_live_oracle_demo <connect_string> <username> <password>
 
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
 
-#include "binding/oci_connection.h"
-#include "binding/oci_lob.h"
-#include "binding/oci_log.h"
-#include "binding/oci_statement.h"
+#include <db/oracle/oci_connection.h>
+#include <db/oracle/oci_lob.h>
+#include <db/oracle/oci_log.h>
+#include <db/oracle/oci_statement.h>
 
-using namespace binding;
+using namespace marketlib::db::oracle;
 
 namespace {
 int g_failures = 0;
 void check(bool cond, const char* what) {
     std::printf("  [%s] %s\n", cond ? "OK" : "FAIL", what);
     if (!cond) ++g_failures;
-}
-const char* status_name(ExecStatus s) {
-    switch (s) {
-        case ExecStatus::Success:        return "Success";
-        case ExecStatus::ConnectionLost: return "ConnectionLost";
-        case ExecStatus::QueryError:     return "QueryError";
-    }
-    return "?";
 }
 } // namespace
 

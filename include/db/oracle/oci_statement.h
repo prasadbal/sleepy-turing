@@ -48,17 +48,17 @@
 // only, which is why it has no such restriction and can be called
 // between prepare() and execute() like bindName().
 
-#include "binding/oci_call.h"
-#include "binding/oci_connection.h"
-#include "binding/oci_handle_guard.h"
-#include "binding/oci_log.h"
+#include <db/oracle/oci_call.h>
+#include <db/oracle/oci_connection.h>
+#include <db/oracle/oci_handle_guard.h>
+#include <db/oracle/oci_log.h>
 
 #include <cctype>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-namespace binding {
+namespace marketlib::db::oracle {
 
 // One result-set column's real, described metadata -- name, 1-based
 // OCIDefineByPos position, the OCI type code Oracle itself reports for
@@ -188,7 +188,7 @@ public:
     // a small result set can already be "done" as far as the server is
     // concerned before a caller has defined anywhere to put the data.
     // Confirmed by a real select_rows()-shaped caller in
-    // ideas/new/examples/live_oracle_client_demo.cpp throwing here the
+    // core/db/examples/live_oracle_client_demo.cpp throwing here the
     // first time this ran against a live database with only 2 real rows
     // and prefetch_rows=10 -- see docs/oci_statement_lifecycle_notes.md.
     // rlskip is the stride between one row's outsize/rlenp entry and the
@@ -439,4 +439,4 @@ private:
     std::string params_log_;
 };
 
-} // namespace binding
+} // namespace marketlib::db::oracle

@@ -1,17 +1,81 @@
-# binding (new architecture)
+# db
 
-A from-scratch OCI wrapper built around three ideas that came out of
-working on `ideas/binding` and hitting real OCI errors that a
-reflection-based, free-function design doesn't have a natural place to
-prevent: centralized error retrieval (`call_oci`), generic handle
-ownership (`OciHandleGuard`), and an explicit, enforced statement
-lifecycle (`OciStatement`). Where `ideas/binding` infers everything from
-a caller's own C++ struct via `boost::pfr`, this is the lower layer --
-type-erased, position/name given explicitly by the caller, no reflection
-at all. The two aren't competing designs so much as different altitudes:
-this is closer to what `ideas/binding`'s `bind_one_param`/
-`define_one_column` are built out of underneath, made into its own
-reusable thing.
+The database layer. Today that is one backend, Oracle, under
+`include/db/oracle/` (namespace `marketlib::db::oracle`); the module is named
+`db` and the backend a subdirectory because a second backend is expected
+later (see "Where this is heading" below).
+
+Building and testing, from the repo root (header-only, so `core_db` is an
+`INTERFACE` library):
+
+```
+cmake --preset linux-debug
+cmake --build build/linux-debug --target test_db
+cd build/linux-debug/tests && ctest -R db    # ctest is run from tests/ in this project
+```
+
+By default this builds against the OCI **mock** (`oci_mock.h`), and the
+configure step says so (`db: no Oracle client configured ...`). To build
+against a real Oracle client, pass both `-DORACLE_OCI_INCLUDE_DIR=<instant
+client>/sdk/include` and `-DORACLE_OCI_LIBRARY=<instant client>/libclntsh.so`.
+`tests/db` asserts the mock's canned data and skips itself against a real
+client; the `live_oracle_*` examples are the real-database checks. That
+real-client path in CMake has not been exercised: no Oracle client was
+available on the machine this module was moved on. The demos below were
+verified against a real database, but were built by hand before being moved
+under CMake.
+
+The db layer throws on failure, unlike the rest of `core/` (no-exceptions,
+`std::expected`) -- see the comment in `CMakeLists.txt` for why it doesn't link
+`core_options`, and why that is acceptable for a non-hot-path component.
+
+Header paths below are under `include/db/oracle/` at the repo root; `examples/`
+and `docs/` are relative to this directory.
+
+## Where this is heading
+
+There are two altitudes here, and they are not yet separate in the source tree.
+
+**Lower layer** -- `OciStatement`, `OciConnection`, `call_oci`, `OciHandleGuard`,
+`OCILob`: type-erased, position/name given explicitly by the caller, no
+reflection at all. This is the Oracle backend proper.
+
+**Upper layer** -- `oci_client.h` (`execute`/`select_rows`/`select`/
+`insert_rows`): walks a caller's own C++ struct via `boost::pfr` and drives the
+lower layer, so a struct *is* the schema.
+
+The intent is for the upper layer to become backend-neutral -- a `db/binding`
+written once against a backend interface -- with Oracle as the first
+implementation of that interface and something like Postgres as a later one.
+It is **not** there yet, and moving files would not get it there: the upper
+layer is welded to Oracle at four specific points.
+
+1. `OciTypeBinder<T>::type_code` maps C++ field types straight to `SQLT_*` OCI
+   type codes.
+2. Every entry point takes `OciConnection&`.
+3. Every entry point returns Oracle's `ExecResult`/`ExecStatus`.
+4. The field types it accepts include Oracle value types (`OciDate`,
+   `OciClob`/`OciBlob`, `FixedString<N>`).
+
+Extracting the interface means replacing (1) with a backend-neutral type tag that
+each backend maps to its own codes, and (2)-(4) with what the interface
+provides. That needs real decisions -- the neutral type set, the error model,
+who owns the connection -- so it is deliberately its own step.
+
+## History
+
+Built around three ideas that came out of working on the older, all-in-one tree
+still at `ideas/binding` (which also holds the config-binding half, and remains
+there) and hitting real OCI errors that a reflection-based, free-function design
+doesn't have a natural place to prevent: centralized error retrieval
+(`call_oci`), generic handle ownership (`OciHandleGuard`), and an explicit,
+enforced statement lifecycle (`OciStatement`). Where `ideas/binding` infers
+everything from a caller's own C++ struct via `boost::pfr`, the lower layer here
+is type-erased, position/name given explicitly by the caller, no reflection at
+all. The two aren't competing designs so much as different altitudes: this is
+closer to what `ideas/binding`'s `bind_one_param`/`define_one_column` are built
+out of underneath, made into its own reusable thing. References to
+`ideas/binding` throughout this document are to that older tree.
 
 ## Why this exists
 
@@ -34,13 +98,13 @@ where this was first written up) for the full story.
 
 ## Layout
 
-- `include/binding/oci_compat.h`, `include/binding/oci_mock.h` -- copied
-  unchanged from `ideas/binding`: picks the real `<oci.h>` when available,
-  otherwise the mock. Both directories share the exact same mock, so a
-  bug fixed in one is fixed in both, and there's one shared source of
-  truth for "how does the mock simulate OCI" rather than two drifting
-  copies.
-- `include/binding/oci_call.h` -- `call_oci(func, args...)`: calls any
+- `include/db/oracle/oci_compat.h`, `include/db/oracle/oci_mock.h` -- picks
+  the real `<oci.h>` when available, otherwise the mock. These began as copies
+  of `ideas/binding`'s and are now their own, diverged copies (different
+  namespace, `MARKETLIB_DB_HAS_REAL_OCI` rather than `BINDING_HAS_REAL_OCI`), so
+  a fix to the mock's OCI simulation in one tree is not automatically in the
+  other. `ideas/binding` is the older tree and is not expected to change much.
+- `include/db/oracle/oci_call.h` -- `call_oci(func, args...)`: calls any
   OCI function, and whenever the returned status isn't `OCI_SUCCESS`,
   finds the `OCIError*` already present somewhere in `args...` (every OCI
   function takes one) and retrieves whatever `OCIErrorGet` has to offer.
@@ -51,7 +115,7 @@ where this was first written up) for the full story.
   different depending on which function returned it, and that
   interpretation belongs to whoever's calling `call_oci` for that
   specific operation, not to `call_oci` itself.
-- `include/binding/oci_handle_guard.h` -- `OciHandleGuard<HandleType,
+- `include/db/oracle/oci_handle_guard.h` -- `OciHandleGuard<HandleType,
   HandleTypeEnum>`, one generic RAII wrapper for every OCI handle kind,
   plus the six aliases (`OCIEnvHandle`, `OCIErrorHandle`,
   `OCIServerHandle`, `OCISvcCtxHandle`, `OCISessionHandle`,
@@ -63,7 +127,7 @@ where this was first written up) for the full story.
   the manual `OCIServerAttach`/`OCISessionBegin`/`OCI_ATTR_SESSION`
   sequence right (a codebase *not* using `OCILogon2`'s shortcut) is
   exactly what produced the real `ORA-24324` mentioned above.
-- `include/binding/oci_connection.h` -- `OciConnection` (connect via
+- `include/db/oracle/oci_connection.h` -- `OciConnection` (connect via
   `OCIEnvCreate`+`OCILogon2`, `OCIErrorHandle` for the error handle) plus
   `OciConnection::classify(OciCallResult)`, which turns a raw `call_oci`
   result into `Success`/`ConnectionLost`/`QueryError` using this
@@ -80,7 +144,7 @@ where this was first written up) for the full story.
   number already says that. `status < 0` reads that convention directly
   instead of re-deriving it as a per-code allowlist that a status this
   codebase hasn't specifically seen yet would fall through incorrectly.
-- `include/binding/oci_statement.h` -- `OciStatement`: a statement handle
+- `include/db/oracle/oci_statement.h` -- `OciStatement`: a statement handle
   with an explicit state enum (`Unprepared -> Prepared -> Executed ->
   EndOfFetch`) and `prepare()`/`bindName()`/`bindNameArray()`/
   `bindOutput()`/`execute()`/`fetch()`/`describeColumnPosition()`/
@@ -142,14 +206,14 @@ where this was first written up) for the full story.
     `docs/oci_statement_lifecycle_notes.md` for both real crashes this
     produced and the fix (a batch loop must stop on the individual
     `fetch()` call's own `OCI_NO_DATA`, not on `state() == EndOfFetch`).
-- `include/binding/oci_log.h` -- `set_statement_logger(logger)`: opt-in,
+- `include/db/oracle/oci_log.h` -- `set_statement_logger(logger)`: opt-in,
   off by default. `OciStatement::execute()` logs the SQL text plus every
   `bindName()`'d value (rendered via `render_typed_value()`, which
   switches on the *runtime* `SQLT_*` code -- there's no C++ type to
   dispatch on on this type-erased layer -- covering integer widths,
   float/double, a character buffer, and `OciDate` via a real
   `OCIDateToText` call) as one line per `execute()` call.
-- `include/binding/oci_lob.h` -- `OCILob`: the LOB *locator* lifecycle
+- `include/db/oracle/oci_lob.h` -- `OCILob`: the LOB *locator* lifecycle
   (`OCIDescriptorAlloc`, `OCILobCreateTemporary`/`OCILobWrite2` on the way
   in, `OCILobGetLength2`/`OCILobRead2` on the way out, all the frees)
   as its own owned object, plus `OciClob`/`OciBlob`, the user-facing
@@ -159,10 +223,10 @@ where this was first written up) for the full story.
   layer is what actually constructs an `OCILob` (transiently, once per
   bind or once per fetched row) and copies bytes in and out of these --
   see that file's own comment for how that staging works.
-- `include/binding/oci_fixed_string.h`, `oci_datetime.h` -- `FixedString<N>`
+- `include/db/oracle/oci_fixed_string.h`, `oci_datetime.h` -- `FixedString<N>`
   and `OciDate`, ported unchanged from `ideas/binding` (both are already
   self-contained, needing only `oci_compat.h`/`oci_connection.h`).
-- `include/binding/oci_client.h` (+ `details/oci_client.h`) -- the
+- `include/db/oracle/oci_client.h` (+ `details/oci_client.h`) -- the
   reflection layer `ideas/binding` has (`execute()`/`select_rows()`/
   `select()`/`insert_rows()`, each walking a plain struct via
   `boost::pfr`), rebuilt to drive `OciStatement` instead of raw OCI
@@ -213,8 +277,10 @@ where this was first written up) for the full story.
   `live_oracle_generic_demo.cpp` -- the same shapes (`OciStatement`
   directly, `oci_client.h`'s struct-based functions, and
   `select_generic()` respectively), verified against a real database.
-  Not part of any CMake build; compile directly (see each file's own
-  header comment).
+  Built as the `db_live_oracle_*` targets (against the mock unless a real
+  client is configured -- see the top of this file), so API drift shows up at
+  compile time; they need a real client and a reachable database to *run*.
+  Each file's own header comment has the exact run command.
 - `examples/live_oracle_empty_table_demo.cpp` -- a genuinely empty table
   (zero rows, not just zero *matching* rows) reaches `EndOfFetch` during
   `execute(0)` itself, guaranteed rather than conditional on

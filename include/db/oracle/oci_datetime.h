@@ -5,8 +5,8 @@
 #include <string_view>
 #include <type_traits>
 
-#include "binding/oci_compat.h"
-#include "binding/oci_connection.h"
+#include <db/oracle/oci_compat.h>
+#include <db/oracle/oci_connection.h>
 
 // ============================================================================
 // OciDate/OciTimestamp used to have a second, parallel way to get a value
@@ -26,7 +26,7 @@
 // constructor/to_string() did, just through the real interpreter now.
 // ============================================================================
 
-namespace binding {
+namespace marketlib::db::oracle {
 
 // Oracle DATE column -- year/month/day/hour/minute/second (Oracle's DATE
 // type always carries a time-of-day, even when only the calendar date
@@ -107,7 +107,7 @@ public:
             language.empty() ? nullptr : reinterpret_cast<const ::text*>(language.data()),
             static_cast<ub4>(language.size()), &result.raw_);
         if (status != OCI_SUCCESS) {
-            throw std::runtime_error("binding: OCIDateFromText failed parsing '" + std::string(value) +
+            throw std::runtime_error("db: OCIDateFromText failed parsing '" + std::string(value) +
                                      "' against format '" + std::string(fmt) + "'");
         }
         return result;
@@ -125,7 +125,7 @@ public:
             language.empty() ? nullptr : reinterpret_cast<const ::text*>(language.data()),
             static_cast<ub4>(language.size()), &buf_size, buf.data());
         if (status != OCI_SUCCESS) {
-            throw std::runtime_error("binding: OCIDateToText failed rendering against format '" +
+            throw std::runtime_error("db: OCIDateToText failed rendering against format '" +
                                      std::string(fmt) + "'");
         }
         return std::string(reinterpret_cast<const char*>(buf.data()), buf_size);
@@ -144,7 +144,7 @@ private:
             // (e.g. set_default_format("")) -- the seed value below means
             // this never fires from a fresh, unconfigured state.
             throw std::runtime_error(
-                "binding: OciDate::from_text/to_text needs a format -- pass one explicitly, "
+                "db: OciDate::from_text/to_text needs a format -- pass one explicitly, "
                 "or call OciDate::set_default_format(...) to restore a default");
         }
         return default_format_storage();
@@ -235,7 +235,7 @@ public:
 
         OCIDateTime* temp = nullptr;
         if (OCIDescriptorAlloc(conn.env(), reinterpret_cast<void**>(&temp), OCI_DTYPE_TIMESTAMP, 0, nullptr) != OCI_SUCCESS) {
-            throw std::runtime_error("binding: OCIDescriptorAlloc(OCI_DTYPE_TIMESTAMP) failed");
+            throw std::runtime_error("db: OCIDescriptorAlloc(OCI_DTYPE_TIMESTAMP) failed");
         }
 
         sword status = OCIDateTimeFromText(conn.env(), conn.err(),
@@ -251,7 +251,7 @@ public:
         OCIDescriptorFree(reinterpret_cast<void*>(temp), OCI_DTYPE_TIMESTAMP);
 
         if (status != OCI_SUCCESS) {
-            throw std::runtime_error("binding: OCIDateTimeFromText failed parsing '" + std::string(value) +
+            throw std::runtime_error("db: OCIDateTimeFromText failed parsing '" + std::string(value) +
                                      "' against format '" + std::string(fmt) + "'");
         }
         return OciTimestamp(year, month, day, hour, minute, second);
@@ -266,7 +266,7 @@ public:
 
         OCIDateTime* temp = nullptr;
         if (OCIDescriptorAlloc(conn.env(), reinterpret_cast<void**>(&temp), OCI_DTYPE_TIMESTAMP, 0, nullptr) != OCI_SUCCESS) {
-            throw std::runtime_error("binding: OCIDescriptorAlloc(OCI_DTYPE_TIMESTAMP) failed");
+            throw std::runtime_error("db: OCIDescriptorAlloc(OCI_DTYPE_TIMESTAMP) failed");
         }
 
         sword status = OCIDateTimeConstruct(conn.env(), conn.err(), temp,
@@ -283,7 +283,7 @@ public:
         OCIDescriptorFree(reinterpret_cast<void*>(temp), OCI_DTYPE_TIMESTAMP);
 
         if (status != OCI_SUCCESS) {
-            throw std::runtime_error("binding: OCIDateTimeToText failed rendering against format '" +
+            throw std::runtime_error("db: OCIDateTimeToText failed rendering against format '" +
                                      std::string(fmt) + "'");
         }
         return std::string(reinterpret_cast<const char*>(buf.data()), buf_size);
@@ -296,7 +296,7 @@ private:
             // Only reachable if a caller explicitly cleared the default --
             // see OciDate::resolve_format's identical comment above.
             throw std::runtime_error(
-                "binding: OciTimestamp::from_text/to_text needs a format -- pass one explicitly, "
+                "db: OciTimestamp::from_text/to_text needs a format -- pass one explicitly, "
                 "or call OciTimestamp::set_default_format(...) to restore a default");
         }
         return default_format_storage();
@@ -313,4 +313,4 @@ private:
 template <typename T>
 inline constexpr bool is_oci_datetime_v = std::is_same_v<T, OciTimestamp>;
 
-} // namespace binding
+} // namespace marketlib::db::oracle

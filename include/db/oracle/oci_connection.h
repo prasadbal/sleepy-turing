@@ -10,14 +10,14 @@
 // OCIHandleFree(ENV), OCILogon2/OCILogoff). err_ genuinely is a plain
 // OCIHandleAlloc handle, so it uses OCIErrorHandle.
 
-#include "binding/oci_call.h"
-#include "binding/oci_handle_guard.h"
+#include <db/oracle/oci_call.h>
+#include <db/oracle/oci_handle_guard.h>
 
 #include <array>
 #include <optional>
 #include <string>
 
-namespace binding {
+namespace marketlib::db::oracle {
 
 enum class ExecStatus { Success, ConnectionLost, QueryError };
 
@@ -138,4 +138,4 @@ private:
     bool connected_ = false;
 };
 
-} // namespace binding
+} // namespace marketlib::db::oracle

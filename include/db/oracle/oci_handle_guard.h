@@ -23,9 +23,9 @@
 // being unusable. See docs/oci_statement_lifecycle_notes.md (copied from
 // ideas/binding, still accurate here) for the full story.
 
-#include "binding/oci_compat.h"
+#include <db/oracle/oci_compat.h>
 
-namespace binding {
+namespace marketlib::db::oracle {
 
 template <typename HandleType, ub4 HandleTypeEnum>
 class OciHandleGuard {
@@ -70,4 +70,4 @@ using OCISvcCtxHandle  = OciHandleGuard<OCISvcCtx,  OCI_HTYPE_SVCCTX>;
 using OCISessionHandle = OciHandleGuard<OCISession, OCI_HTYPE_SESSION>;
 using OCIStmtHandle    = OciHandleGuard<OCIStmt,    OCI_HTYPE_STMT>;
 
-} // namespace binding
+} // namespace marketlib::db::oracle

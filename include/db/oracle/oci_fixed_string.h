@@ -5,7 +5,7 @@
 #include <string_view>
 #include <type_traits>
 
-#include "binding/oci_compat.h"
+#include <db/oracle/oci_compat.h>
 
 // ============================================================================
 // A fixed-capacity character buffer, for binding/defining a CHAR(N) or
@@ -18,7 +18,7 @@
 // type under two names, chosen for readability at the call site.
 // ============================================================================
 
-namespace binding {
+namespace marketlib::db::oracle {
 
 template <std::size_t Capacity>
 class FixedString {
@@ -70,4 +70,4 @@ inline constexpr bool is_fixed_string_v = is_fixed_string_impl<std::remove_cv_t<
 template <std::size_t N> using OciChar = FixedString<N>;     // maps to a CHAR(N) column
 template <std::size_t N> using OciVarchar2 = FixedString<N>; // maps to a VARCHAR2(N) column
 
-} // namespace binding
+} // namespace marketlib::db::oracle

@@ -28,13 +28,13 @@
 // run the call, and if the raw status isn't OCI_SUCCESS, attach whatever
 // error text/code OCIErrorGet has. Nothing more.
 
-#include "binding/oci_compat.h"
+#include <db/oracle/oci_compat.h>
 
 #include <array>
 #include <string>
 #include <type_traits>
 
-namespace binding {
+namespace marketlib::db::oracle {
 
 struct OciCallResult {
     sword status = OCI_SUCCESS;
@@ -85,4 +85,4 @@ OciCallResult call_oci(F&& func, Args&&... args) {
     return result;
 }
 
-} // namespace binding
+} // namespace marketlib::db::oracle

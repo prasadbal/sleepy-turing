@@ -112,7 +112,7 @@ constexpr ub2 SQLT_BLOB    = 113;
 constexpr ub2 SQLT_ODT       = 156;
 constexpr ub2 SQLT_TIMESTAMP = 187;
 
-namespace binding::mock {
+namespace marketlib::db::oracle::mock {
 
 // Lets a demo/test declare what the next execute() should simulate, instead
 // of the opaque "fail every Nth call" trick the first draft of this used.
@@ -385,7 +385,7 @@ inline std::string render_with_mock_format(std::string_view fmt, int year, int m
     return out;
 }
 
-} // namespace binding::mock
+} // namespace marketlib::db::oracle::mock
 
 // ---- Mock entry points -----------------------------------------------------
 extern "C" {
@@ -410,10 +410,10 @@ inline sword OCILogon2(OCIEnv*, OCIError*, OCISvcCtx** svchp,
 inline sword OCILogoff(OCISvcCtx*, OCIError*) { return OCI_SUCCESS; }
 
 inline sword OCIStmtPrepare(OCIStmt*, OCIError*, const text*, ub4, ub4, ub4) {
-    binding::mock::g_defines.clear();
-    binding::mock::g_fetch_row = 0;
-    binding::mock::g_last_bind_indicators.clear();
-    binding::mock::g_stmt_state.store(OCI_STMT_STATE_INITIALIZED);
+    marketlib::db::oracle::mock::g_defines.clear();
+    marketlib::db::oracle::mock::g_fetch_row = 0;
+    marketlib::db::oracle::mock::g_last_bind_indicators.clear();
+    marketlib::db::oracle::mock::g_stmt_state.store(OCI_STMT_STATE_INITIALIZED);
     return OCI_SUCCESS;
 }
 
@@ -423,7 +423,7 @@ inline sword OCIBindByName(OCIStmt*, OCIBind**, OCIError*, const text*, sb4,
     // struct's fields in declaration order), same convention OCIBindByPos
     // uses positionally -- g_last_bind_indicators[i] is the i-th bound
     // field's indicator either way.
-    binding::mock::g_last_bind_indicators.push_back(indp ? *static_cast<sb2*>(indp) : OCI_IND_NOTNULL);
+    marketlib::db::oracle::mock::g_last_bind_indicators.push_back(indp ? *static_cast<sb2*>(indp) : OCI_IND_NOTNULL);
     return OCI_SUCCESS;
 }
 
@@ -437,7 +437,7 @@ inline sword OCIBindArrayOfStruct(OCIBind*, OCIError*, ub4, ub4, ub4, ub4) {
 
 inline sword OCIBindByPos(OCIStmt*, OCIBind**, OCIError*, ub4 position,
                            dvoid*, sb4, ub2, dvoid* indp, ub2*, ub2*, ub4, ub4*, ub4) {
-    auto& inds = binding::mock::g_last_bind_indicators;
+    auto& inds = marketlib::db::oracle::mock::g_last_bind_indicators;
     if (inds.size() < position) inds.resize(position, OCI_IND_NOTNULL);
     inds[position - 1] = indp ? *static_cast<sb2*>(indp) : OCI_IND_NOTNULL;
     return OCI_SUCCESS;
@@ -446,7 +446,7 @@ inline sword OCIBindByPos(OCIStmt*, OCIBind**, OCIError*, ub4 position,
 inline sword OCIDefineByPos(OCIStmt*, OCIDefine** defnpp, OCIError*, ub4 position,
                              dvoid* valuep, sb4 value_sz, ub2 dty,
                              dvoid* indp, ub2* rlenp, ub2*, ub4) {
-    auto& defines = binding::mock::g_defines;
+    auto& defines = marketlib::db::oracle::mock::g_defines;
     if (defines.size() < position) defines.resize(position);
     defines[position - 1] = { valuep, value_sz, dty, static_cast<sb2*>(indp), 0, 0, rlenp, 0 };
     // Encode the column position directly as the "handle" value -- never
@@ -458,7 +458,7 @@ inline sword OCIDefineByPos(OCIStmt*, OCIDefine** defnpp, OCIError*, ub4 positio
 }
 
 inline sword OCIDefineArrayOfStruct(OCIDefine* defnp, OCIError*, ub4 pvskip, ub4 indskip, ub4 rlskip, ub4) {
-    auto& defines = binding::mock::g_defines;
+    auto& defines = marketlib::db::oracle::mock::g_defines;
     const auto position = static_cast<ub4>(reinterpret_cast<std::uintptr_t>(defnp));
     if (position >= 1 && position <= defines.size()) {
         defines[position - 1].pvskip = pvskip;
@@ -478,7 +478,7 @@ inline sword OCIAttrSet(dvoid*, ub4, dvoid*, ub4, ub4, OCIError*) {
 
 inline sword OCIAttrGet(const dvoid*, ub4, dvoid* attributep, ub4* sizep, ub4 attrtype, OCIError*) {
     if (attrtype == OCI_ATTR_ROWS_FETCHED && attributep) {
-        *static_cast<ub4*>(attributep) = static_cast<ub4>(binding::mock::g_last_rows_fetched.load());
+        *static_cast<ub4*>(attributep) = static_cast<ub4>(marketlib::db::oracle::mock::g_last_rows_fetched.load());
         if (sizep) *sizep = sizeof(ub4);
     } else if (attrtype == OCI_ATTR_PARAM_COUNT && attributep) {
         // 0 columns describable -- this mock has no notion of a query's
@@ -497,7 +497,7 @@ inline sword OCIAttrGet(const dvoid*, ub4, dvoid* attributep, ub4* sizep, ub4 at
         *static_cast<text**>(attributep) = nullptr;
         if (sizep) *sizep = 0;
     } else if (attrtype == OCI_ATTR_STMT_STATE && attributep) {
-        *static_cast<ub4*>(attributep) = static_cast<ub4>(binding::mock::g_stmt_state.load());
+        *static_cast<ub4*>(attributep) = static_cast<ub4>(marketlib::db::oracle::mock::g_stmt_state.load());
         if (sizep) *sizep = sizeof(ub4);
     }
     return OCI_SUCCESS;
@@ -517,7 +517,7 @@ inline sword OCIParamGet(const dvoid*, ub4, OCIError*, dvoid**, ub4) {
 // g_fetch_row (the mock's shared row cursor) by exactly one row per call,
 // same as it always has.
 inline void generate_one_mock_row(ub4 fetched) {
-    using namespace binding::mock;
+    using namespace marketlib::db::oracle::mock;
 
     // Demo behavior (opt-in, see g_simulate_null_last_column): the last
     // defined column comes back NULL on every other row, so code
@@ -577,7 +577,7 @@ inline void generate_one_mock_row(ub4 fetched) {
             // content directly, the same way OCILobWrite2 would if the
             // caller had bound this value instead of fetched it.
             auto* locator = *reinterpret_cast<OCILobLocator**>(row_ptr);
-            auto* desc = reinterpret_cast<binding::mock::MockLobDescriptor*>(locator);
+            auto* desc = reinterpret_cast<marketlib::db::oracle::mock::MockLobDescriptor*>(locator);
             desc->data = "lob_row" + std::to_string(g_fetch_row) + "_col" + std::to_string(i);
         } else if (d.dty == SQLT_ODT && d.size == sizeof(::OCIDate)) {
             // Writes the real 7-byte ::OCIDate layout directly -- OciDate
@@ -594,7 +594,7 @@ inline void generate_one_mock_row(ub4 fetched) {
 }
 
 inline sword OCIStmtExecute(OCISvcCtx*, OCIStmt*, OCIError*, ub4 iters, ub4, const dvoid*, dvoid*, ub4) {
-    using namespace binding::mock;
+    using namespace marketlib::db::oracle::mock;
     g_execute_calls.fetch_add(1);
     g_last_iters.store(static_cast<int>(iters));
     if (g_mode.load() == FailureMode::ExecErrorAlways) {
@@ -629,7 +629,7 @@ inline sword OCIStmtExecute(OCISvcCtx*, OCIStmt*, OCIError*, ub4 iters, ub4, con
 }
 
 inline sword OCIStmtFetch2(OCIStmt*, OCIError*, ub4 nrows, ub2, sb4, ub4) {
-    using namespace binding::mock;
+    using namespace marketlib::db::oracle::mock;
 
     // Real Oracle behavior (confirmed against a live database): the call
     // that returns the last, possibly-partial batch reports OCI_NO_DATA
@@ -648,7 +648,7 @@ inline sword OCIStmtFetch2(OCIStmt*, OCIError*, ub4 nrows, ub2, sb4, ub4) {
 }
 
 inline sword OCIErrorGet(dvoid*, ub4, text*, sb4* errcodep, text* bufp, ub4 bufsiz, ub4) {
-    using namespace binding::mock;
+    using namespace marketlib::db::oracle::mock;
     sb4 code = 0;
     std::string_view msg = "ORA-00000: normal, successful completion";
     switch (g_mode.load()) {
@@ -673,7 +673,7 @@ inline sword OCIErrorGet(dvoid*, ub4, text*, sb4* errcodep, text* bufp, ub4 bufs
 }
 
 inline sword OCIDescriptorAlloc(const dvoid*, dvoid** descpp, ub4 type, size_t, dvoid**) {
-    using namespace binding::mock;
+    using namespace marketlib::db::oracle::mock;
     if (type == OCI_DTYPE_TIMESTAMP) {
         *descpp = reinterpret_cast<dvoid*>(new MockDateTimeDescriptor{});
     } else if (type == OCI_DTYPE_LOB) {
@@ -685,9 +685,9 @@ inline sword OCIDescriptorAlloc(const dvoid*, dvoid** descpp, ub4 type, size_t, 
 }
 inline sword OCIDescriptorFree(dvoid* descp, ub4 type) {
     if (type == OCI_DTYPE_TIMESTAMP) {
-        delete reinterpret_cast<binding::mock::MockDateTimeDescriptor*>(descp);
+        delete reinterpret_cast<marketlib::db::oracle::mock::MockDateTimeDescriptor*>(descp);
     } else if (type == OCI_DTYPE_LOB) {
-        delete reinterpret_cast<binding::mock::MockLobDescriptor*>(descp);
+        delete reinterpret_cast<marketlib::db::oracle::mock::MockLobDescriptor*>(descp);
     }
     return OCI_SUCCESS;
 }
@@ -695,14 +695,14 @@ inline sword OCIDescriptorFree(dvoid* descp, ub4 type) {
 inline sword OCIDateTimeConstruct(void*, OCIError*, OCIDateTime* datetime, sb2 year, unsigned char month,
                                    unsigned char day, unsigned char hour, unsigned char minute,
                                    unsigned char second, ub4 fsec, text*, size_t) {
-    using namespace binding::mock;
+    using namespace marketlib::db::oracle::mock;
     *reinterpret_cast<MockDateTimeDescriptor*>(datetime) =
         MockDateTimeDescriptor{year, month, day, hour, minute, second, fsec};
     return OCI_SUCCESS;
 }
 
 // Parses date_str against fmt via the mock's small format-model interpreter
-// (see binding::mock::parse_with_mock_format above) and writes the result
+// (see marketlib::db::oracle::mock::parse_with_mock_format above) and writes the result
 // directly into *date -- the real OCIDateFromText does the equivalent using
 // Oracle's own interpreter, needing only err (never a live session/round
 // trip: this is a pure client-side text<->value conversion).
@@ -710,7 +710,7 @@ inline sword OCIDateFromText(OCIError*, const text* date_str, ub4 d_str_length,
                               const text* fmt, ub1 fmt_length,
                               const text*, ub4,
                               OCIDate* date) {
-    using namespace binding::mock;
+    using namespace marketlib::db::oracle::mock;
     ParsedMockDateTime parsed;
     const std::string_view text_sv(reinterpret_cast<const char*>(date_str), d_str_length);
     const std::string_view fmt_sv(reinterpret_cast<const char*>(fmt), fmt_length);
@@ -732,7 +732,7 @@ inline sword OCIDateToText(OCIError*, const OCIDate* date,
                             const text* fmt, ub1 fmt_length,
                             const text*, ub4,
                             ub4* buf_size, text* buf) {
-    using namespace binding::mock;
+    using namespace marketlib::db::oracle::mock;
     const std::string_view fmt_sv(reinterpret_cast<const char*>(fmt), fmt_length);
     const std::string rendered = render_with_mock_format(fmt_sv,
         date->OCIDateYYYY, date->OCIDateMM, date->OCIDateDD,
@@ -753,7 +753,7 @@ inline sword OCIDateTimeFromText(void*, OCIError*,
                                   const text* fmt, ub1 fmt_length,
                                   const text*, size_t,
                                   OCIDateTime* datetime) {
-    using namespace binding::mock;
+    using namespace marketlib::db::oracle::mock;
     ParsedMockDateTime parsed;
     const std::string_view text_sv(reinterpret_cast<const char*>(date_str), dstr_length);
     const std::string_view fmt_sv(reinterpret_cast<const char*>(fmt), fmt_length);
@@ -769,7 +769,7 @@ inline sword OCIDateTimeToText(void*, OCIError*, const OCIDateTime* datetime,
                                 const text* fmt, ub1 fmt_length, ub1,
                                 const text*, size_t,
                                 ub4* buf_size, text* buf) {
-    using namespace binding::mock;
+    using namespace marketlib::db::oracle::mock;
     const auto* d = reinterpret_cast<const MockDateTimeDescriptor*>(datetime);
     const std::string_view fmt_sv(reinterpret_cast<const char*>(fmt), fmt_length);
     const std::string rendered = render_with_mock_format(fmt_sv, d->year, d->month, d->day, d->hour, d->minute, d->second);
@@ -786,13 +786,13 @@ inline sword OCIDateTimeToText(void*, OCIError*, const OCIDateTime* datetime,
 // conversion instead of the hand-rolled default-format parser.
 inline sword OCIDateTimeGetDate(void*, OCIError*, const OCIDateTime* datetime,
                                  sb2* year, unsigned char* month, unsigned char* day) {
-    const auto* d = reinterpret_cast<const binding::mock::MockDateTimeDescriptor*>(datetime);
+    const auto* d = reinterpret_cast<const marketlib::db::oracle::mock::MockDateTimeDescriptor*>(datetime);
     *year = d->year; *month = d->month; *day = d->day;
     return OCI_SUCCESS;
 }
 inline sword OCIDateTimeGetTime(void*, OCIError*, OCIDateTime* datetime,
                                  unsigned char* hour, unsigned char* minute, unsigned char* second, ub4* fsec) {
-    const auto* d = reinterpret_cast<const binding::mock::MockDateTimeDescriptor*>(datetime);
+    const auto* d = reinterpret_cast<const marketlib::db::oracle::mock::MockDateTimeDescriptor*>(datetime);
     *hour = d->hour; *minute = d->minute; *second = d->second;
     if (fsec) *fsec = d->fsec;
     return OCI_SUCCESS;
@@ -813,20 +813,20 @@ inline sword OCILobFreeTemporary(OCISvcCtx*, OCIError*, OCILobLocator*) { return
 
 inline sword OCILobWrite2(OCISvcCtx*, OCIError*, OCILobLocator* locp, oraub8* byte_amtp, oraub8* char_amtp, ub4,
                            dvoid* bufp, oraub8 buflen, ub1, dvoid*, dvoid*, ub2, ub1) {
-    auto* desc = reinterpret_cast<binding::mock::MockLobDescriptor*>(locp);
+    auto* desc = reinterpret_cast<marketlib::db::oracle::mock::MockLobDescriptor*>(locp);
     desc->data.assign(static_cast<const char*>(bufp), static_cast<std::size_t>(buflen));
     if (byte_amtp) *byte_amtp = buflen;
     if (char_amtp) *char_amtp = buflen;
     return OCI_SUCCESS;
 }
 inline sword OCILobGetLength2(OCISvcCtx*, OCIError*, OCILobLocator* locp, oraub8* lenp) {
-    auto* desc = reinterpret_cast<binding::mock::MockLobDescriptor*>(locp);
+    auto* desc = reinterpret_cast<marketlib::db::oracle::mock::MockLobDescriptor*>(locp);
     if (lenp) *lenp = static_cast<oraub8>(desc->data.size());
     return OCI_SUCCESS;
 }
 inline sword OCILobRead2(OCISvcCtx*, OCIError*, OCILobLocator* locp, oraub8* byte_amtp, oraub8* char_amtp, ub4,
                           dvoid* bufp, oraub8 bufl, ub1, dvoid*, dvoid*, ub2, ub1) {
-    auto* desc = reinterpret_cast<binding::mock::MockLobDescriptor*>(locp);
+    auto* desc = reinterpret_cast<marketlib::db::oracle::mock::MockLobDescriptor*>(locp);
     const std::size_t to_copy = std::min(desc->data.size(), static_cast<std::size_t>(bufl));
     std::memcpy(bufp, desc->data.data(), to_copy);
     if (byte_amtp) *byte_amtp = to_copy;

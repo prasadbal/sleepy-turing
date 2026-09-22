@@ -14,14 +14,14 @@
 // as an owned object instead of a set of functions threaded through by
 // the caller.
 
-#include "binding/oci_call.h"
-#include "binding/oci_connection.h"
+#include <db/oracle/oci_call.h>
+#include <db/oracle/oci_connection.h>
 
 #include <string>
 #include <type_traits>
 #include <vector>
 
-namespace binding {
+namespace marketlib::db::oracle {
 
 class OCILob {
 public:
@@ -129,4 +129,4 @@ template <typename T> inline constexpr bool is_oci_clob_v = std::is_same_v<T, Oc
 template <typename T> inline constexpr bool is_oci_blob_v = std::is_same_v<T, OciBlob>;
 template <typename T> inline constexpr bool is_oci_lob_v = is_oci_clob_v<T> || is_oci_blob_v<T>;
 
-} // namespace binding
+} // namespace marketlib::db::oracle

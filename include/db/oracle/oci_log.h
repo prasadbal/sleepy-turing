@@ -14,7 +14,7 @@
 // as "<unrendered type N>" rather than guessing at how to interpret
 // arbitrary bytes.
 
-#include "binding/oci_connection.h"
+#include <db/oracle/oci_connection.h>
 
 #include <array>
 #include <cstring>
@@ -22,7 +22,7 @@
 #include <string>
 #include <string_view>
 
-namespace binding {
+namespace marketlib::db::oracle {
 
 using StatementLogger = std::function<void(std::string_view line)>;
 
@@ -83,4 +83,4 @@ inline std::string render_typed_value(OciConnection& conn, ub2 data_type, const 
     return "<unrendered type " + std::to_string(data_type) + ">";
 }
 
-} // namespace binding
+} // namespace marketlib::db::oracle

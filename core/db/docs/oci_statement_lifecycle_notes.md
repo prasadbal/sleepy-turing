@@ -107,7 +107,7 @@ Unprepared --prepare()--> Prepared --execute()--> Executed --fetch()--> Executed
                                                     into a caller buffer                      "handle done")
                                                     yet -- see below)
 ```
-(`ideas/new` specifically -- this diagram used to show a separate
+(`db/oracle` specifically -- this diagram used to show a separate
 "Fetching" state distinct from "Executed"; real `OCI_ATTR_STMT_STATE`
 never reports one, so it was dropped. See below.)
 
@@ -134,7 +134,7 @@ Concretely, from what this codebase learned building it:
   corrects an earlier, wrong assumption in this same bullet that
   `EndOfFetch` also meant "can't be fetched again."
 
-### `OCI_ATTR_STMT_STATE` exists, and revealed a real bug when `ideas/new` started reading it
+### `OCI_ATTR_STMT_STATE` exists, and revealed a real bug when `db/oracle` started reading it
 
 Real OCI tracks a statement handle's own execute/fetch state itself, via
 `OCIAttrGet(..., OCI_ATTR_STMT_STATE, ...)` (attribute `182`, confirmed
@@ -146,7 +146,7 @@ a freshly allocated handle -- OCI doesn't track "has `prepare()` been
 called" as its own state at all) and no separate "mid-batch-fetch-loop"
 value distinct from `EXECUTED`.
 
-`ideas/new`'s `OciStatement` originally hand-derived its own
+`db/oracle`'s `OciStatement` originally hand-derived its own
 `Executed`/`Fetching`/`EndOfFetch` states from each call's *return
 status* (`OCI_NO_DATA` vs not) rather than asking OCI directly. Switching
 `execute()`/`fetch()` to read `OCI_ATTR_STMT_STATE` after every call
@@ -167,7 +167,7 @@ buffers -- that only happens when `fetch()` is actually called. So
 `fetch()` call, immediately after a genuinely successful `execute()`, on
 a live database.
 
-Confirmed by `ideas/new/examples/live_oracle_demo.cpp`'s own batch-fetch
+Confirmed by `core/db/examples/live_oracle_demo.cpp`'s own batch-fetch
 test (`set_prefetch_rows(100)` over 3 real rows, batch size 2): it threw
 `OciStatementStateError` the moment `OCI_ATTR_STMT_STATE` was wired in
 directly, precisely because `fetch()` still only accepted `Executed`.
@@ -197,7 +197,7 @@ before that later `bindOutput()` call has any chance to run first.
 Confirmed for real with a genuinely small (2-row) real table and
 `prefetch_rows=10`: `bindOutput()` threw `OciStatementStateError`
 (`"statement is EndOfFetch, expected Prepared or Executed"`) the moment
-`ideas/new`'s reflection layer (`oci_client.h`, built on top of
+`db/oracle`'s reflection layer (`oci_client.h`, built on top of
 `OciStatement`, mirroring `ideas/binding`'s own reflection layer) tried
 to define its output columns. Fixed the same way as `fetch()` and
 `describeColumnPosition()`: `bindOutput()` now also accepts `EndOfFetch`.

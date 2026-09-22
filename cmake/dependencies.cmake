@@ -24,6 +24,29 @@ FetchContent_Declare(tomlplusplus
     GIT_SHALLOW    TRUE
 )
 
+# ── Boost.PFR (db: reflection over plain structs, header-only) ────────────────
+# Standalone repo, not the full Boost tree -- PFR is the only Boost library
+# the db layer uses. The Boost::pfr target is defined below, after
+# FetchContent_MakeAvailable.
+#
+# Pinned to the Boost 1.91.0 release tag, deliberately not a 2.x library
+# tag: 2.2.0 fails to compile under GCC 15 for a struct declared locally in
+# a function ("fake_object ... declared using local type ... is used but
+# never defined"), which the db examples and tests do throughout. 1.91.0 is
+# also the version the db layer was developed and tested against.
+#
+# SOURCE_SUBDIR points at a directory that doesn't exist, so the sources are
+# fetched but PFR's own CMakeLists.txt is never run. It's header-only, and
+# that CMakeLists adds a test/ tree whenever BUILD_TESTING is on (which
+# include(CTest) turns on for this project) whose targets link against the
+# rest of Boost -- Boost::core and friends -- that isn't here.
+FetchContent_Declare(pfr
+    GIT_REPOSITORY https://github.com/boostorg/pfr.git
+    GIT_TAG        boost-1.91.0
+    GIT_SHALLOW    TRUE
+    SOURCE_SUBDIR  do_not_configure
+)
+
 # ── tsl::robin_map (fast hash map) ───────────────────────────────────────────
 FetchContent_Declare(robin_map
     GIT_REPOSITORY https://github.com/Tessil/robin-map.git
@@ -86,6 +109,7 @@ FetchContent_MakeAvailable(
     spdlog
     concurrentqueue
     tomlplusplus
+    pfr
     robin_map
     date
     Catch2
@@ -94,6 +118,13 @@ FetchContent_MakeAvailable(
     CLI11
     backward
 )
+
+# Boost.PFR: header-only, so the target is just its include directory. SYSTEM
+# keeps its (heavily template-metaprogrammed) headers out of -Wall/-Wextra/
+# -Wpedantic, the same way the other fetched dependencies are treated.
+add_library(pfr_headers INTERFACE)
+target_include_directories(pfr_headers SYSTEM INTERFACE ${pfr_SOURCE_DIR}/include)
+add_library(Boost::pfr ALIAS pfr_headers)
 
 # ── jemalloc (Linux only, installed via apt) ──────────────────────────────────
 if(UNIX AND NOT APPLE)
