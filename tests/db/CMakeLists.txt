@@ -1,4 +1,4 @@
-add_executable(test_db test_db.cpp)
+add_executable(test_db test_db.cpp test_diag.cpp)
 
 # core_db must come AFTER core_testing. core_testing pulls in core_perfmeasure,
 # which leaks -fno-exceptions, and the last flag on the command line wins --

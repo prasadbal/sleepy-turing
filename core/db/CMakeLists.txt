@@ -61,6 +61,7 @@ endif()
 foreach(example
         demo
         demo_client
+        diag_demo
         live_oracle_demo
         live_oracle_client_demo
         live_oracle_empty_table_demo

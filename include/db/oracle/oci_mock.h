@@ -16,6 +16,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <string>
@@ -126,6 +127,24 @@ inline std::atomic<int> g_last_iters{0}; // the `iters` OCIStmtExecute was last 
 inline void set_mode(FailureMode mode, int disconnect_count = 1) {
     g_mode = mode;
     g_disconnects_remaining = disconnect_count;
+}
+
+// Every SQL text passed to OCIStmtPrepare, in order -- lets a test check which
+// statements a call actually issued. Plain globals, not atomics: like the rest
+// of this mock's state, one thread at a time.
+inline std::vector<std::string> g_sql_log;
+// When non-empty, executing a statement whose text contains this substring
+// fails with ORA-00942 (table or view does not exist), which is what a missing
+// grant on a V$ view looks like. Everything else keeps working, so a test can
+// exercise "one part of a report is unavailable, the rest is fine".
+inline std::string g_fail_on_sql;
+inline int g_fail_on_sql_code = 942; // ORA number reported instead, e.g. 2003 = invalid USERENV parameter
+inline bool g_last_execute_failed_on_sql = false;
+inline void reset_sql_hooks() {
+    g_sql_log.clear();
+    g_fail_on_sql.clear();
+    g_fail_on_sql_code = 942;
+    g_last_execute_failed_on_sql = false;
 }
 
 // pvskip/indskip: byte stride from one row's value/indicator to the next
@@ -409,7 +428,8 @@ inline sword OCILogon2(OCIEnv*, OCIError*, OCISvcCtx** svchp,
 }
 inline sword OCILogoff(OCISvcCtx*, OCIError*) { return OCI_SUCCESS; }
 
-inline sword OCIStmtPrepare(OCIStmt*, OCIError*, const text*, ub4, ub4, ub4) {
+inline sword OCIStmtPrepare(OCIStmt*, OCIError*, const text* stmt, ub4 stmt_len, ub4, ub4) {
+    marketlib::db::oracle::mock::g_sql_log.emplace_back(reinterpret_cast<const char*>(stmt), stmt_len);
     marketlib::db::oracle::mock::g_defines.clear();
     marketlib::db::oracle::mock::g_fetch_row = 0;
     marketlib::db::oracle::mock::g_last_bind_indicators.clear();
@@ -597,6 +617,11 @@ inline sword OCIStmtExecute(OCISvcCtx*, OCIStmt*, OCIError*, ub4 iters, ub4, con
     using namespace marketlib::db::oracle::mock;
     g_execute_calls.fetch_add(1);
     g_last_iters.store(static_cast<int>(iters));
+    g_last_execute_failed_on_sql =
+        !g_fail_on_sql.empty() && !g_sql_log.empty() && g_sql_log.back().find(g_fail_on_sql) != std::string::npos;
+    if (g_last_execute_failed_on_sql) {
+        return OCI_ERROR; // ORA-00942, see g_fail_on_sql
+    }
     if (g_mode.load() == FailureMode::ExecErrorAlways) {
         return OCI_ERROR; // e.g. ORA-00001 unique constraint violated -- not retryable
     }
@@ -651,6 +676,16 @@ inline sword OCIErrorGet(dvoid*, ub4, text*, sb4* errcodep, text* bufp, ub4 bufs
     using namespace marketlib::db::oracle::mock;
     sb4 code = 0;
     std::string_view msg = "ORA-00000: normal, successful completion";
+    char simulated[64];
+    if (g_last_execute_failed_on_sql) {
+        code = g_fail_on_sql_code;
+        if (code == 942) {
+            msg = "ORA-00942: table or view does not exist";
+        } else {
+            std::snprintf(simulated, sizeof simulated, "ORA-%05d: simulated failure (mock)", code);
+            msg = simulated;
+        }
+    }
     switch (g_mode.load()) {
         case FailureMode::DisconnectThenRecover:
             code = 3113;

@@ -295,6 +295,55 @@ where this was first written up) for the full story.
   `OCIStmtPrepare2`/`OCIStmtRelease` lifecycle wrinkle, and the design
   notes this architecture is actually built from.
 
+## Diagnostics (`oci_diag.h`)
+
+Server, session and per-query cost reporting, built on `select_rows()` and the
+V$ views. Nothing in it throws; a query that fails comes back as a
+`DiagProblem` carrying the ORA- code and text.
+
+| Call | Returns |
+|---|---|
+| `server_info(conn)` | `ServerInfo`: identity (db, instance, service, server host, sid), multitenant container / PDB, instance and database rows, version banners, host CPUs and memory (every `V$OSSTAT` row), SGA (`V$SGAINFO`), PGA (`V$PGASTAT`), memory parameters |
+| `session_stats(conn, opts)` | this session's `V$MYSTAT` counters: SQL*Net round trips, bytes sent/received, PGA/UGA memory, parses, executes, gets, sorts, redo, CPU. `all_nonzero` returns every non-zero counter instead of the key set |
+| `statement_stats(conn, sql_id)` | `V$SQL` totals for one statement: executions, fetches, parse calls, rows, buffer gets, disk reads, CPU/elapsed, and sharable / persistent / runtime memory |
+| `QueryMeter::measure(fn)` | runs `fn` and returns its `ExecResult` plus `QueryStats`: round trips, bytes, PGA/UGA before/after/max, the other counters, elapsed time, and the `V$SQL` row for the last statement `fn` ran |
+
+`describe(x)` renders any of them as text.
+
+**Privileges.** All of it reads V$ views, so the user needs `SELECT_CATALOG_ROLE`
+or `SELECT` on `V_$INSTANCE`, `V_$DATABASE`, `V_$VERSION`, `V_$OSSTAT`,
+`V_$SGAINFO`, `V_$PGASTAT`, `V_$PARAMETER`, `V_$CONTAINERS`, `V_$MYSTAT`,
+`V_$STATNAME`, `V_$SESSION`, `V_$SQL`. `server_info()` is a set of independent
+sections: one the user cannot read is listed in `ServerInfo::problems` (section,
+ORA code, message) and the rest still fill in. A pre-12c server (no `CON_NAME`,
+no `banner_full`) is not reported as a problem. After a lost connection the
+report stops instead of issuing queries that cannot work.
+
+**How round trips are measured.** Oracle counts SQL*Net round trips per session,
+not per statement, so `QueryMeter` snapshots `V$MYSTAT` before and after the call
+and subtracts. The snapshots are queries and cost round trips themselves, so the
+meter first measures an empty before/after pair (minimum of three) and subtracts
+that from every counter; `QueryStats::overhead_round_trips` shows what was
+removed. Memory statistics are levels, not totals: `pga`/`uga` report before,
+after and session max, and are not corrected. `V$SQL` figures are cumulative for
+the cursor across all sessions and executions, so they describe the statement,
+not the one run; `rows_per_fetch()` is a quick hint that a small prefetch is
+costing round trips.
+
+**Cost.** Two snapshot queries per measured call, plus one `V$SQL` lookup, plus a
+one-off calibration. Use it on chosen calls or a sample, not on every query of a
+hot path. To attribute a statement, `V$SESSION.PREV_SQL_ID` is read; without a
+grant on `V_$SESSION` the meter carries on without the sql id and the statement
+lookup.
+
+**Status.** Written against the documented view and column names and tested only
+against the mock (`tests/db/test_diag.cpp`), which returns canned rows whatever
+the SQL says: the tests cover which views are queried, partial failure, lost
+connection, and the before/after arithmetic, not whether the SQL is right for a
+real Oracle. `examples/diag_demo.cpp` is the live check:
+`db_diag_demo <connect_string> <user> <password>`. It runs the same query at
+prefetch 10 and 1000, which should show the round trip count fall sharply.
+
 ## What this doesn't have (yet)
 
 Nothing left unbuilt at the scope `ideas/binding` covers: array-bind
