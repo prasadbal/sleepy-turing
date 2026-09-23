@@ -1,0 +1,20 @@
+---
+# Exception-specification hygiene only. This is not a general lint profile.
+#
+#   bugprone-exception-escape  a noexcept function (or destructor / move
+#                              operation) that can reach a throw. In this
+#                              project it also surfaces hot-path functions that
+#                              call into containers which can grow.
+#   performance-noexcept-*     move constructors, swap and destructors that
+#                              should be noexcept and are not.
+#
+# bugprone-exception-escape switches itself off in a translation unit compiled
+# with -fno-exceptions, which is how the hot modules are built, so it reports
+# nothing there by default. scripts/run_tidy.py adds -fexceptions for the
+# analysis; run tidy through it rather than directly.
+Checks: >
+  -*,
+  bugprone-exception-escape,
+  performance-noexcept-move-constructor,
+  performance-noexcept-swap,
+  performance-noexcept-destructor
