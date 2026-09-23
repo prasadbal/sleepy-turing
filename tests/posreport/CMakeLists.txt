@@ -1,0 +1,3 @@
+add_executable(test_posreport test_path_resolver.cpp test_report_expr.cpp)
+target_link_libraries(test_posreport PRIVATE core_testing core_posreport)
+catch_discover_tests(test_posreport)
