@@ -19,6 +19,12 @@
 // that data written into a segment and then unmapped, without ever being
 // explicitly flushed, is still correctly on disk after close() and a
 // completely fresh file read -- see segmented_mmap_test.cpp.
+//
+// Even with that ordering, extending the file (set_file_size(), below) can
+// still spuriously fail with ERROR_USER_MAPPED_FILE: the kernel's memory
+// manager can lag tearing a section down internally even after
+// UnmapViewOfFile + CloseHandle have both already returned. set_file_size()
+// retries briefly (bounded, not infinite) on that specific error only.
 #pragma once
 #ifndef NOMINMAX
 #define NOMINMAX // otherwise windows.h's max()/min() macros mangle std::max/std::min below
@@ -111,12 +117,7 @@ public:
             if (debug_on_unmap) debug_on_unmap(old_base, old_size);
         }
         if (file_ != INVALID_HANDLE_VALUE) {
-            LARGE_INTEGER sz{};
-            sz.QuadPart = static_cast<LONGLONG>(real_size);
-            if (!SetFilePointerEx(file_, sz, nullptr, FILE_BEGIN) || !SetEndOfFile(file_)) {
-                last_error_ = GetLastError();
-                ok = false;
-            }
+            if (!set_file_size(real_size)) ok = false;
             CloseHandle(file_);
             file_ = INVALID_HANDLE_VALUE;
         }
@@ -140,14 +141,35 @@ private:
         return map_segment(offset, size);
     }
 
+    // Sets the file's length, retrying briefly on ERROR_USER_MAPPED_FILE:
+    // the kernel's memory manager can lag tearing down a section even
+    // after UnmapViewOfFile + CloseHandle have both already returned
+    // (slide_to() always does both before calling here), which can make
+    // SetEndOfFile spuriously fail right after a slide. A real, observed
+    // transient race, not hardening against something theoretical --
+    // bounded retries with a short sleep, not an infinite loop, and any
+    // OTHER error fails immediately (not retryable).
+    bool set_file_size(std::size_t new_size) {
+        LARGE_INTEGER sz{};
+        sz.QuadPart = static_cast<LONGLONG>(new_size);
+        if (!SetFilePointerEx(file_, sz, nullptr, FILE_BEGIN)) {
+            last_error_ = GetLastError();
+            return false; // moving the cursor isn't part of the retryable race -- fail immediately
+        }
+        constexpr int kMaxAttempts = 5;
+        constexpr DWORD kRetryDelayMs = 2;
+        for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+            if (SetEndOfFile(file_)) return true;
+            last_error_ = GetLastError();
+            if (last_error_ != ERROR_USER_MAPPED_FILE) return false; // different, non-retryable failure
+            if (attempt + 1 < kMaxAttempts) Sleep(kRetryDelayMs);
+        }
+        return false; // exhausted retries; last_error() is ERROR_USER_MAPPED_FILE
+    }
+
     bool map_segment(std::size_t offset, std::size_t size) {
         const std::size_t new_total = offset + size;
-        LARGE_INTEGER sz{};
-        sz.QuadPart = static_cast<LONGLONG>(new_total);
-        if (!SetFilePointerEx(file_, sz, nullptr, FILE_BEGIN) || !SetEndOfFile(file_)) {
-            last_error_ = GetLastError();
-            return false;
-        }
+        if (!set_file_size(new_total)) return false;
         HANDLE mapping = CreateFileMappingW(file_, nullptr, PAGE_READWRITE,
                                              static_cast<DWORD>(new_total >> 32), static_cast<DWORD>(new_total & 0xFFFFFFFFu),
                                              nullptr);
