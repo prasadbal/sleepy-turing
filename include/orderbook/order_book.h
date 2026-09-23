@@ -64,14 +64,25 @@ struct Snapshot {
 
 // Array-based limit order book for a single symbol. MaxLevels is small on
 // purpose (HFT books rarely need full depth resident) — insert/remove is
-// O(MaxLevels) via shift, which beats a tree/skiplist at this size and,
-// critically, never allocates.
+// O(MaxLevels) via shift, which beats a tree/skiplist at this size.
+//
+// Allocation: the constructor reserves the order table for MaxOrders entries,
+// and that is the only allocation the book ever makes. Every on_* call after
+// construction is allocation-free. The price levels are fixed arrays; the
+// order table cannot grow past its reservation because on_add refuses the
+// order instead. Construct books at startup, not on the hot path.
 template<std::size_t MaxLevels = 32, std::size_t MaxOrders = 8192>
 class OrderBook {
 public:
-    explicit OrderBook(std::uint32_t symbol_id) noexcept : symbol_id_(symbol_id) {}
+    // Allocates the order table, so deliberately not noexcept.
+    explicit OrderBook(std::uint32_t symbol_id) : symbol_id_(symbol_id) {
+        orders_.reserve(MaxOrders);
+    }
 
-    void on_add(OrderId id, Side side, Price price, Qty qty) noexcept {
+    // Returns false, leaving the book untouched, when MaxOrders orders are
+    // already resting. Accepting one more would rehash the order table.
+    [[nodiscard]] bool on_add(OrderId id, Side side, Price price, Qty qty) noexcept {
+        if (orders_.size() >= MaxOrders) [[unlikely]] return false;
         auto& levels     = side == Side::Bid ? bids_ : asks_;
         auto& count      = side == Side::Bid ? num_bids_ : num_asks_;
         const auto level_idx = find_or_insert_level(levels, count, side, price);
@@ -79,6 +90,7 @@ public:
         ++levels[level_idx].order_count;
         orders_[id] = OrderLoc{.side = side, .price = price, .qty = qty};
         ++sequence_;
+        return true;
     }
 
     void on_cancel(OrderId id) noexcept {

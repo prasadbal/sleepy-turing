@@ -32,7 +32,7 @@ struct Args {
 //             .addFlag("--dry-run", dry_run_, "Don't send live orders");
 class Options {
 public:
-    Options(std::string_view app_name, std::string_view app_version) noexcept;
+    Options(std::string_view app_name, std::string_view app_version);
 
     // Binds `target` directly (fully typed on T — whatever CLI11 itself
     // supports: string, int, double, filesystem::path, vector<T>, ...).

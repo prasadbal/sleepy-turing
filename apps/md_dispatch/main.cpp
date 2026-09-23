@@ -36,12 +36,17 @@ struct MarketDataTask {
 
 using Pool = threadpool::ThreadPool<MarketDataTask, /*QueueCapacity=*/4096, kNumBookWorkers>;
 
+using Book = orderbook::OrderBook<32, 8192>;
+
 // One of these per worker — private book storage, never shared across
 // threads. A worker only ever sees symbols hash-partitioned to it, so no
 // synchronization is needed here; see order_book.h for why.
+//
+// `books` is filled once in main(), before the pool starts, and is only
+// looked up afterwards: inserting a book on the hot path would allocate.
 struct WorkerCtx {
-    marketlib::HashMap<std::uint32_t, orderbook::OrderBook<32, 8192>> books;
-    orderbook::SharedBookTable<kMaxSymbols>*                          shared_table{nullptr};
+    marketlib::HashMap<std::uint32_t, Book> books;
+    orderbook::SharedBookTable<kMaxSymbols>* shared_table{nullptr};
 };
 
 // Demo wire format layered on WireHeader's payload: [msg_type:1][order_id:8]
@@ -49,7 +54,12 @@ struct WorkerCtx {
 // decodes ITCH/OUCH/MDP3 here instead of this ad hoc layout.
 void process_market_data(MarketDataTask& task, void* ctx_raw) noexcept {
     auto& ctx = *static_cast<WorkerCtx*>(ctx_raw);
-    auto [it, inserted] = ctx.books.try_emplace(task.symbol_id, task.symbol_id);
+    const auto it = ctx.books.find(task.symbol_id);
+    if (it == ctx.books.end()) [[unlikely]] {
+        LOG_WARN(onload::log, "no book for symbol={} seq={}, dropping",
+                  task.symbol_id, task.sequence);
+        return;
+    }
     auto& book = it.value();
 
     const auto* p = task.payload.data();
@@ -69,7 +79,10 @@ void process_market_data(MarketDataTask& task, void* ctx_raw) noexcept {
         std::memcpy(&price, p, sizeof(price)); p += sizeof(price);
         orderbook::Qty qty{};
         std::memcpy(&qty, p, sizeof(qty));
-        book.on_add(order_id, side_byte ? orderbook::Side::Ask : orderbook::Side::Bid, price, qty);
+        const auto side = side_byte ? orderbook::Side::Ask : orderbook::Side::Bid;
+        if (!book.on_add(order_id, side, price, qty)) [[unlikely]]
+            LOG_WARN(onload::log, "book full, dropping add symbol={} order={}",
+                      task.symbol_id, order_id);
         break;
     }
     case 'X':
@@ -136,6 +149,21 @@ int main() {
     // One core per book worker (adjust to the box's isolated/isolcpus set).
     const std::array<int, kNumBookWorkers> cpu_ids{2, 3, 4, 5};
     pool.spawn_group("book-builders", process_market_data, ctx_ptrs, cpu_ids);
+
+    // Build every book now, before any worker runs, so process_market_data
+    // never allocates. Each symbol goes to the worker submit_by_key will route
+    // it to; worker_for_key indexes ctxs directly because this is the first
+    // (and only) group registered, so worker i owns ctxs[i]. Symbol ids
+    // 0..kMaxSymbols-1 are this demo's universe (a real feed seeds from its
+    // instrument list); anything else has no book and is dropped with a warning.
+    std::array<std::vector<std::uint32_t>, kNumBookWorkers> owned;
+    for (std::uint32_t sym = 0; sym < kMaxSymbols; ++sym)
+        owned[pool.worker_for_key(sym)].push_back(sym);
+    for (std::size_t w = 0; w < kNumBookWorkers; ++w) {
+        ctxs[w]->books.reserve(owned[w].size());
+        for (const auto sym : owned[w]) ctxs[w]->books.try_emplace(sym, sym);
+    }
+
     pool.start();
 
     DispatchCtx dispatch_ctx{.pool = &pool};

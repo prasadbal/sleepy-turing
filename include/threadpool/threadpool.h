@@ -124,11 +124,19 @@ public:
         return queues_[idx].try_push(std::move(task));
     }
 
+    // Which worker submit_by_key routes `key` to. Startup code uses this to
+    // build each worker's per-key state (its books) before start(), rather
+    // than lazily on the hot path. The modulus is the current worker count,
+    // so it is only stable once every worker has been registered.
+    template<typename Key>
+    [[nodiscard]] std::size_t worker_for_key(const Key& key) const noexcept {
+        return std::hash<Key>{}(key) % num_workers_;
+    }
+
     // Affinity: same key always maps to the same worker across the whole pool.
     template<typename Key>
     [[nodiscard]] bool submit_by_key(const Key& key, Task task) noexcept {
-        const auto idx = std::hash<Key>{}(key) % num_workers_;
-        return queues_[idx].try_push(std::move(task));
+        return queues_[worker_for_key(key)].try_push(std::move(task));
     }
 
     // Affinity scoped to one group: same key always maps to the same worker

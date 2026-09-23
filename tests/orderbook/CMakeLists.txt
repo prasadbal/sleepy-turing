@@ -1,0 +1,3 @@
+add_executable(test_orderbook test_order_book.cpp)
+target_link_libraries(test_orderbook PRIVATE core_orderbook core_testing)
+catch_discover_tests(test_orderbook)

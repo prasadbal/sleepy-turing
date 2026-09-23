@@ -3,7 +3,7 @@
 
 namespace marketlib::cmdline {
 
-Options::Options(std::string_view app_name, std::string_view app_version) noexcept
+Options::Options(std::string_view app_name, std::string_view app_version)
     : app_{std::string(app_name)} {
     app_.set_version_flag("--version,-V", std::string(app_version));
 
