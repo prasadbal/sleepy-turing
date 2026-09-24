@@ -49,6 +49,9 @@ struct Fixture {
     }
 
     std::optional<Value> run(std::string_view expr) { return eval(*parse(expr), pos, res, funcs); }
+    std::optional<Value> run_compiled(std::string_view expr) {
+        return compile<Position, Instrument>(*parse(expr))(pos, res, funcs);
+    }
 };
 
 bool near(const std::optional<Value>& v, double expect, double eps = 1e-9) {
@@ -114,6 +117,38 @@ TEST_CASE_METHOD(Fixture, "report_expr: IF genuinely short-circuits", "[posrepor
     // if that were violated, these would come back nullopt instead of a value.
     CHECK(near(run("IF(1 < 2, 10, FUNC.nosuchfunc(1))"), 10.0));
     CHECK(near(run("IF(1 > 2, FUNC.nosuchfunc(1), 20)"), 20.0));
+}
+
+TEST_CASE_METHOD(Fixture, "report_expr: compile() matches eval() -- same expression, same answer", "[posreport]") {
+    // One CHECK per Node::Kind (Literal, BinOp, Neg, Path, Call, Cmp, If),
+    // not just a spot check -- compile() is a real second implementation of
+    // eval()'s semantics, built independently per node kind, so each kind
+    // needs its own proof they agree, not one passing case standing in for
+    // all seven.
+    auto same = [&](std::string_view expr) {
+        const auto a = run(expr);
+        const auto b = run_compiled(expr);
+        CHECK(a == b);
+        return a;
+    };
+    CHECK(near(same("2 + 3 * 4"), 14.0));                          // Literal, BinOp
+    CHECK(near(same("-5 + 3"), -2.0));                              // Neg
+    CHECK(near(same("ins.notional * 2"), 4'000'000.0));             // Path
+    CHECK(near(same("FUNC.round(ins.notional / 1000000, 2)"), 2.0)); // Call
+    CHECK(same("ins.ccy == \"EUR\"") == Value{true});               // Cmp
+    CHECK(near(same("IF(1 < 2, 10, 20)"), 10.0));                   // If
+    CHECK_FALSE(same("FUNC.nosuchfunc(1)").has_value());            // unknown function: both nullopt
+    CHECK_FALSE(same("2 == \"2\"").has_value());                    // not comparable: both nullopt
+}
+
+TEST_CASE_METHOD(Fixture, "report_expr: compile()'s IF genuinely short-circuits too", "[posreport]") {
+    // Same guarantee eval()'s IF has (see the test above this one in spirit):
+    // building the untaken branch's closure is not the same as calling it --
+    // compile() builds both then_/else_ closures unconditionally (that's
+    // just tree construction), but the returned closure only ever CALLS one
+    // of them, so the untaken branch's FUNC call still never actually runs.
+    CHECK(near(run_compiled("IF(1 < 2, 10, FUNC.nosuchfunc(1))"), 10.0));
+    CHECK(near(run_compiled("IF(1 > 2, FUNC.nosuchfunc(1), 20)"), 20.0));
 }
 
 TEST_CASE_METHOD(Fixture, "report_expr: syntax errors are rejected, not silently misparsed", "[posreport]") {
