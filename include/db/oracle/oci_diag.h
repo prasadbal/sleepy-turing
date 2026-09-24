@@ -498,6 +498,19 @@ struct StatementStats {
     return out;
 }
 
+// Convenience overload: reads sql_id directly off the statement handle
+// (OciStatement::sql_id(), an exact per-statement id) instead of a caller
+// having to thread it through manually -- and unlike session_stats()'s
+// with_sql_id option (V$SESSION.PREV_SQL_ID, "whatever this session ran
+// last"), this is unambiguously the query V$SQL is being asked about,
+// even if other statements ran on the same connection in between. `stmt`
+// must already be past execute() -- see OciStatement::sql_id()'s own
+// comment for why.
+[[nodiscard]] inline std::expected<StatementStats, DiagProblem> statement_stats(OciConnection& conn,
+                                                                                const OciStatement& stmt) {
+    return statement_stats(conn, stmt.sql_id());
+}
+
 // ----------------------------------------------------------------------------
 // QueryMeter: what did this call cost?
 // ----------------------------------------------------------------------------

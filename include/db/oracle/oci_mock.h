@@ -86,6 +86,10 @@ struct OCIDate { sb2 OCIDateYYYY = 0; unsigned char OCIDateMM = 0, OCIDateDD = 0
 #define OCI_ATTR_DATA_SIZE     1   // maximum size of the data (real oci.h value)
 #define OCI_ATTR_DATA_TYPE     2   // the SQL type of the column/argument (real oci.h value)
 #define OCI_ATTR_STMT_STATE    182 // real oci.h value -- confirmed against instantclient19's sdk/include/oci.h
+#define OCI_ATTR_SQL_ID        480 // real oci.h value, per Oracle's published OCI reference (12c+) -- NOT
+                                    // independently re-confirmed against a real header in this session, unlike
+                                    // OCI_ATTR_STMT_STATE above; no Oracle client was available here (see
+                                    // core/db/README.md)
 #define OCI_STMT_STATE_INITIALIZED  0x0001
 #define OCI_STMT_STATE_EXECUTED     0x0002
 #define OCI_STMT_STATE_END_OF_FETCH 0x0003
@@ -151,11 +155,25 @@ inline thread_local std::vector<std::string> g_sql_log;
 inline thread_local std::string g_fail_on_sql;
 inline thread_local int g_fail_on_sql_code = 942; // ORA number reported instead, e.g. 2003 = invalid USERENV parameter
 inline thread_local bool g_last_execute_failed_on_sql = false;
+
+// Mirrors real OCI's OCI_ATTR_SQL_ID: a canned, stable value returned
+// unconditionally (the mock never actually parses SQL, so there's nothing
+// real to derive a SQL_ID from) -- present so OciStatement::sql_id() and
+// anything built on it (statement_stats(conn, stmt)) have something to
+// return against the mock rather than only being exercisable live. Not
+// gated on g_stmt_state the way OCI_ATTR_ROWS_FETCHED isn't either
+// (returns its last value regardless of state) -- a test that wants to
+// verify sql_id() specifically rejects Unprepared/Prepared checks
+// OciStatement's own state machine for that, not this value.
+inline thread_local std::string g_mock_sql_id = "mocksqlID0001"; // 13 chars, like a real SQL_ID's length
+inline void set_mock_sql_id(std::string id) { g_mock_sql_id = std::move(id); }
+
 inline void reset_sql_hooks() {
     g_sql_log.clear();
     g_fail_on_sql.clear();
     g_fail_on_sql_code = 942;
     g_last_execute_failed_on_sql = false;
+    g_mock_sql_id = "mocksqlID0001"; // keep every hook a test might set, that another test could observe, reset here
 }
 
 // pvskip/indskip: byte stride from one row's value/indicator to the next
@@ -528,6 +546,12 @@ inline sword OCIAttrGet(const dvoid*, ub4, dvoid* attributep, ub4* sizep, ub4 at
     } else if (attrtype == OCI_ATTR_STMT_STATE && attributep) {
         *static_cast<ub4*>(attributep) = static_cast<ub4>(marketlib::db::oracle::mock::g_stmt_state.load());
         if (sizep) *sizep = sizeof(ub4);
+    } else if (attrtype == OCI_ATTR_SQL_ID && attributep) {
+        // Same pointer-into-owned-storage shape as OCI_ATTR_NAME above:
+        // real OCI hands back a pointer to its own internal buffer, not a
+        // caller-provided one, for this attribute too.
+        *static_cast<text**>(attributep) = reinterpret_cast<text*>(marketlib::db::oracle::mock::g_mock_sql_id.data());
+        if (sizep) *sizep = static_cast<ub4>(marketlib::db::oracle::mock::g_mock_sql_id.size());
     }
     return OCI_SUCCESS;
 }

@@ -386,6 +386,29 @@ public:
         return count;
     }
 
+    // This statement's real SQL_ID (OCI_ATTR_SQL_ID) -- the exact key
+    // V$SQL/V$SQLAREA use for it, read directly off this handle. This is
+    // more precise than oci_diag.h's session_stats(with_sql_id=true),
+    // which can only recover V$SESSION.PREV_SQL_ID -- "whatever this
+    // session ran last before some snapshot query" -- and isn't
+    // necessarily THIS statement if anything else ran on the same
+    // connection in between. Only meaningful after execute(): a statement
+    // that's only been prepared hasn't been parsed into the shared pool
+    // yet and has no SQL_ID, same restriction describeColumns()/
+    // describeColumnPosition() already have for the same underlying
+    // reason (nothing to describe/identify before execute()).
+    std::string sql_id() const {
+        if (state_ != State::Executed && state_ != State::EndOfFetch) {
+            throw OciStatementStateError(
+                "OciStatement::sql_id(): statement is " + state_name(state_) +
+                ", expected Executed -- call execute() first");
+        }
+        text* id_ptr = nullptr;
+        ub4 id_len = 0;
+        OCIAttrGet(handle_.get(), OCI_HTYPE_STMT, &id_ptr, &id_len, OCI_ATTR_SQL_ID, conn_.err());
+        return std::string(reinterpret_cast<const char*>(id_ptr), id_len);
+    }
+
     State state() const noexcept { return state_; }
     OCIStmt* handle() const noexcept { return handle_.get(); }
 

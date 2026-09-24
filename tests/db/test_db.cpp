@@ -252,6 +252,35 @@ TEST_CASE("OciStatement: a zero-row result is Success, not an error", "[db]") {
     CHECK(stmt.state() == OciStatement::State::EndOfFetch);
 }
 
+TEST_CASE("OciStatement: sql_id() throws before execute(), same as describeColumns()", "[db]") {
+    Connected c;
+    OciStatement stmt(c.conn);
+    stmt.prepare("SELECT trade_id FROM trades");
+
+    REQUIRE_THROWS_AS(stmt.sql_id(), OciStatementStateError);
+    try {
+        stmt.sql_id();
+        FAIL("sql_id() before execute() should have thrown");
+    } catch (const OciStatementStateError& e) {
+        CHECK(std::string(e.what()).find("execute()") != std::string::npos);
+    }
+}
+
+TEST_CASE("OciStatement: sql_id() reads OCI_ATTR_SQL_ID after execute()", "[db]") {
+    Connected c;
+    FetchCursorReset reset;
+    struct SqlIdReset { ~SqlIdReset() { mock::reset_sql_hooks(); } } sql_id_reset; // runs even if a REQUIRE below fails
+    mock::set_mock_sql_id("gxk9abcdefghi");
+
+    OciStatement stmt(c.conn);
+    stmt.prepare("SELECT trade_id FROM trades");
+    int trade_id = -1;
+    stmt.bindOutput(1, SQLT_INT, &trade_id, sizeof(trade_id), nullptr, nullptr);
+    REQUIRE(stmt.execute(0).status == ExecStatus::Success);
+
+    CHECK(stmt.sql_id() == "gxk9abcdefghi");
+}
+
 TEST_CASE("OciStatement: bindNameArray re-binds per chunk on one prepared statement", "[db]") {
     Connected c;
 

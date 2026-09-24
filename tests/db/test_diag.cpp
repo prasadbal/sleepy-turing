@@ -290,6 +290,38 @@ TEST_CASE("statement_stats: an unreadable V$SQL is an error", "[diag]") {
     CHECK(s.error().error_code == 942);
 }
 
+TEST_CASE("statement_stats: (conn, stmt) overload binds the statement's own sql_id, not a passed-in one", "[diag]") {
+    CleanMock clean;
+    Connected c;
+    mock::set_mock_sql_id("stmtOwnID001");
+
+    OciStatement stmt(c.conn);
+    stmt.prepare("SELECT trade_id FROM trades");
+    int trade_id = -1;
+    stmt.bindOutput(1, SQLT_INT, &trade_id, sizeof(trade_id), nullptr, nullptr);
+    REQUIRE(stmt.execute(0).status == ExecStatus::Success);
+
+    // The mock always returns the same canned row data regardless of what's
+    // bound (see this file's own header comment), so StatementStats::sql_id
+    // in the RESULT can't be used to verify the overload bound the right
+    // value -- it's a fixed echo either way. What can be verified: the
+    // statement it issues while resolving statement_stats(conn, stmt) is
+    // real, and actually carries stmt.sql_id()'s value as the bind, not some
+    // other/empty one -- checked via the statement logger, the same way
+    // execute()'s bound values are verified elsewhere in this test suite.
+    std::vector<std::string> logged;
+    set_statement_logger([&](std::string_view line) { logged.emplace_back(line); });
+    struct LoggerReset { ~LoggerReset() { set_statement_logger(nullptr); } } logger_reset;
+
+    const auto by_stmt = statement_stats(c.conn, stmt);
+    REQUIRE(by_stmt.has_value());
+    CHECK(by_stmt->found);
+
+    REQUIRE(logged.size() == 1);
+    CHECK(logged[0].find("sql_id='stmtOwnID001'") != std::string::npos); // render_typed_value quotes SQLT_CHR values
+    CHECK(issued("FROM v$sql WHERE sql_id = :sql_id")); // same query path as the sql_id overload, not a separate one
+}
+
 // ---------------------------------------------------------------------------
 // Per-query measurement
 // ---------------------------------------------------------------------------
