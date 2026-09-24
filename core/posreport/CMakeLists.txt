@@ -17,5 +17,6 @@ target_include_directories(core_posreport INTERFACE
 target_link_libraries(core_posreport INTERFACE
     compiler_options
     Boost::pfr
+    Boost::parser
     reenable_exceptions
 )

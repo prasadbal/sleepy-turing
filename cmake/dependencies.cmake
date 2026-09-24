@@ -47,6 +47,45 @@ FetchContent_Declare(pfr
     SOURCE_SUBDIR  do_not_configure
 )
 
+# ── Boost.Parser (posreport: report_expr.h's expression grammar) ─────────────
+# Unlike Boost.PFR (a genuinely standalone, near-zero-dependency repo),
+# Boost.Parser transitively needs hana, charconv, assert, type_index, core,
+# fusion, mpl, tuple, config, container_hash, throw_exception, describe, and
+# mp11 (found by actually grepping every #include <boost/...> those headers
+# reach, recursively, not guessed or assumed complete on the first pass --
+# container_hash's own describe dependency specifically was missed on the
+# first attempt and only found from a real build failure) -- no standalone
+# single-repo fetch covers that. Fetched from the boostorg/boost super-repo
+# instead, with GIT_SUBMODULES restricted to just those library directories
+# (plus parser itself) rather than the full, much larger submodule set the
+# super-repo has -- each library's own include/boost/<name>/ subtree is
+# independently correctly namespaced, so adding each one's include/ as its
+# own SYSTEM include directory below resolves every #include <boost/...>
+# across all of them without needing the unified boost/ symlink tree
+# Boost's own b2/headers build step creates (not run here -- this only
+# needs the headers, same reasoning as PFR's do_not_configure SOURCE_SUBDIR).
+FetchContent_Declare(boost_parser
+    GIT_REPOSITORY https://github.com/boostorg/boost.git
+    GIT_TAG        boost-1.91.0
+    GIT_SHALLOW    TRUE
+    GIT_SUBMODULES
+        libs/parser
+        libs/hana
+        libs/charconv
+        libs/assert
+        libs/type_index
+        libs/core
+        libs/fusion
+        libs/mpl
+        libs/tuple
+        libs/config
+        libs/container_hash
+        libs/throw_exception
+        libs/describe
+        libs/mp11
+    SOURCE_SUBDIR  do_not_configure
+)
+
 # ── tsl::robin_map (fast hash map) ───────────────────────────────────────────
 FetchContent_Declare(robin_map
     GIT_REPOSITORY https://github.com/Tessil/robin-map.git
@@ -110,6 +149,7 @@ FetchContent_MakeAvailable(
     concurrentqueue
     tomlplusplus
     pfr
+    boost_parser
     robin_map
     date
     Catch2
@@ -125,6 +165,16 @@ FetchContent_MakeAvailable(
 add_library(pfr_headers INTERFACE)
 target_include_directories(pfr_headers SYSTEM INTERFACE ${pfr_SOURCE_DIR}/include)
 add_library(Boost::pfr ALIAS pfr_headers)
+
+# Boost.Parser + its transitive dependencies (see the FetchContent_Declare
+# comment above for which, and why these specific ones): each restricted
+# submodule's own include/ added separately, not one shared root.
+add_library(boost_parser_headers INTERFACE)
+foreach(_bp_lib parser hana charconv assert type_index core fusion mpl tuple config container_hash throw_exception describe mp11)
+    target_include_directories(boost_parser_headers SYSTEM INTERFACE
+        ${boost_parser_SOURCE_DIR}/libs/${_bp_lib}/include)
+endforeach()
+add_library(Boost::parser ALIAS boost_parser_headers)
 
 # ── jemalloc (Linux only, installed via apt) ──────────────────────────────────
 if(UNIX AND NOT APPLE)

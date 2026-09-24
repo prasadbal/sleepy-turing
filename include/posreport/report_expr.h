@@ -18,7 +18,7 @@
 //   comparison := additive (('=='|'!='|'<'|'<='|'>'|'>=') additive)?   -- at most one; "a < b < c" is a syntax error, not chained
 //   additive   := term (('+' | '-') term)*
 //   term       := unary (('*' | '/') unary)*
-//   unary      := '-' unary | primary
+//   unary      := '-'* primary                                         -- zero or more unary minus, then a primary
 //   primary    := NUMBER | STRING | path | '(' expr ')'
 //               | 'IF' '(' expr ',' expr ',' expr ')'
 //   path       := IDENT ('.' IDENT)*  [ '(' (expr (',' expr)*)? ')' ]
@@ -34,8 +34,46 @@
 // if the untaken branch is only valid when cond doesn't hold) and not fixable
 // without a special case, so IF gets its own AST node with real short-circuit
 // evaluation instead of going through the function table.
+//
+// Parser: boost::parser (a PEG combinator library, the modern Spirit
+// successor), not a hand-rolled tokenizer+recursive-descent parser -- see
+// core/posreport/README.md for why a plain for loop/runtime index can't
+// dispatch per-field the way earlier design work in this same directory
+// needed, which is the same underlying reason this grammar is built from
+// declarative rule combinators rather than hand-written token-walking code.
+// Three real limitations of this specific boost::parser version were found
+// and worked around while building this file, not assumed away:
+//   1. A rule directly referencing itself as the first parser in its own
+//      alternative (e.g. a naive `'-' >> unary | primary` for unary minus)
+//      hits the library's recursion handling: nested self-calls return a
+//      placeholder ("nope"), not the real attribute, per rule_parser::call's
+//      own documented behavior. Fixed by not self-recursing at all --
+//      `unary` counts leading '-' via plain repetition (*char_('-')) instead
+//      of recursing into itself; odd count negates, even doesn't, same net
+//      value as nested Neg(Neg(...)) would produce.
+//   2. `comparison % ','` (list, 1-or-more) combined with `|` or `-(...)` to
+//      handle a possibly-empty argument list hits a real limitation in this
+//      version's internal move_back() helper, which copy-inserts rather than
+//      moves when merging a move-only vector<unique_ptr<Node>> across an
+//      alternation/optional boundary. Fixed by never asking the library to
+//      do that merge: path_or_call is three flat alternatives (zero-arg
+//      call, one-or-more-arg call via a bare, un-alternated `%`, no call),
+//      each producing a complete NodePtr via its own self-contained action
+//      before `|` ever combines them.
+//   3. Every rule/action here is declared `constexpr` (matching
+//      boost::parser's own test suite convention for exactly this pattern,
+//      not a style choice) -- without it, these are ordinary runtime
+//      globals, and this file crashed on every real recursive/nested
+//      grammar rule (correct results for entirely-flat expressions like
+//      "2 + 3 * 4", assertion failures inside the library for anything
+//      reaching a recursive rule a second time) until every rule and _def
+//      object were made constexpr, forcing compile-time initialization and
+//      sidestepping whatever static-initialization-order dependency the
+//      runtime-global version was missing.
 #pragma once
 #include <posreport/path_resolver.h>
+
+#include <boost/parser/parser.hpp>
 
 #include <cmath>
 #include <functional>
@@ -47,71 +85,7 @@
 
 namespace posreport {
 
-// ---------------------------------------------------------------------------
-// Tokenizer
-// ---------------------------------------------------------------------------
-struct Token {
-    enum class Kind {
-        Ident, Number, String, Dot, Plus, Minus, Star, Slash, LParen, RParen, Comma,
-        Eq, Ne, Lt, Le, Gt, Ge, End
-    } kind;
-    std::string text; // Ident/String (String: the unescaped contents, no quotes)
-    double      num = 0; // Number
-};
-
-inline std::vector<Token> tokenize(std::string_view s) {
-    std::vector<Token> out;
-    std::size_t i = 0;
-    while (i < s.size()) {
-        const char c = s[i];
-        if (c == ' ' || c == '\t') { ++i; continue; }
-        if (c == '.') { out.push_back({Token::Kind::Dot, "."}); ++i; continue; }
-        if (c == '+') { out.push_back({Token::Kind::Plus, "+"}); ++i; continue; }
-        if (c == '-') { out.push_back({Token::Kind::Minus, "-"}); ++i; continue; }
-        if (c == '*') { out.push_back({Token::Kind::Star, "*"}); ++i; continue; }
-        if (c == '/') { out.push_back({Token::Kind::Slash, "/"}); ++i; continue; }
-        if (c == '(') { out.push_back({Token::Kind::LParen, "("}); ++i; continue; }
-        if (c == ')') { out.push_back({Token::Kind::RParen, ")"}); ++i; continue; }
-        if (c == ',') { out.push_back({Token::Kind::Comma, ","}); ++i; continue; }
-        if (c == '=' && i + 1 < s.size() && s[i + 1] == '=') { out.push_back({Token::Kind::Eq, "=="}); i += 2; continue; }
-        if (c == '!' && i + 1 < s.size() && s[i + 1] == '=') { out.push_back({Token::Kind::Ne, "!="}); i += 2; continue; }
-        if (c == '<' && i + 1 < s.size() && s[i + 1] == '=') { out.push_back({Token::Kind::Le, "<="}); i += 2; continue; }
-        if (c == '>' && i + 1 < s.size() && s[i + 1] == '=') { out.push_back({Token::Kind::Ge, ">="}); i += 2; continue; }
-        if (c == '<') { out.push_back({Token::Kind::Lt, "<"}); ++i; continue; }
-        if (c == '>') { out.push_back({Token::Kind::Gt, ">"}); ++i; continue; }
-        if (c == '"') {
-            std::string val;
-            std::size_t j = i + 1;
-            for (; j < s.size() && s[j] != '"'; ++j) {
-                if (s[j] == '\\' && j + 1 < s.size() && (s[j + 1] == '"' || s[j + 1] == '\\')) { val += s[j + 1]; ++j; }
-                else val += s[j];
-            }
-            if (j >= s.size()) throw std::runtime_error("posreport: unterminated string literal in expression: " + std::string(s));
-            out.push_back({Token::Kind::String, val});
-            i = j + 1;
-            continue;
-        }
-        if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
-            std::size_t j = i;
-            while (j < s.size() && (std::isalnum(static_cast<unsigned char>(s[j])) || s[j] == '_')) ++j;
-            out.push_back({Token::Kind::Ident, std::string(s.substr(i, j - i))});
-            i = j;
-            continue;
-        }
-        if (std::isdigit(static_cast<unsigned char>(c))) {
-            std::size_t j = i;
-            while (j < s.size() && (std::isdigit(static_cast<unsigned char>(s[j])) || s[j] == '.')) ++j;
-            Token t{Token::Kind::Number, std::string(s.substr(i, j - i))};
-            t.num = std::stod(t.text);
-            out.push_back(t);
-            i = j;
-            continue;
-        }
-        throw std::runtime_error("posreport: unexpected character '" + std::string(1, c) + "' in expression: " + std::string(s));
-    }
-    out.push_back({Token::Kind::End, ""});
-    return out;
-}
+namespace bp = boost::parser;
 
 // ---------------------------------------------------------------------------
 // AST
@@ -133,150 +107,220 @@ struct Node {
 using NodePtr = std::unique_ptr<Node>;
 
 // ---------------------------------------------------------------------------
-// Parser -- precedence climbing, single pass over the token list.
+// Parser -- boost::parser grammar. See the file header comment above for
+// the three library-specific limitations this shape works around.
 // ---------------------------------------------------------------------------
-class Parser {
-public:
-    explicit Parser(std::string_view src) : src_(src), toks_(tokenize(src)) {}
+namespace grammar {
 
-    NodePtr parse_all() {
-        auto n = parse_comparison();
-        expect(Token::Kind::End, "trailing input after a complete expression");
-        return n;
-    }
+// ---- helpers used inside semantic actions ---------------------------------
+inline NodePtr make_literal(Value v) {
+    auto n = std::make_unique<Node>();
+    n->kind = Node::Kind::Literal;
+    n->literal = std::move(v);
+    return n;
+}
+inline NodePtr make_binop(Op op, NodePtr lhs, NodePtr rhs) {
+    auto n = std::make_unique<Node>();
+    n->kind = Node::Kind::BinOp; n->op = op; n->lhs = std::move(lhs); n->rhs = std::move(rhs);
+    return n;
+}
+inline NodePtr make_cmp(CmpOp op, NodePtr lhs, NodePtr rhs) {
+    auto n = std::make_unique<Node>();
+    n->kind = Node::Kind::Cmp; n->cmp = op; n->lhs = std::move(lhs); n->rhs = std::move(rhs);
+    return n;
+}
+inline NodePtr make_neg(NodePtr operand) {
+    auto n = std::make_unique<Node>();
+    n->kind = Node::Kind::Neg; n->lhs = std::move(operand);
+    return n;
+}
 
-private:
-    std::string_view    src_;
-    std::vector<Token>   toks_;
-    std::size_t          pos_ = 0;
+// ---- rule declarations -----------------------------------------------------
+// Each level that PRODUCES a node has attribute NodePtr and is built via a
+// semantic action (move-only, so the ordinary "attribute propagation"
+// boost::parser does for copyable types doesn't apply -- every action moves
+// explicitly). constexpr throughout -- see limitation #3 in the file header.
+constexpr bp::rule<struct comparison_tag, NodePtr>    comparison    = "comparison";
+constexpr bp::rule<struct additive_tag,   NodePtr>    additive      = "additive";
+constexpr bp::rule<struct term_tag,       NodePtr>    term          = "term";
+constexpr bp::rule<struct unary_tag,      NodePtr>    unary         = "unary";
+constexpr bp::rule<struct primary_tag,    NodePtr>    primary       = "primary";
+constexpr bp::rule<struct if_expr_tag,    NodePtr>    if_expr       = "IF(cond, then, else)";
+constexpr bp::rule<struct path_or_call_tag, NodePtr>  path_or_call  = "path or FUNC.name(args)";
+constexpr bp::rule<struct ident_tag,      std::string> ident         = "identifier";
+constexpr bp::rule<struct string_lit_tag, std::string> string_lit    = "string literal";
 
-    const Token& peek() const { return toks_[pos_]; }
-    Token take() { return toks_[pos_++]; }
-    void expect(Token::Kind k, const char* what) {
-        if (peek().kind != k) fail(what);
-    }
-    [[noreturn]] void fail(const std::string& what) const {
-        throw std::runtime_error("posreport: " + what + " in expression: " + std::string(src_));
-    }
+// ---- lexical pieces ---------------------------------------------------------
+// Identifier: [A-Za-z_][A-Za-z0-9_]*, no internal whitespace (lexeme turns
+// off the skipper for the duration of this sub-parser).
+constexpr auto ident_def =
+    bp::lexeme[(bp::char_('a', 'z') | bp::char_('A', 'Z') | bp::char_('_'))
+               >> *(bp::char_('a', 'z') | bp::char_('A', 'Z') | bp::char_('0', '9') | bp::char_('_'))];
 
-    NodePtr parse_comparison() { // at most one -- "a < b < c" is a syntax error, not chained
-        auto n = parse_expr();
-        static const std::pair<Token::Kind, CmpOp> ops[] = {
-            {Token::Kind::Eq, CmpOp::Eq}, {Token::Kind::Ne, CmpOp::Ne}, {Token::Kind::Le, CmpOp::Le},
-            {Token::Kind::Ge, CmpOp::Ge}, {Token::Kind::Lt, CmpOp::Lt}, {Token::Kind::Gt, CmpOp::Gt},
-        };
-        for (const auto& [tk, cmp] : ops) {
-            if (peek().kind == tk) {
-                take();
-                auto node = std::make_unique<Node>();
-                node->kind = Node::Kind::Cmp; node->cmp = cmp; node->lhs = std::move(n); node->rhs = parse_expr();
-                return node;
-            }
-        }
-        return n;
-    }
+// String literal: "..." with \" and \\ as the only recognized escapes (same
+// as the original tokenizer -- anything else after a backslash is not a
+// recognized escape, so the backslash is kept literally, matching the
+// original's `if (\ and next is " or \) take escaped char; else take char
+// as-is` behavior exactly, backslash included).
+constexpr auto string_lit_def =
+    bp::lexeme['"' >> *(("\\" >> bp::char_("\"\\")) | (bp::char_ - bp::char_('"'))) >> '"'];
 
-    NodePtr parse_expr() { // + -
-        auto n = parse_term();
-        for (;;) {
-            if (peek().kind == Token::Kind::Plus || peek().kind == Token::Kind::Minus) {
-                const Op op = take().kind == Token::Kind::Plus ? Op::Add : Op::Sub;
-                auto node = std::make_unique<Node>();
-                node->kind = Node::Kind::BinOp; node->op = op; node->lhs = std::move(n); node->rhs = parse_term();
-                n = std::move(node);
-            } else break;
-        }
-        return n;
-    }
-    NodePtr parse_term() { // * /
-        auto n = parse_unary();
-        for (;;) {
-            if (peek().kind == Token::Kind::Star || peek().kind == Token::Kind::Slash) {
-                const Op op = take().kind == Token::Kind::Star ? Op::Mul : Op::Div;
-                auto node = std::make_unique<Node>();
-                node->kind = Node::Kind::BinOp; node->op = op; node->lhs = std::move(n); node->rhs = parse_unary();
-                n = std::move(node);
-            } else break;
-        }
-        return n;
-    }
-    NodePtr parse_unary() {
-        if (peek().kind == Token::Kind::Minus) {
-            take();
-            auto node = std::make_unique<Node>();
-            node->kind = Node::Kind::Neg; node->lhs = parse_unary();
-            return node;
-        }
-        return parse_primary();
-    }
-    NodePtr parse_primary() {
-        if (peek().kind == Token::Kind::Number) {
-            const double v = take().num;
-            auto node = std::make_unique<Node>();
-            node->kind = Node::Kind::Literal; node->literal = Value{v};
-            return node;
-        }
-        if (peek().kind == Token::Kind::String) {
-            auto node = std::make_unique<Node>();
-            node->kind = Node::Kind::Literal; node->literal = Value{take().text};
-            return node;
-        }
-        if (peek().kind == Token::Kind::LParen) {
-            take();
-            auto n = parse_comparison();
-            if (peek().kind != Token::Kind::RParen) fail("expected ')'");
-            take();
-            return n;
-        }
-        if (peek().kind == Token::Kind::Ident && peek().text == "IF") return parse_if();
-        if (peek().kind == Token::Kind::Ident) return parse_path_or_call();
-        fail("expected a number, string, identifier or '('");
-    }
-    NodePtr parse_if() {
-        take(); // 'IF'
-        if (peek().kind != Token::Kind::LParen) fail("expected '(' after IF");
-        take();
-        auto node = std::make_unique<Node>();
-        node->kind = Node::Kind::If;
-        node->cond = parse_comparison();
-        if (peek().kind != Token::Kind::Comma) fail("expected ',' after IF's condition");
-        take();
-        node->then_branch = parse_comparison();
-        if (peek().kind != Token::Kind::Comma) fail("expected ',' after IF's then-branch");
-        take();
-        node->else_branch = parse_comparison();
-        if (peek().kind != Token::Kind::RParen) fail("expected ')' to close IF(cond, then, else)");
-        take();
-        return node;
-    }
-    NodePtr parse_path_or_call() {
-        std::vector<std::string> segs;
-        segs.push_back(take().text);
-        while (peek().kind == Token::Kind::Dot) {
-            take();
-            if (peek().kind != Token::Kind::Ident) fail("expected an identifier after '.'");
-            segs.push_back(take().text);
-        }
-        if (peek().kind == Token::Kind::LParen) {
-            if (segs.size() != 2 || segs[0] != "FUNC") fail("only FUNC.<name>(...) is callable");
-            take(); // '('
-            auto node = std::make_unique<Node>();
-            node->kind = Node::Kind::Call; node->func_name = segs[1];
-            if (peek().kind != Token::Kind::RParen) {
-                node->args.push_back(parse_comparison());
-                while (peek().kind == Token::Kind::Comma) { take(); node->args.push_back(parse_comparison()); }
-            }
-            if (peek().kind != Token::Kind::RParen) fail("expected ')' to close a function call");
-            take();
-            return node;
-        }
-        auto node = std::make_unique<Node>();
-        node->kind = Node::Kind::Path; node->path = std::move(segs);
-        return node;
-    }
-};
+// ---- primary ----------------------------------------------------------------
+constexpr auto primary_def =
+    bp::double_[([](auto& ctx) { _val(ctx) = grammar::make_literal(Value{_attr(ctx)}); })]
+    | string_lit[([](auto& ctx) { _val(ctx) = grammar::make_literal(Value{std::move(_attr(ctx))}); })]
+    | ('(' >> comparison >> ')')[([](auto& ctx) { _val(ctx) = std::move(_attr(ctx)); })]
+    | if_expr[([](auto& ctx) { _val(ctx) = std::move(_attr(ctx)); })]
+    | path_or_call[([](auto& ctx) { _val(ctx) = std::move(_attr(ctx)); })];
 
-inline NodePtr parse(std::string_view expr) { return Parser(expr).parse_all(); }
+// ---- unary := '-'* primary  (zero or more unary minus, then a primary) -----
+// NOT '-' unary | primary -- see limitation #1 in the file header comment.
+// Odd count of leading minus signs negates, even doesn't; same net value as
+// nested Neg(Neg(...)) would produce.
+constexpr auto unary_def =
+    (*bp::char_('-') >> primary)
+    [([](auto& ctx) {
+        auto& attr = _attr(ctx); // tuple<vector<char>, NodePtr>
+        auto& minuses = boost::parser::get(attr, bp::llong<0>{});
+        NodePtr result = std::move(boost::parser::get(attr, bp::llong<1>{}));
+        if (minuses.size() % 2 == 1) result = grammar::make_neg(std::move(result));
+        _val(ctx) = std::move(result);
+    })];
+
+// ---- term := unary (('*'|'/') unary)*  (left fold) --------------------------
+// One action on the WHOLE rule body, not one per repetition element -- an
+// action nested inside a *(...) that reads/writes the ENCLOSING rule's
+// _val() across iterations is not how this library's actions compose;
+// every rule here collects its full attribute first (via plain grammar
+// combinators, no actions inside the repetition) and folds it in one place.
+// char_('*')/char_('/') (not bare '*'/'/') deliberately capture the matched
+// operator, so the single outer action can tell which one matched per
+// repetition.
+constexpr auto term_def =
+    (unary >> *((bp::char_('*') | bp::char_('/')) >> unary))
+    [([](auto& ctx) {
+        auto& attr = _attr(ctx); // tuple<NodePtr, vector<tuple<char, NodePtr>>>
+        NodePtr result = std::move(boost::parser::get(attr, bp::llong<0>{}));
+        for (auto& step : boost::parser::get(attr, bp::llong<1>{})) {
+            const char op_char = boost::parser::get(step, bp::llong<0>{});
+            NodePtr& rhs = boost::parser::get(step, bp::llong<1>{});
+            result = grammar::make_binop(op_char == '*' ? Op::Mul : Op::Div, std::move(result), std::move(rhs));
+        }
+        _val(ctx) = std::move(result);
+    })];
+
+// ---- additive := term (('+'|'-') term)*  (left fold) -------------------------
+constexpr auto additive_def =
+    (term >> *((bp::char_('+') | bp::char_('-')) >> term))
+    [([](auto& ctx) {
+        auto& attr = _attr(ctx);
+        NodePtr result = std::move(boost::parser::get(attr, bp::llong<0>{}));
+        for (auto& step : boost::parser::get(attr, bp::llong<1>{})) {
+            const char op_char = boost::parser::get(step, bp::llong<0>{});
+            NodePtr& rhs = boost::parser::get(step, bp::llong<1>{});
+            result = grammar::make_binop(op_char == '+' ? Op::Add : Op::Sub, std::move(result), std::move(rhs));
+        }
+        _val(ctx) = std::move(result);
+    })];
+
+// ---- comparison := additive (cmpop additive)?  (at most one) ----------------
+// "a < b < c" is rejected, not silently reinterpreted: this rule consumes
+// at most one comparison operator; parse()'s bp::parse() call requires the
+// entire input to be consumed, so a second comparison operator left over
+// (e.g. "< c" after "a < b") fails the overall parse as unconsumed trailing
+// input, same effect the hand-rolled parser got from an explicit
+// end-of-input check after parsing exactly one comparison.
+//
+// bp::string(...), not a bare literal, so the matched operator text is
+// captured (bare string literals are auto-omitted here) -- the single outer
+// action dispatches on that text. Longest-match first within the
+// alternation: "==", "!=", "<=", ">=" before "<", ">".
+constexpr auto comparison_def =
+    (additive >> -(
+        (bp::string("==") >> additive) | (bp::string("!=") >> additive) | (bp::string("<=") >> additive)
+        | (bp::string(">=") >> additive) | (bp::string("<") >> additive) | (bp::string(">") >> additive)
+    ))
+    [([](auto& ctx) {
+        auto& attr = _attr(ctx); // tuple<NodePtr, optional<tuple<string, NodePtr>>>
+        NodePtr lhs = std::move(boost::parser::get(attr, bp::llong<0>{}));
+        auto& opt = boost::parser::get(attr, bp::llong<1>{});
+        if (!opt) { _val(ctx) = std::move(lhs); return; }
+        const std::string& op_text = boost::parser::get(*opt, bp::llong<0>{});
+        NodePtr& rhs = boost::parser::get(*opt, bp::llong<1>{});
+        const CmpOp op = op_text == "==" ? CmpOp::Eq : op_text == "!=" ? CmpOp::Ne
+                        : op_text == "<=" ? CmpOp::Le : op_text == ">=" ? CmpOp::Ge
+                        : op_text == "<"  ? CmpOp::Lt : CmpOp::Gt;
+        _val(ctx) = grammar::make_cmp(op, std::move(lhs), std::move(rhs));
+    })];
+
+// ---- IF(cond, then, else) ----------------------------------------------------
+constexpr auto if_expr_def =
+    (bp::lit("IF") >> '(' >> comparison >> ',' >> comparison >> ',' >> comparison >> ')')
+    [([](auto& ctx) {
+        auto& attr = _attr(ctx); // tuple<NodePtr, NodePtr, NodePtr>
+        auto n = std::make_unique<Node>();
+        n->kind = Node::Kind::If;
+        n->cond        = std::move(boost::parser::get(attr, bp::llong<0>{}));
+        n->then_branch = std::move(boost::parser::get(attr, bp::llong<1>{}));
+        n->else_branch = std::move(boost::parser::get(attr, bp::llong<2>{}));
+        _val(ctx) = std::move(n);
+    })];
+
+// ---- path := IDENT ('.' IDENT)*  ['(' (comparison (',' comparison)*)? ')'] --
+// A path is a function call exactly when its segments are ["FUNC", name] and
+// followed by '(' -- enforced in the action, not the grammar (the grammar
+// accepts any ident-path optionally followed by a call; the action rejects a
+// call on anything that isn't FUNC.<name>, same division of labor the
+// original hand-rolled parser used).
+//
+// Three flat alternatives -- zero-arg call, one-or-more-arg call, no call --
+// not one sequence with an optional '(args?)' suffix -- see limitation #2 in
+// the file header comment. Zero-arg tried before one-or-more so a real "()"
+// doesn't fall through to a %-list that requires at least one element; the
+// call-shaped alternatives are tried before the plain-path one so a real
+// call isn't left half-matched as a path with unconsumed trailing "(args)".
+constexpr auto path_or_call_def =
+    (ident >> *('.' >> ident) >> '(' >> ')')
+    [([](auto& ctx) {
+        std::vector<std::string> segs = std::move(_attr(ctx));
+        if (segs.size() != 2 || segs[0] != "FUNC") { _pass(ctx) = false; return; }
+        auto n = std::make_unique<Node>();
+        n->kind = Node::Kind::Call;
+        n->func_name = segs[1];
+        _val(ctx) = std::move(n);
+    })]
+    | (ident >> *('.' >> ident) >> '(' >> (comparison % ',') >> ')')
+    [([](auto& ctx) {
+        auto& attr = _attr(ctx); // tuple<vector<string>, vector<NodePtr>>
+        std::vector<std::string> segs = std::move(boost::parser::get(attr, bp::llong<0>{}));
+        if (segs.size() != 2 || segs[0] != "FUNC") { _pass(ctx) = false; return; }
+        auto n = std::make_unique<Node>();
+        n->kind = Node::Kind::Call;
+        n->func_name = segs[1];
+        for (auto& a : boost::parser::get(attr, bp::llong<1>{})) n->args.push_back(std::move(a));
+        _val(ctx) = std::move(n);
+    })]
+    | (ident >> *('.' >> ident))
+    [([](auto& ctx) {
+        auto n = std::make_unique<Node>();
+        n->kind = Node::Kind::Path;
+        n->path = std::move(_attr(ctx)); // ident >> *('.' >> ident) auto-flattens to vector<string>
+        _val(ctx) = std::move(n);
+    })];
+
+BOOST_PARSER_DEFINE_RULES(comparison, additive, term, unary, primary, if_expr, path_or_call, ident, string_lit);
+
+} // namespace grammar
+
+// Whitespace skipped BETWEEN tokens: space and tab only (not newline), same
+// as the original tokenizer -- bp::blank, not bp::ws (which also eats line
+// breaks). A report-column expression is one line in practice, but this is
+// a faithful port, not a "close enough" one.
+inline NodePtr parse(std::string_view expr) {
+    auto result = bp::parse(expr, grammar::comparison, bp::blank);
+    if (!result) throw std::runtime_error("posreport: syntax error in expression: " + std::string(expr));
+    return std::move(*result);
+}
 
 // ---------------------------------------------------------------------------
 // Evaluator
