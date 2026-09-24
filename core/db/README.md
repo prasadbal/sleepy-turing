@@ -344,6 +344,123 @@ real Oracle. `examples/diag_demo.cpp` is the live check:
 `db_diag_demo <connect_string> <user> <password>`. It runs the same query at
 prefetch 10 and 1000, which should show the round trip count fall sharply.
 
+## Query performance: tuning a large scan against a real database
+
+Findings from tuning one real, slow query (a transaction-table scan
+initially assumed to return ~50 million rows, later found to be ~2.5
+million) against a live database, not from anything built or tested in
+this repo -- recorded here because every one of these was a genuine
+"looks right, isn't" trap, and the next slow query is likely to hit the
+same ones.
+
+**`ORDER BY` is not the same cost as the underlying scan.** Removing an
+outer `ORDER BY` only removes the `SORT` step; if the query was still slow
+afterward, the sort was never the dominant cost, and the real problem is
+in the scan/join plan itself. Conversely, an `ORDER BY` **inside a
+subquery used with `IN`/`EXISTS`** is pure wasted work with zero semantic
+effect -- membership testing doesn't care about order, but Oracle still
+has to materialize and sort the subquery's full result to satisfy it.
+Some optimizer versions strip a provably-useless subquery `ORDER BY`
+during transformation; not reliably enough to assume it for free. Remove
+it and re-measure rather than trust the optimizer to have already done so.
+
+**`NOT IN (subquery)` with a `NULL` in the subquery's results silently
+returns zero rows for the entire outer query** -- three-valued logic makes
+the whole condition evaluate to unknown, not just the non-matching rows.
+This is one of the most common "query returns nothing and nobody can see
+why" bugs in Oracle SQL. Plain `IN` doesn't have this trap (a `NULL` there
+only affects rows that wouldn't have matched anyway). If a filter can be
+written as `NOT IN`, prefer `NOT EXISTS` instead, which has no null
+sensitivity at all.
+
+**`IN (subquery)` commonly gets rewritten internally as a semi-join** --
+seeing a `HASH JOIN` in the plan for a query that only has one real table
+and one `IN` subquery is expected, not a sign of an extra hidden join. The
+subquery *is* the join's other input.
+
+**A hint with a mistyped alias, or targeting a table where the referenced
+index/access path doesn't apply, is silently ignored** -- no error, no
+warning, the optimizer just proceeds as if the hint weren't there. Always
+re-run `DBMS_XPLAN.DISPLAY` after adding `/*+ FULL(t) */` or
+`/*+ PARALLEL(t, n) */` and confirm the plan actually changed
+(`TABLE ACCESS FULL`, `PX COORDINATOR`/`PX SEND`/`PX BLOCK ITERATOR`)
+before trusting a timing comparison.
+
+**Prefetch (`OCI_ATTR_PREFETCH_ROWS`/`OCI_ATTR_PREFETCH_MEMORY`) and the
+array/`DEFINE` fetch size (`nrows` to `OCIStmtFetch2`, `elemSize` to
+`OCIDefineByPos` -- this codebase's `bindOutput()`) are two unrelated
+mechanisms, and tuning only one does nothing:**
+- Prefetch controls how much the OCI client library caches *ahead of* an
+  explicit fetch call, reducing real network round trips to the server.
+- Array/`DEFINE` size controls how many rows land in *your* application
+  buffers per explicit fetch call -- i.e. how many times your own code
+  loops and does per-row work.
+
+Raising prefetch while the array/fetch size stays small can show *no*
+visible improvement even though round trips genuinely dropped, because
+the cost that was actually dominant was per-fetch-call application-side
+overhead, which prefetch never touches. Comparing per-row time at two
+different array sizes (`total_time / rows`) rather than raw per-call
+wall-clock is the way to tell whether round trips were ever the
+bottleneck at all: if per-row time barely moves when the batch size
+changes 10x, round-trip/batching tuning has hit its ceiling and the real
+cost is elsewhere (server-side per-row evaluation, or genuine I/O
+throughput).
+
+**`OCI_ATTR_PREFETCH_MEMORY` and `OCI_ATTR_PREFETCH_ROWS` are both `ub4`
+(32-bit unsigned), and `4GB` overflows it exactly.** `4×1024³ = 2^32`,
+one more than `ub4`'s max (`2^32 - 1`). Computed or truncated into a
+32-bit value, it silently wraps to `0` -- a real, different, valid value
+to OCI (probably "no memory-based limit"), not an error. Anything measured
+believing "4GB" was in effect while this was actually 0 needs re-measuring
+once corrected. Read the value back with `OCIAttrGet` after setting it,
+not just checking the `OCIAttrSet` return code -- a successful set doesn't
+guarantee the value that's actually in effect matches what was intended
+(wrong handle, a pooled statement handle carrying a stale value from
+before, or a set applied at the wrong point in the prepare/execute
+lifecycle all pass silently too).
+
+**`PARALLEL` only helps if the bottleneck is on the server.** Splitting a
+scan/join across parallel execution servers helps when the cost is
+server-side CPU (per-row predicate/join evaluation) or the I/O subsystem
+can genuinely serve multiple concurrent readers faster than one serial
+stream. It does nothing for a bottleneck in the *client's* own fetch loop
+(per-row OCI type conversion, NLS conversion, application-side
+processing) -- Oracle's parallel execution still funnels final results
+back through the one client session via the query coordinator, so a
+faster-to-execute-but-still-single-stream result doesn't change how fast
+the client can consume it. Check server-side CPU while a batch is
+fetching before reaching for `PARALLEL`: pegged CPU on the database host
+means it can help; a mostly-idle server while the client-side fetch loop
+churns means the cost is client-side and `PARALLEL` won't touch it.
+
+**"Stuck" and "slow" are different failure modes and need different
+diagnosis.** A query that eventually returns is a tuning problem (the
+above). A query whose `execute()`/fetch never returns at all is more
+likely a wait/contention problem, and `PARALLEL` is a specific new way to
+cause it: if the instance doesn't have enough `PARALLEL_MAX_SERVERS` free,
+or other sessions already hold the available ones, a parallel query can
+sit queued waiting for slave processes rather than actually running.
+Check what the session is actually waiting on rather than guessing:
+
+```sql
+SELECT sid, serial#, status, event, wait_class, seconds_in_wait
+FROM v$session
+WHERE sid = (SELECT sid FROM v$mystat WHERE rownum = 1);
+```
+
+`event` names the exact wait (`PX Deq: Execute Reply`/`PX qref latch` for
+parallel-slave starvation; `enq: TX - row lock contention` for blocking on
+another session's uncommitted transaction; `direct path read`/`db file
+sequential read` for still-genuinely-working, not stuck).
+
+**Verify the row-count assumption behind any time estimate before trusting
+extrapolated numbers.** The original ask here was for a query "maybe 50
+million rows"; the real figure turned out to be ~2.5 million, a 20x
+difference that made every earlier "this might take hours" extrapolation
+wrong by the same factor. A measured per-row or per-batch rate is only as
+good as the row count it gets multiplied by.
+
 ## What this doesn't have (yet)
 
 Nothing left unbuilt at the scope `ideas/binding` covers: array-bind
