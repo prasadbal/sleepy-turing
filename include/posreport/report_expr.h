@@ -188,40 +188,29 @@ constexpr auto unary_def =
     })];
 
 // ---- term := unary (('*'|'/') unary)*  (left fold) --------------------------
-// One action on the WHOLE rule body, not one per repetition element -- an
-// action nested inside a *(...) that reads/writes the ENCLOSING rule's
-// _val() across iterations is not how this library's actions compose;
-// every rule here collects its full attribute first (via plain grammar
-// combinators, no actions inside the repetition) and folds it in one place.
-// char_('*')/char_('/') (not bare '*'/'/') deliberately capture the matched
-// operator, so the single outer action can tell which one matched per
-// repetition.
+// One action per operator, each building the right node directly -- '*'
+// found means Mul, no need to capture and re-inspect which character
+// matched. (An earlier version of this file captured the operator
+// generically and dispatched on it in one combined action, believing this
+// direct-per-alternative form was broken -- that belief was formed while
+// debugging against a mismatched boost::parser header version and never
+// retested once the real one was found. Retested since: this exact
+// shape -- action nested inside *(...), reading/writing the enclosing
+// rule's _val() per repetition -- works correctly against boost-1.91.0.)
 constexpr auto term_def =
-    (unary >> *((bp::char_('*') | bp::char_('/')) >> unary))
-    [([](auto& ctx) {
-        auto& attr = _attr(ctx); // tuple<NodePtr, vector<tuple<char, NodePtr>>>
-        NodePtr result = std::move(boost::parser::get(attr, bp::llong<0>{}));
-        for (auto& step : boost::parser::get(attr, bp::llong<1>{})) {
-            const char op_char = boost::parser::get(step, bp::llong<0>{});
-            NodePtr& rhs = boost::parser::get(step, bp::llong<1>{});
-            result = grammar::make_binop(op_char == '*' ? Op::Mul : Op::Div, std::move(result), std::move(rhs));
-        }
-        _val(ctx) = std::move(result);
-    })];
+    unary[([](auto& ctx) { _val(ctx) = std::move(_attr(ctx)); })]
+    >> *(
+        ('*' >> unary)[([](auto& ctx) { _val(ctx) = grammar::make_binop(Op::Mul, std::move(_val(ctx)), std::move(_attr(ctx))); })]
+        | ('/' >> unary)[([](auto& ctx) { _val(ctx) = grammar::make_binop(Op::Div, std::move(_val(ctx)), std::move(_attr(ctx))); })]
+    );
 
 // ---- additive := term (('+'|'-') term)*  (left fold) -------------------------
 constexpr auto additive_def =
-    (term >> *((bp::char_('+') | bp::char_('-')) >> term))
-    [([](auto& ctx) {
-        auto& attr = _attr(ctx);
-        NodePtr result = std::move(boost::parser::get(attr, bp::llong<0>{}));
-        for (auto& step : boost::parser::get(attr, bp::llong<1>{})) {
-            const char op_char = boost::parser::get(step, bp::llong<0>{});
-            NodePtr& rhs = boost::parser::get(step, bp::llong<1>{});
-            result = grammar::make_binop(op_char == '+' ? Op::Add : Op::Sub, std::move(result), std::move(rhs));
-        }
-        _val(ctx) = std::move(result);
-    })];
+    term[([](auto& ctx) { _val(ctx) = std::move(_attr(ctx)); })]
+    >> *(
+        ('+' >> term)[([](auto& ctx) { _val(ctx) = grammar::make_binop(Op::Add, std::move(_val(ctx)), std::move(_attr(ctx))); })]
+        | ('-' >> term)[([](auto& ctx) { _val(ctx) = grammar::make_binop(Op::Sub, std::move(_val(ctx)), std::move(_attr(ctx))); })]
+    );
 
 // ---- comparison := additive (cmpop additive)?  (at most one) ----------------
 // "a < b < c" is rejected, not silently reinterpreted: this rule consumes
@@ -231,27 +220,22 @@ constexpr auto additive_def =
 // input, same effect the hand-rolled parser got from an explicit
 // end-of-input check after parsing exactly one comparison.
 //
-// bp::string(...), not a bare literal, so the matched operator text is
-// captured (bare string literals are auto-omitted here) -- the single outer
-// action dispatches on that text. Longest-match first within the
-// alternation: "==", "!=", "<=", ">=" before "<", ">".
+// Same one-action-per-alternative shape as term/additive above, nested
+// inside -(...) (optional, 0-or-1) rather than *(...) (0-or-more) -- also
+// retested and confirmed working. bp::lit(...), not a bare literal or
+// bp::string(...): the operator only needs to be MATCHED here, not
+// captured, since each alternative already knows which comparison it is.
+// Longest-match first: "==", "!=", "<=", ">=" before "<", ">".
 constexpr auto comparison_def =
-    (additive >> -(
-        (bp::string("==") >> additive) | (bp::string("!=") >> additive) | (bp::string("<=") >> additive)
-        | (bp::string(">=") >> additive) | (bp::string("<") >> additive) | (bp::string(">") >> additive)
-    ))
-    [([](auto& ctx) {
-        auto& attr = _attr(ctx); // tuple<NodePtr, optional<tuple<string, NodePtr>>>
-        NodePtr lhs = std::move(boost::parser::get(attr, bp::llong<0>{}));
-        auto& opt = boost::parser::get(attr, bp::llong<1>{});
-        if (!opt) { _val(ctx) = std::move(lhs); return; }
-        const std::string& op_text = boost::parser::get(*opt, bp::llong<0>{});
-        NodePtr& rhs = boost::parser::get(*opt, bp::llong<1>{});
-        const CmpOp op = op_text == "==" ? CmpOp::Eq : op_text == "!=" ? CmpOp::Ne
-                        : op_text == "<=" ? CmpOp::Le : op_text == ">=" ? CmpOp::Ge
-                        : op_text == "<"  ? CmpOp::Lt : CmpOp::Gt;
-        _val(ctx) = grammar::make_cmp(op, std::move(lhs), std::move(rhs));
-    })];
+    additive[([](auto& ctx) { _val(ctx) = std::move(_attr(ctx)); })]
+    >> -(
+        (bp::lit("==") >> additive)[([](auto& ctx) { _val(ctx) = grammar::make_cmp(CmpOp::Eq, std::move(_val(ctx)), std::move(_attr(ctx))); })]
+        | (bp::lit("!=") >> additive)[([](auto& ctx) { _val(ctx) = grammar::make_cmp(CmpOp::Ne, std::move(_val(ctx)), std::move(_attr(ctx))); })]
+        | (bp::lit("<=") >> additive)[([](auto& ctx) { _val(ctx) = grammar::make_cmp(CmpOp::Le, std::move(_val(ctx)), std::move(_attr(ctx))); })]
+        | (bp::lit(">=") >> additive)[([](auto& ctx) { _val(ctx) = grammar::make_cmp(CmpOp::Ge, std::move(_val(ctx)), std::move(_attr(ctx))); })]
+        | (bp::lit("<")  >> additive)[([](auto& ctx) { _val(ctx) = grammar::make_cmp(CmpOp::Lt, std::move(_val(ctx)), std::move(_attr(ctx))); })]
+        | (bp::lit(">")  >> additive)[([](auto& ctx) { _val(ctx) = grammar::make_cmp(CmpOp::Gt, std::move(_val(ctx)), std::move(_attr(ctx))); })]
+    );
 
 // ---- IF(cond, then, else) ----------------------------------------------------
 constexpr auto if_expr_def =
