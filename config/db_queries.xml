@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  QueryDescriptor SQL text, looked up by name via QuerySqlRegistry
+  (include/db/oracle/query_sql_registry.h). Each descriptor in C++ declares
+  a query_name matching one <query name="..."> entry here; bind_type,
+  define_type, and key_type stay in C++ (see query_descriptor.h) -- only the
+  SQL text itself lives here, so it can be edited without a rebuild.
+-->
+<queries>
+    <query name="objects_by_name">
+        <sql><![CDATA[
+            SELECT object_name, object_type FROM all_objects WHERE ROWNUM <= 2000
+        ]]></sql>
+    </query>
+
+    <query name="objects_of_type">
+        <sql><![CDATA[
+            SELECT object_name, object_type FROM all_objects
+            WHERE object_type = :object_type AND ROWNUM <= 2000
+        ]]></sql>
+    </query>
+</queries>

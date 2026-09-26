@@ -102,6 +102,18 @@ FetchContent_Declare(date
     GIT_SHALLOW    TRUE
 )
 
+# ── pugixml (db: QueryDescriptor SQL text stored in an external XML file) ────
+# Small, standalone, genuinely near-zero-dependency (unlike Boost.Parser's
+# 14-library transitive pull) -- a real single-purpose XML library, not the
+# full-Boost-tree situation elsewhere in this project.
+set(PUGIXML_NO_XPATH ON CACHE BOOL "" FORCE)  # not needed: lookups here are by a flat name attribute, not XPath
+set(PUGIXML_NO_EXCEPTIONS OFF CACHE BOOL "" FORCE) # keep default parse-exception behavior
+FetchContent_Declare(pugixml
+    GIT_REPOSITORY https://github.com/zeux/pugixml.git
+    GIT_TAG        v1.16
+    GIT_SHALLOW    TRUE
+)
+
 # ── Catch2 v3 (testing) ───────────────────────────────────────────────────────
 FetchContent_Declare(Catch2
     GIT_REPOSITORY https://github.com/catchorg/Catch2.git
@@ -150,6 +162,7 @@ FetchContent_MakeAvailable(
     tomlplusplus
     pfr
     boost_parser
+    pugixml
     robin_map
     date
     Catch2

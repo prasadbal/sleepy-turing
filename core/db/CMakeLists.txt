@@ -21,6 +21,7 @@ target_include_directories(core_db INTERFACE
 target_link_libraries(core_db INTERFACE
     compiler_options
     Boost::pfr
+    pugixml::pugixml   # query_sql_registry.h: QueryDescriptor SQL loaded from an external XML file
     reenable_exceptions
 )
 

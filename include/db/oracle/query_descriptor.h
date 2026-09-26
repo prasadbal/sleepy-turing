@@ -6,15 +6,23 @@
 //   struct ObjectsByName {
 //       using bind_type   = NoBind;                    // no :placeholders
 //       using define_type = ObjectRow;                  // the output row shape
-//       static constexpr std::string_view sql =
-//           "SELECT object_name, object_type FROM all_objects WHERE ROWNUM <= 5000";
+//       static constexpr std::string_view query_name = "objects_by_name";
 //       using key_type    = std::index_sequence<0>;      // key on define_type's field 0
 //   };
 //
+// query_name names this descriptor's entry in a QuerySqlRegistry
+// (query_sql_registry.h) -- the actual SQL text lives in an external XML
+// file, not in this struct, so it can be edited without a C++ rebuild.
+// bind_type/define_type/key_type stay here: they're structural (what a row
+// looks like, how to bind/key it), not something a config file should own.
+// run_and_measure() below takes the registry to resolve query_name against
+// explicitly, the same way it already takes OciConnection/QueryMeter
+// explicitly rather than reaching for global state.
+//
 // Declare descriptors at namespace scope, not inside a function. A class
 // declared inside a function ([class.local]) cannot have a static data
-// member, constexpr or not, so a descriptor's `static constexpr sql` cannot
-// be defined inside main() or any other function body.
+// member, constexpr or not, so a descriptor's `static constexpr query_name`
+// cannot be defined inside main() or any other function body.
 //
 // key_type names which define_type fields (by position, boost::pfr order)
 // form the map key that run_and_measure() indexes its results by -- e.g.
@@ -33,6 +41,7 @@
 // an empty struct satisfies (tuple_size_v == 0), and execute()/select_rows()
 // with such a struct binds nothing -- see NoBind below.
 #include <db/oracle/oci_diag.h>
+#include <db/oracle/query_sql_registry.h>
 
 #include <boost/pfr.hpp>
 #include <cstddef>
@@ -94,21 +103,23 @@ struct QueryRunResult {
     std::size_t                             row_count = 0; // rows fetched, before dedup by key
 };
 
-// Runs Descriptor::sql through QueryMeter, binding `bind` (pass a NoBind{}
-// for a query with no parameters) and folding every fetched row into `rows`
-// keyed by key_of<Descriptor>. A duplicate key overwrites -- last row wins --
-// same "last one seen" semantics as a plain std::map::operator[] would give;
-// if a descriptor's key isn't actually unique in the result set, row_count
-// vs rows.size() tells you so.
+// Runs Descriptor::query_name's SQL (resolved via `sql_registry`) through
+// QueryMeter, binding `bind` (pass a NoBind{} for a query with no
+// parameters) and folding every fetched row into `rows` keyed by
+// key_of<Descriptor>. A duplicate key overwrites -- last row wins -- same
+// "last one seen" semantics as a plain std::map::operator[] would give; if
+// a descriptor's key isn't actually unique in the result set, row_count vs
+// rows.size() tells you so.
 template<class Descriptor>
 [[nodiscard]] QueryRunResult<Descriptor> run_and_measure(
-    OciConnection& conn, QueryMeter& meter, typename Descriptor::bind_type bind = {},
+    OciConnection& conn, QueryMeter& meter, const QuerySqlRegistry& sql_registry,
+    typename Descriptor::bind_type bind = {},
     std::size_t prefetch_rows = 500, std::size_t fetch_batch_size = 200)
 {
     QueryRunResult<Descriptor> out;
     const auto m = meter.measure([&] {
         return select_rows<typename Descriptor::bind_type, typename Descriptor::define_type>(
-            conn, std::string(Descriptor::sql), bind, prefetch_rows, fetch_batch_size,
+            conn, sql_registry.sql_for(Descriptor::query_name), bind, prefetch_rows, fetch_batch_size,
             [&](const typename Descriptor::define_type* rows, std::size_t n) {
                 out.row_count += n;
                 for (std::size_t i = 0; i < n; ++i) out.rows[key_of<Descriptor>(rows[i])] = rows[i];
