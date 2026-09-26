@@ -16,8 +16,10 @@
 #include <db/oracle/oci_lob.h>
 #include <db/oracle/oci_statement.h>
 
+#include <array>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace marketlib::db::oracle;
@@ -54,6 +56,16 @@ struct WithString { std::string name; };
 struct WithOptionalFixedString { std::optional<FixedString<8>> name; };
 struct WithOptionalLob { std::optional<OciClob> body; };
 
+// The member is deliberately NOT named trade_id: reflective_struct means
+// field_names() -- not boost::pfr's own compiler-derived name for the
+// member -- is what binding actually uses. If this bound as "x" instead
+// (boost::pfr's real name for the field), the UPDATE below would bind a
+// nonexistent parameter and fail.
+struct ReflectiveTradeId {
+    int x;
+    static constexpr std::array<std::string_view, 1> field_names() { return {"trade_id"}; }
+};
+
 } // namespace
 
 TEST_CASE("connection: connect and disconnect", "[db]") {
@@ -76,6 +88,28 @@ TEST_CASE("scalar_bindable: which structs the reflection layer accepts", "[db]")
     STATIC_REQUIRE_FALSE(scalar_bindable<WithOptionalFixedString>);
     // A nullable LOB isn't wired in.
     STATIC_REQUIRE_FALSE(scalar_bindable<WithOptionalLob>);
+}
+
+TEST_CASE("reflective_struct: field_names() drives binding, not boost::pfr's own member name",
+          "[db]") {
+    STATIC_REQUIRE(reflective_struct<ReflectiveTradeId>);
+    // A plain aggregate with no field_names() of its own still falls back
+    // to boost::pfr's derivation -- unaffected by any of this.
+    STATIC_REQUIRE_FALSE(reflective_struct<TradeRow>);
+
+    Connected c;
+    std::vector<std::string> logged;
+    set_statement_logger([&](std::string_view line) { logged.emplace_back(line); });
+    struct LoggerReset { ~LoggerReset() { set_statement_logger(nullptr); } } reset;
+
+    ReflectiveTradeId params{100};
+    const auto r = execute(c.conn, "UPDATE trades SET notional=1 WHERE trade_id=:trade_id", params);
+
+    REQUIRE(r.status == ExecStatus::Success);
+    REQUIRE(logged.size() == 1);
+    // Bound as "trade_id" (field_names()'s name), not "x" (the member's own
+    // name, which is what boost::pfr::names_as_array would have produced).
+    CHECK(logged[0].find("trade_id=100") != std::string::npos);
 }
 
 TEST_CASE("execute: DDL with no bind parameters", "[db]") {

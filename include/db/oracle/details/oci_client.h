@@ -92,7 +92,7 @@ void bind_one_param(OciStatement& stmt, OciConnection& conn, T& params, std::str
 template <typename T, std::size_t... I>
 void bind_params_impl(OciStatement& stmt, OciConnection& conn, T& params, std::vector<sb2>& indicators,
                        bind_t<T>& staging, std::index_sequence<I...>) {
-    constexpr auto names = boost::pfr::names_as_array<T>();
+    constexpr auto names = field_names_of<T>();
     (bind_one_param<I>(stmt, conn, params, names[I], indicators, staging), ...);
 }
 
@@ -132,7 +132,7 @@ std::vector<ub4> resolve_column_positions(OciStatement& stmt, OciConnection& con
         return positions;
     }
 
-    constexpr auto field_names = boost::pfr::names_as_array<T>();
+    constexpr auto field_names = field_names_of<T>();
     for (std::size_t i = 0; i < field_count; ++i) {
         positions[i] = stmt.describeColumnPosition(std::string(field_names[i]));
     }
@@ -425,7 +425,7 @@ template <typename T, std::size_t... I>
 void bind_array_fields_impl(OciStatement& stmt, std::vector<T>& rows,
                              std::vector<std::vector<sb2>>& indicators,
                              std::size_t offset, std::size_t count, std::index_sequence<I...>) {
-    constexpr auto names = boost::pfr::names_as_array<T>();
+    constexpr auto names = field_names_of<T>();
     (bind_array_field<I>(stmt, rows, indicators, offset, count, names[I]), ...);
 }
 

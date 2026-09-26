@@ -41,10 +41,12 @@
 #include <db/oracle/oci_statement.h>
 
 #include <boost/pfr.hpp>
+#include <concepts>
 #include <cstddef>
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -59,6 +61,39 @@ template <typename U> struct optional_value { using type = void; };
 template <typename U> struct optional_value<std::optional<U>> { using type = U; };
 template <typename U> using optional_value_t = typename optional_value<U>::type;
 template <typename U> inline constexpr bool is_optional_v = !std::is_void_v<optional_value_t<U>>;
+
+// ----------------------------------------------------------------------------
+// reflective_struct<T>: T supplies its own field names directly, as an
+// explicit static field_names() -- an alternative to boost::pfr's own name
+// derivation, which works by parsing each compiler's pretty-function output
+// (__PRETTY_FUNCTION__/__FUNCSIG__). That's real, working reflection, but
+// more compiler-specific than the structured-bindings-based mechanism
+// boost::pfr::get<I>/tuple_size_v use for *value* access -- every T here
+// still goes through that mechanism regardless of whether it's a
+// reflective_struct, only *name* derivation is affected. A codegen'd
+// struct, generated straight from a query's known XML field names, has no
+// reason to make the compiler re-derive what its own generator already
+// knows for certain -- it emits field_names() directly instead.
+// ----------------------------------------------------------------------------
+template <typename T>
+concept reflective_struct = requires(std::size_t i) {
+    { T::field_names().size() } -> std::convertible_to<std::size_t>;
+    { T::field_names()[i] } -> std::convertible_to<std::string_view>;
+};
+
+// The field-name list for T: T::field_names() for a reflective_struct,
+// boost::pfr::names_as_array<T>() (ordinary compiler-derived reflection)
+// for everything else. Every name-based lookup in details/oci_client.h
+// goes through this one dispatch point, so a plain hand-written struct's
+// behavior is completely unchanged.
+template <typename T>
+constexpr auto field_names_of() {
+    if constexpr (reflective_struct<T>) {
+        return T::field_names();
+    } else {
+        return boost::pfr::names_as_array<T>();
+    }
+}
 
 // ----------------------------------------------------------------------------
 // Compile-time OCI external type code for a scalar field. std::optional<U>
