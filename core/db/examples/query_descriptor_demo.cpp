@@ -110,5 +110,17 @@ int main(int argc, char** argv) {
     // query_name matching a new <query name="..."> entry in
     // config/db_queries.xml) and one more run_and_dump<YourDescriptor>(...) call.
 
+    // get_map<>() -- when you just want the rows keyed by their first field
+    // and don't care about stats, the same ObjectsByName/ObjectsOfType
+    // descriptors work directly: no separate struct, no query_name passed
+    // twice, no QueryMeter.
+    std::printf("\n########## 3: get_map<ObjectsByName>() ##########\n");
+    const auto by_name = get_map<ObjectsByName>(conn, sql_registry);
+    std::printf("rows: %zu\n", by_name.size());
+
+    std::printf("\n########## 4: get_map<ObjectsOfType>() ##########\n");
+    const auto of_type = get_map<ObjectsOfType>(conn, sql_registry, filter);
+    std::printf("rows: %zu\n", of_type.size());
+
     return EXIT_SUCCESS;
 }

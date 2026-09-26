@@ -142,6 +142,50 @@ TEST_CASE("run_and_measure: an unreadable table is reported, not a crash", "[que
 }
 
 // ---------------------------------------------------------------------------
+// get_map()
+// ---------------------------------------------------------------------------
+
+TEST_CASE("get_map: same descriptor run_and_measure uses, no query_name passed separately",
+          "[query_descriptor][get_map]") {
+    Connected c;
+    const auto rows = get_map<ObjectsByName>(c.conn, descriptor_test_registry());
+
+    REQUIRE(rows.size() == 3); // the mock always returns 3 rows, all distinct on object_name
+    CHECK(rows.contains(std::tuple{std::string("row0_col0")}));
+    CHECK(rows.contains(std::tuple{std::string("row1_col0")}));
+    CHECK(rows.contains(std::tuple{std::string("row2_col0")}));
+}
+
+TEST_CASE("get_map: keyed identically to run_and_measure with key_type = index_sequence<0>",
+          "[query_descriptor][get_map]") {
+    Connected c;
+    QueryMeter meter(c.conn);
+    const auto via_run_and_measure = run_and_measure<ObjectsByName>(c.conn, meter, descriptor_test_registry());
+    const auto via_get_map = get_map<ObjectsByName>(c.conn, descriptor_test_registry());
+
+    REQUIRE(via_get_map.size() == via_run_and_measure.rows.size());
+    for (const auto& [key, row] : via_get_map) {
+        REQUIRE(via_run_and_measure.rows.contains(key));
+        CHECK(row.object_name.str() == via_run_and_measure.rows.at(key).object_name.str());
+    }
+}
+
+// A one-off struct satisfying only query_association (define_type +
+// query_name), not a full QueryDescriptor -- no bind_type, no key_type --
+// to prove get_map() doesn't require the heavier struct.
+struct ObjectsMinimal {
+    using define_type = ObjRow;
+    static constexpr std::string_view query_name = "test_objects_by_name";
+};
+
+TEST_CASE("get_map: works with a minimal query_association struct, not just a full QueryDescriptor",
+          "[query_descriptor][get_map]") {
+    Connected c;
+    const auto rows = get_map<ObjectsMinimal>(c.conn, descriptor_test_registry());
+    CHECK(rows.size() == 3);
+}
+
+// ---------------------------------------------------------------------------
 // QuerySqlRegistry
 // ---------------------------------------------------------------------------
 

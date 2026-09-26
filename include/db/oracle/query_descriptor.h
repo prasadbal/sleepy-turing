@@ -44,9 +44,11 @@
 #include <db/oracle/query_sql_registry.h>
 
 #include <boost/pfr.hpp>
+#include <concepts>
 #include <cstddef>
 #include <map>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -128,6 +130,61 @@ template<class Descriptor>
     out.result = m.result;
     out.stats = m.stats;
     out.problems = m.problems;
+    return out;
+}
+
+// Key type get_map() below uses: the same tuple-of-one shape key_of<>
+// produces for a single-field key_type, so a get_map() result and a
+// run_and_measure() result with key_type = std::index_sequence<0> are
+// keyed identically and comparable.
+template<class Define>
+using first_field_key_t = decltype(detail::qd::key_of_impl(std::declval<const Define&>(), std::index_sequence<0>{}));
+
+// The subset of QueryDescriptor that get_map() actually needs: an
+// association between a row shape and a query name. Every real
+// QueryDescriptor already satisfies this (define_type + query_name are two
+// of its four members) -- get_map<ObjectsByName>(...) works with the exact
+// same struct run_and_measure<ObjectsByName>(...) uses, no new declaration
+// required. A one-off query that has no need for run_and_measure()'s
+// key_type/bind_type can instead declare just the two members this concept
+// asks for.
+template<class Query>
+concept query_association = requires {
+    typename Query::define_type;
+    { Query::query_name } -> std::convertible_to<std::string_view>;
+};
+
+// A lighter-weight sibling of run_and_measure() for when a query's name is
+// already tied to its row shape via `Query` (a QueryDescriptor, or anything
+// smaller satisfying query_association) -- so unlike an earlier version of
+// this function, the query's name is never a second, separately-typed-out
+// runtime argument that could drift from Query::define_type:
+//
+//   auto rows  = get_map<ObjectsByName>(conn, sql_registry);
+//   auto rows2 = get_map<ObjectsOfType>(conn, sql_registry, TypeFilter{.object_type = "TABLE"});
+//
+// `Bind` is deduced from whatever value is actually passed for `bind` (or
+// defaults to NoBind) rather than being a member Query has to declare --
+// its type already exists at the call site as the argument itself, so
+// naming it a second time on Query would be redundant. The map is keyed on
+// Query::define_type's first field only (boost::pfr position 0) -- the
+// same key every QueryDescriptor declared so far actually uses (key_type =
+// std::index_sequence<0>) -- with no way to ask for a composite key. No
+// QueryMeter/stats either: this is for "get me the data", not "investigate
+// this query's performance". Reach for run_and_measure() instead when you
+// need either.
+template<query_association Query, class Bind = NoBind>
+[[nodiscard]] std::map<first_field_key_t<typename Query::define_type>, typename Query::define_type>
+get_map(OciConnection& conn, const QuerySqlRegistry& sql_registry,
+        Bind bind = {}, std::size_t prefetch_rows = 500, std::size_t fetch_batch_size = 200)
+{
+    using Define = typename Query::define_type;
+    std::map<first_field_key_t<Define>, Define> out;
+    select_rows<Bind, Define>(conn, sql_registry.sql_for(Query::query_name), bind, prefetch_rows, fetch_batch_size,
+                               [&](const Define* rows, std::size_t n) {
+                                   for (std::size_t i = 0; i < n; ++i)
+                                       out[detail::qd::key_of_impl(rows[i], std::index_sequence<0>{})] = rows[i];
+                               });
     return out;
 }
 
