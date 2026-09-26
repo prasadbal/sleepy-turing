@@ -61,13 +61,28 @@ struct BadQuery {
     using key_type    = std::index_sequence<0>;
 };
 
-// One shared registry for every run_and_measure() test below -- the actual
-// SQL text doesn't matter against the mock (it returns canned rows whatever
-// the SQL says), only that these two names resolve to something.
+struct TypeFilter { FixedString<32> object_type; };
+
+// query_association-only (no bind_type, no key_type) -- proves get_map()
+// works with a bind parameter without the struct declaring bind_type at
+// all: Bind is deduced from whatever value is passed as get_map()'s third
+// argument, here TypeFilter.
+struct ObjectsOfTypeMinimal {
+    using define_type = ObjRow;
+    static constexpr std::string_view query_name = "test_objects_of_type";
+};
+
+// One shared registry for every run_and_measure()/get_map() test below --
+// the actual SQL text doesn't matter against the mock (it returns canned
+// rows whatever the SQL says, ignoring any bind values too), only that
+// these names resolve to something.
 const QuerySqlRegistry& descriptor_test_registry() {
     static const QuerySqlRegistry reg = QuerySqlRegistry::from_string(R"(
         <queries>
             <query name="test_objects_by_name"><sql>SELECT object_name, object_type FROM all_objects</sql></query>
+            <query name="test_objects_of_type">
+                <sql>SELECT object_name, object_type FROM all_objects WHERE object_type = :object_type</sql>
+            </query>
             <query name="test_bad_query"><sql>SELECT object_name FROM nonexistent_view</sql></query>
         </queries>
     )");
@@ -183,6 +198,15 @@ TEST_CASE("get_map: works with a minimal query_association struct, not just a fu
     Connected c;
     const auto rows = get_map<ObjectsMinimal>(c.conn, descriptor_test_registry());
     CHECK(rows.size() == 3);
+}
+
+TEST_CASE("get_map: binds a parameter with no bind_type declared on the struct -- Bind is deduced",
+          "[query_descriptor][get_map]") {
+    Connected c;
+    TypeFilter filter;
+    filter.object_type.assign("TABLE");
+    const auto rows = get_map<ObjectsOfTypeMinimal>(c.conn, descriptor_test_registry(), filter);
+    CHECK(rows.size() == 3); // the mock ignores the bind value and returns its usual 3 rows
 }
 
 // ---------------------------------------------------------------------------
